@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(python -c \":*)",
+      "Bash(find \"c:/Users/alexh/Personal Projects/Personal-Trading-Portfolio-Project/data/cache\" -name \"top_universe_*\" -type f -delete)",
+      "Bash(find \"c:/Users/alexh/Personal Projects/Personal-Trading-Portfolio-Project/data/cache\" -name \"prices_*\" -type f -delete)",
+      "Bash(find \"c:/Users/alexh/Personal Projects/Personal-Trading-Portfolio-Project/data/cache\" -name \"feature_panel_*\" -type f -delete)",
+      "Bash(python -m pip install catboost optuna)",
+      "Bash(python -c \"import optuna; print\\(f''Optuna: {optuna.__version__}''\\); from catboost import CatBoostRanker; print\\(''CatBoost OK''\\)\")",
+      "WebSearch",
+      "Bash(python -m pip install lightgbm --config-settings=cmake.define.USE_GPU=ON)",
+      "Bash(rm -f top_universe_*.pkl eodhd_prices_*.pkl eodhd_universe*.pkl feature_panel_*.pkl sector_map.pkl earnings_estimates.pkl institutional_holders.pkl)",
+      "Bash(rm -rf api/)",
+      "Bash(mkdir -p api)",
+      "Bash(rm -f top_universe_*.pkl eodhd_prices_*.pkl eodhd_universe*.pkl yf_prices_*.pkl prices_*.pkl feature_panel_*.pkl sector_map.pkl earnings_estimates.pkl institutional_holders.pkl)",
+      "Bash(ls -lh *.pkl)",
+      "Bash(rm -f *.pkl)",
+      "Bash(ls -la *.pkl)",
+      "Bash(wmic process:*)",
+      "Bash(grep -v \"^$\")"
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+regime,n_days,pct_time,ann_return,ann_volatility,sharpe,max_drawdown,win_rate,active_return
+bear_calm,160,5.7%,-44.6%,12.4%,-4.84,-30.7%,45.0%,-6.4%
+bear_volatile,454,16.2%,-22.5%,14.7%,-1.80,-38.0%,46.5%,-4.8%
+bull_calm,1791,63.9%,15.3%,14.1%,0.94,-13.9%,55.2%,-6.5%
+bull_volatile,399,14.2%,43.3%,15.6%,2.25,-9.7%,58.4%,-11.8%

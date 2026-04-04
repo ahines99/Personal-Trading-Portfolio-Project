@@ -1,0 +1,4 @@
+metric,observed,p5,p50,p95,p(>0)
+Sharpe Ratio,0.401,-0.037,0.398,0.833,93.8%
+Sortino Ratio,0.545,-0.048,0.545,1.162,93.8%
+Annualized Return,0.070,0.004,0.069,0.138,95.4%

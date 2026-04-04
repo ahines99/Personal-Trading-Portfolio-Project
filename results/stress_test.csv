@@ -1,0 +1,6 @@
+period,start,end,n_days,total_return,ann_vol,max_drawdown,vs_benchmark,status
+COVID crash (2020),2020-02-19,2020-03-23,24.0,-20.2%,33.5%,-21.0%,+13.2%,
+Post-COVID rally (2020),2020-03-23,2020-08-31,113.0,22.5%,14.9%,-4.4%,-30.9%,
+Rate hike cycle (2022),2022-01-01,2022-12-31,251.0,-8.4%,12.1%,-10.2%,+9.8%,
+GFC peak-to-trough,,,,,,,,not in sample
+Dot-com bust,,,,,,,,not in sample

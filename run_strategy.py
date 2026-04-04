@@ -1,0 +1,519 @@
+"""
+run_strategy.py
+---------------
+Personal Trading Portfolio — ML-ranked concentrated long-only strategy.
+
+Goal: Beat SPY by 5-10%+ annualized with 15-20 stocks, monthly rebalance.
+Designed to be actually traded with personal capital.
+
+Pipeline:
+  Phase 1: Load data (3000+ stock universe, alt data)
+  Phase 2: Feature engineering + walk-forward ML training
+  Phase 3: Long-only portfolio construction (top 20, monthly)
+  Phase 4: Backtest with realistic personal-scale costs
+  Phase 5: Analysis + interactive dashboard
+
+Usage:
+  python run_strategy.py                          # full run
+  python run_strategy.py --skip-ml                # rule-based only
+  python run_strategy.py --skip-alt-data          # skip SEC/FRED/insider data
+  python run_strategy.py --n-positions 15         # fewer positions
+  python run_strategy.py --capital 50000          # personal capital size
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from data_loader     import load_prices, get_close, get_returns, get_volume, get_sectors
+from features        import (build_composite_signal, realized_volatility,
+                              factor_decay_analysis, momentum)
+from portfolio       import (build_monthly_portfolio, compute_portfolio_stats,
+                              get_current_holdings, sector_allocation)
+from backtest        import run_backtest, TransactionCostModel
+from metrics         import (compute_full_tearsheet, monte_carlo_sharpe,
+                              monthly_returns_table, annual_returns, wealth_growth,
+                              after_tax_returns)
+from model           import build_feature_matrix, build_labels, WalkForwardModel
+from regime          import (detect_combined_regime, build_market_series,
+                              performance_by_regime, stress_test)
+from robustness      import bootstrap_tearsheet
+from dashboard       import build_dashboard
+from alt_data_loader import (load_edgar_fundamentals, load_fred_macro,
+                              load_vix_term_structure, load_short_interest,
+                              load_earnings_calendar, load_insider_transactions,
+                              load_analyst_actions, load_earnings_estimates,
+                              load_institutional_holders)
+from alt_features    import build_alt_features
+from api_data        import load_all_api_data
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Personal Trading Portfolio")
+    p.add_argument("--start",           default="2013-01-01")
+    p.add_argument("--end",             default="2026-03-01")
+    p.add_argument("--capital",         default=100_000, type=float,
+                   help="Starting capital (default $100K)")
+    p.add_argument("--n-positions",     default=20, type=int,
+                   help="Number of stocks to hold (default 20)")
+    p.add_argument("--weighting",       default="signal",
+                   choices=["equal", "signal", "inverse_vol"],
+                   help="Position weighting scheme")
+    p.add_argument("--concentration",   default=1.0, type=float,
+                   help="Signal weighting concentration (0=equal, 0.5=sqrt, 1=linear)")
+    p.add_argument("--max-weight",      default=0.10, type=float,
+                   help="Max weight per position (default 10%%)")
+    p.add_argument("--max-sector-pct",  default=0.35, type=float,
+                   help="Max allocation to any single sector (default 35%%)")
+    p.add_argument("--skip-ml",         action="store_true")
+    p.add_argument("--skip-alt-data",   action="store_true")
+    p.add_argument("--skip-robustness", action="store_true")
+    p.add_argument("--n-bootstrap",     default=500, type=int)
+    p.add_argument("--forward-window",  default=21, type=int,
+                   help="Forward return window for ML labels (default 21 = monthly)")
+    p.add_argument("--stop-loss",       default=0.15, type=float,
+                   help="Stop-loss threshold (default 15%%)")
+    p.add_argument("--cash-in-bear",    default=0.15, type=float,
+                   help="Fraction of portfolio in cash during bear regimes (default 15%%)")
+    return p.parse_args()
+
+
+def section(title: str):
+    print(f"\n{'='*60}\n  {title}\n{'='*60}")
+
+
+def run(args):
+    results_dir = Path(__file__).parent / "results"
+    results_dir.mkdir(exist_ok=True)
+
+    section("PERSONAL TRADING PORTFOLIO")
+    print(f"  Period:     {args.start} -> {args.end}")
+    print(f"  Capital:    ${args.capital:,.0f}")
+    print(f"  Positions:  {args.n_positions}")
+    print(f"  Weighting:  {args.weighting} (concentration={args.concentration})")
+    print(f"  Sector cap: {args.max_sector_pct*100:.0f}%")
+
+    # ------------------------------------------------------------------
+    # PHASE 1 — Data
+    # ------------------------------------------------------------------
+    section("Phase 1 — Data Loading")
+
+    print("[1/6] Loading price data (large universe)...")
+    # $1M ADV: maximize universe for small-cap alpha. Risk-adjusted labels +
+    # vol-bucket selection prevent loading up on volatile junk. Liquidity-scaled
+    # transaction costs penalize micro-caps realistically.
+    prices = load_prices(
+        start=args.start,
+        end=args.end,
+        dynamic_universe=True,
+        universe_size=3000,
+        min_price=5.0,
+        min_adv=500_000,
+    )
+    close   = get_close(prices)
+    returns = get_returns(prices)
+    volume  = get_volume(prices)
+    print(f"      {len(close.columns)} tickers x {len(close)} trading days")
+
+    print("[1b/6] Loading sector map...")
+    sector_map = get_sectors(close.columns.tolist())
+
+    # ------------------------------------------------------------------
+    # Alternative data
+    # ------------------------------------------------------------------
+    alt_features_dict = None
+    if not args.skip_alt_data:
+        print("[1c/6] Loading alternative data sources...")
+        tickers_list = close.columns.tolist()
+
+        edgar_df = load_edgar_fundamentals(tickers_list, start=args.start, end=args.end)
+        fred_df  = load_fred_macro(start=args.start, end=args.end)
+        vix_df   = load_vix_term_structure(start=args.start, end=args.end)
+        si_df    = load_short_interest(tickers_list)
+
+        earnings_dict = load_earnings_calendar(tickers_list, start=args.start, end=args.end)
+        insider_dict  = load_insider_transactions(tickers_list, start=args.start, end=args.end)
+        analyst_dict  = load_analyst_actions(tickers_list, start=args.start, end=args.end)
+        estimates_df  = load_earnings_estimates(tickers_list)
+        inst_df       = load_institutional_holders(tickers_list)
+
+        alt_features_dict = build_alt_features(
+            tickers    = close.columns,
+            date_index = close.index,
+            edgar_df   = edgar_df if not edgar_df.empty else None,
+            fred_df    = fred_df  if not fred_df.empty  else None,
+            vix_df     = vix_df   if not vix_df.empty   else None,
+            si_df      = si_df,
+            earnings_dict  = earnings_dict,
+            insider_dict   = insider_dict,
+            analyst_dict   = analyst_dict,
+            estimates_df    = estimates_df if not estimates_df.empty else None,
+            institutional_df = inst_df if not inst_df.empty else None,
+        )
+        n_alt = len(alt_features_dict)
+        print(f"      {n_alt} alt feature panels loaded")
+    else:
+        print("  [alt data skipped]")
+        alt_features_dict = {}
+
+    # ------------------------------------------------------------------
+    # Paid API data (EODHD + Finnhub)
+    # ------------------------------------------------------------------
+    if not args.skip_alt_data:
+        print("[1d/6] Loading EODHD + Finnhub API data...")
+        api_features = load_all_api_data(
+            tickers=close.columns.tolist(),
+            date_index=close.index,
+            finnhub_max=500,  # top 500 tickers for Finnhub (rate limit)
+        )
+        if api_features:
+            if alt_features_dict is None:
+                alt_features_dict = {}
+            alt_features_dict.update(api_features)
+            print(f"      Total features (free + paid): {len(alt_features_dict)}")
+
+    # ------------------------------------------------------------------
+    # PHASE 2 — Feature Engineering + ML
+    # ------------------------------------------------------------------
+    section("Phase 2 — Feature Engineering + ML Model")
+
+    print("[2/6] Computing alpha signals...")
+    composite, ranked_signals = build_composite_signal(
+        close, returns, volume,
+        sector_map=sector_map,
+        use_ic_weights=True,
+    )
+    rvol = realized_volatility(returns, window=21)
+
+    decay = factor_decay_analysis(composite, returns, horizons=[1, 5, 10, 21])
+    decay.to_csv(results_dir / "factor_decay.csv")
+    print(decay.to_string())
+
+    # Momentum filter: 63-day (3-month) momentum for pre-screening
+    mom_63d = momentum(close, 63)
+
+    # Compute ADV for liquidity-aware costs and position sizing
+    adv_30d = (close * volume).rolling(30, min_periods=10).mean()
+
+    # Regime detection — computed early so portfolio can use it
+    print("[2b/6] Computing market regime...")
+    mkt_price, mkt_return = build_market_series(prices)
+    regime = detect_combined_regime(mkt_return, mkt_price)
+
+    # ------------------------------------------------------------------
+    # ML signal (or fall back to rule-based composite)
+    # ------------------------------------------------------------------
+    final_signal = composite
+    feature_imp  = None
+
+    if not args.skip_ml:
+        print("[3/6] Building feature matrix...")
+        panel  = build_feature_matrix(
+            close, returns, volume, ranked_signals,
+            alt_features=alt_features_dict,
+            sector_map=sector_map,
+        )
+        labels = build_labels(returns, forward_window=args.forward_window,
+                              sector_map=sector_map)
+        print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
+
+        print("[3b/6] Walk-forward LightGBM training...")
+        # 252-day warmup (1 year). 504 was too conservative — lost a full year
+        # of predictions. 252 gives enough data for 90+ features while maximizing
+        # the OOS evaluation period.
+        wf = WalkForwardModel(
+            min_train_days=252,
+            retrain_freq=21,
+            forward_window=args.forward_window,
+            num_leaves=31,
+            learning_rate=0.05,
+            lgbm_weight=0.60,
+            ridge_weight=0.40,
+        )
+        ml_signal = wf.fit_predict(panel, labels)
+
+        # Light smoothing (5-day)
+        ml_signal_smooth = ml_signal.rolling(5, min_periods=1).mean()
+
+        # ── Momentum blend ───────────────────────────────────────────────
+        # 70% ML + 30% classic 12-1 month momentum.
+        # V4 used 60/40 which gave too much weight to momentum (a known factor)
+        # and not enough to the ML's stock-specific signal. Shifting to 70/30
+        # trusts the ML more while keeping momentum as an anchor.
+        print("[3c/6] Blending ML signal with 12-1 month momentum...")
+        mom_12_1 = close.shift(21).pct_change(252)
+        mom_12_1_ranked = mom_12_1.rank(axis=1, pct=True)
+
+        mom_aligned = mom_12_1_ranked.reindex(
+            index=ml_signal_smooth.index, columns=ml_signal_smooth.columns
+        )
+        final_signal = (0.70 * ml_signal_smooth + 0.30 * mom_aligned.fillna(0.5))
+        final_signal = final_signal.rank(axis=1, pct=True)
+
+        feature_imp = wf.feature_importance()
+        if feature_imp is not None:
+            feature_imp.to_csv(results_dir / "feature_importance.csv")
+            print("\n  Top 10 features:")
+            print(feature_imp.head(10).to_string())
+    else:
+        print("  [ML skipped — using rule-based composite signal]")
+
+    # ------------------------------------------------------------------
+    # PHASE 3 — Portfolio Construction
+    # ------------------------------------------------------------------
+    section("Phase 3 — Long-Only Portfolio Construction")
+
+    # Quality filter: use alt ROE signal if available, else use
+    # profitability proxy (low idiosyncratic vol = more stable/profitable).
+    quality_signal = None
+    if alt_features_dict and "roe_signal" in alt_features_dict:
+        quality_signal = alt_features_dict["roe_signal"]
+        print("  Using ROE quality filter")
+    elif alt_features_dict and "gross_margin_signal" in alt_features_dict:
+        quality_signal = alt_features_dict["gross_margin_signal"]
+        print("  Using gross margin quality filter")
+
+    # SPY trend filter: signal is positive when SPY > 200d MA, negative when below
+    # SPY trend overlay DISABLED — V4 showed it ate too much exposure.
+    # With beta 0.53, the portfolio was a de-levered index fund.
+    # Regime-based cash (15%) is sufficient downside protection.
+    spy_trend = None
+
+    # Earnings dates for exclusion zone
+    earnings_days_df = None
+    if alt_features_dict and "days_to_earnings_signal" in alt_features_dict:
+        # The raw days-to-earnings panel (before cross-sectional ranking)
+        # We need raw days, not ranks. Use the signal as a proxy:
+        # higher rank = closer to earnings. Invert: rank 1.0 = 0 days away.
+        earnings_days_df = alt_features_dict.get("days_to_earnings_signal")
+
+    print("[4/6] Building monthly portfolio...")
+    weights, rebalance_dates = build_monthly_portfolio(
+        signal          = final_signal,
+        n_positions     = args.n_positions,
+        weighting       = args.weighting,
+        concentration   = args.concentration,
+        max_weight      = args.max_weight,
+        min_weight      = 0.02,
+        sector_map      = sector_map,
+        max_sector_pct  = args.max_sector_pct,
+        momentum_filter = mom_63d,
+        realized_vol    = rvol,
+        returns         = returns,
+        regime          = regime,
+        adv             = adv_30d,
+        cash_in_bear    = args.cash_in_bear,
+        quality_filter  = quality_signal,
+        earnings_dates  = earnings_days_df,
+        spy_trend_filter= spy_trend,
+    )
+
+    port_stats = compute_portfolio_stats(weights, rebalance_dates)
+    print(f"      Positions:  {port_stats['avg_positions']:.0f} avg")
+    print(f"      Max weight: {port_stats['avg_max_weight']*100:.1f}% avg")
+    print(f"      Top-5 wt:   {port_stats['avg_top5_weight']*100:.1f}% avg")
+    print(f"      Rebalances: {port_stats['n_rebalances']}")
+    print(f"      Ann. turn:  {port_stats['annualized_turnover']*100:.0f}%")
+
+    # Current holdings (latest rebalance)
+    holdings = get_current_holdings(weights, final_signal, sector_map)
+    if not holdings.empty:
+        print("\n  Latest holdings:")
+        print(holdings.to_string(index=False))
+        holdings.to_csv(results_dir / "current_holdings.csv", index=False)
+
+    # ------------------------------------------------------------------
+    # PHASE 4 — Backtest
+    # ------------------------------------------------------------------
+    section("Phase 4 — Backtest")
+
+    print("[5/6] Running backtest...")
+    # Personal-scale costs: $0 commission (IBKR/Schwab), ~3bps base spread
+    # (scaled by liquidity per stock), minimal slippage at personal sizes.
+    cost_model = TransactionCostModel(
+        spread_bps=3.0,
+        commission_bps=0.0,
+        slippage_bps=2.0,
+    )
+    result = run_backtest(
+        weights,
+        prices,
+        initial_capital=args.capital,
+        cost_model=cost_model,
+        rebalance_dates=set(rebalance_dates),
+        adv=adv_30d,
+        stop_loss_pct=args.stop_loss,
+        monthly_loss_limit=0.0,  # disabled — too defensive in V4
+    )
+
+    # SPY benchmark
+    try:
+        spy_raw    = load_prices(["SPY"], start=args.start, end=args.end, use_cache=False)
+        spy_ret    = get_returns(spy_raw)
+        # Force to 1D Series (yfinance may return multi-level columns)
+        if isinstance(spy_ret, pd.DataFrame):
+            if "SPY" in spy_ret.columns:
+                spy_series = spy_ret["SPY"]
+            else:
+                spy_series = spy_ret.iloc[:, 0]
+            # Flatten if still multi-level
+            if isinstance(spy_series, pd.DataFrame):
+                spy_series = spy_series.iloc[:, 0]
+        else:
+            spy_series = spy_ret
+        spy_series = spy_series.reindex(result.daily_returns.index).fillna(0)
+        spy_equity = (1 + spy_series).cumprod() * args.capital
+    except Exception:
+        spy_series = pd.Series(0.0, index=result.daily_returns.index)
+        spy_equity = pd.Series(args.capital, index=result.daily_returns.index)
+
+    tearsheet = compute_full_tearsheet(result, benchmark_returns=spy_series)
+    print("\n  Performance Tearsheet:")
+    print(tearsheet.to_string())
+    tearsheet.to_csv(results_dir / "tearsheet.csv")
+
+    # Annual returns
+    annual = annual_returns(result.daily_returns, benchmark_returns=spy_series)
+    print("\n  Annual Returns:")
+    print(annual.to_string())
+    annual.to_csv(results_dir / "annual_returns.csv")
+
+    # Monthly returns heatmap
+    monthly = monthly_returns_table(result.daily_returns)
+    print("\n  Monthly Returns (%):")
+    print(monthly.to_string())
+    monthly.to_csv(results_dir / "monthly_returns.csv")
+
+    # Save daily weights history for time-travel dashboard
+    if not result.weights_history.empty:
+        result.weights_history.to_parquet(results_dir / "weights_history.parquet")
+        print(f"  Weights history saved: {result.weights_history.shape}")
+
+    # Wealth growth comparison
+    wealth = wealth_growth(result.daily_returns, spy_series, initial=args.capital)
+    wealth.to_csv(results_dir / "wealth_growth.csv")
+    print(f"\n  Final portfolio:  ${wealth['Strategy'].iloc[-1]:>12,.0f}")
+    print(f"  SPY buy & hold:   ${wealth['SPY Buy & Hold'].iloc[-1]:>12,.0f}")
+    print(f"  Excess wealth:    ${wealth['Excess'].iloc[-1]:>+12,.0f}")
+
+    # After-tax estimate
+    tax_info = after_tax_returns(result.daily_returns)
+    print("\n  After-Tax Estimate:")
+    for k, v in tax_info.items():
+        print(f"    {k:25s}: {v}")
+
+    # ------------------------------------------------------------------
+    # PHASE 5 — Robustness + Dashboard
+    # ------------------------------------------------------------------
+    section("Phase 5 — Analysis & Dashboard")
+
+    # Regime analysis (regime already computed in Phase 2)
+    print("[5b/6] Regime analysis...")
+    perf_regime = performance_by_regime(
+        result.daily_returns, regime, benchmark_returns=spy_series)
+    print(perf_regime.to_string())
+    perf_regime.to_csv(results_dir / "regime_performance.csv")
+
+    print("\n  Stress test:")
+    stress = stress_test(result.daily_returns, spy_series)
+    print(stress.to_string())
+    stress.to_csv(results_dir / "stress_test.csv")
+
+    # OOS split
+    from metrics import oos_split_tearsheet, fama_french_regression, strategy_correlation_analysis
+    oos_df = None
+    ff_df = None
+    factor_corr_df = None
+
+    print("\n  In-sample vs out-of-sample split...")
+    try:
+        oos_df = oos_split_tearsheet(result, benchmark_returns=spy_series,
+                                     oos_start="2024-01-01")
+        print(oos_df.to_string())
+        oos_df.to_csv(results_dir / "oos_tearsheet.csv")
+    except Exception as e:
+        print(f"  [OOS split failed: {e}]")
+
+    print("\n  Fama-French 5-factor + Momentum regression...")
+    try:
+        ff_df = fama_french_regression(result.daily_returns)
+        if "error" not in ff_df.columns:
+            print(ff_df.to_string())
+            ff_df.to_csv(results_dir / "fama_french.csv")
+        else:
+            print(f"  [FF regression failed: {ff_df['error'].iloc[0]}]")
+            ff_df = None
+    except Exception as e:
+        print(f"  [FF regression failed: {e}]")
+
+    print("\n  Strategy correlation to known factors...")
+    try:
+        factor_corr_df = strategy_correlation_analysis(
+            result.daily_returns, benchmark_returns=spy_series)
+        if "error" not in factor_corr_df.columns:
+            print(factor_corr_df.to_string())
+            factor_corr_df.to_csv(results_dir / "factor_correlation.csv")
+        else:
+            factor_corr_df = None
+    except Exception as e:
+        print(f"  [Factor correlation failed: {e}]")
+
+    # Bootstrap (optional)
+    bootstrap_df = None
+    if not args.skip_robustness:
+        print("\n  Bootstrap confidence intervals...")
+        bootstrap_df = bootstrap_tearsheet(result.daily_returns, n_simulations=args.n_bootstrap)
+        print(bootstrap_df.to_string())
+        bootstrap_df.to_csv(results_dir / "bootstrap_ci.csv")
+
+    # Sector allocation
+    sector_alloc = sector_allocation(weights, sector_map)
+    sector_alloc.to_csv(results_dir / "sector_allocation.csv")
+
+    # Dashboard
+    print("\n[6/6] Building dashboard...")
+    build_dashboard(
+        result             = result,
+        benchmark_equity   = spy_equity,
+        benchmark_returns  = spy_series,
+        perf_by_regime     = perf_regime,
+        feature_importance = feature_imp,
+        bootstrap_df       = bootstrap_df,
+        oos_df             = oos_df,
+        factor_corr_df     = factor_corr_df,
+        monthly_returns    = monthly,
+        annual_df          = annual,
+        holdings_df        = holdings,
+        sector_alloc_df    = sector_alloc,
+        initial_capital    = args.capital,
+        output_path        = str(results_dir / "dashboard.html"),
+    )
+
+    section("ALL OUTPUTS SAVED TO results/")
+    print("""
+  tearsheet.csv            Strategy performance metrics
+  annual_returns.csv       Year-by-year returns vs SPY
+  monthly_returns.csv      Calendar monthly returns (%)
+  wealth_growth.csv        Cumulative wealth: strategy vs SPY
+  current_holdings.csv     Latest portfolio holdings
+  sector_allocation.csv    Sector weights over time
+  feature_importance.csv   ML feature importances
+  regime_performance.csv   Performance by market regime
+  stress_test.csv          Historical stress events
+  oos_tearsheet.csv        In-sample vs out-of-sample
+  fama_french.csv          Factor regression results
+  factor_correlation.csv   Correlation to known factors
+  bootstrap_ci.csv         Bootstrap confidence intervals
+  dashboard.html           <- Open in browser
+""")
+
+    return result, tearsheet, annual, monthly
+
+
+if __name__ == "__main__":
+    run(parse_args())
