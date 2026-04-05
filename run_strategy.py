@@ -618,7 +618,7 @@ def run(args):
             realized_vol=rvol,
             target_vol=args.vol_target,
             max_leverage=args.max_leverage,
-            min_leverage=0.5,
+            min_leverage=0.8,
         )
     else:
         print("  [vol-target] disabled")

@@ -121,7 +121,9 @@ def apply_vol_targeting(
     target_vol: float = 0.16,
     avg_correlation: float = 0.45,
     max_leverage: float = 1.3,
-    min_leverage: float = 0.5,
+    min_leverage: float = 0.8,
+    vol_floor: float = 0.08,
+    vol_ceiling: float = 0.25,
 ) -> pd.DataFrame:
     """
     Scale portfolio gross exposure inversely to ex-ante portfolio vol.
@@ -140,6 +142,19 @@ def apply_vol_targeting(
         sigma_p ≈ sqrt( sum(w_i^2 * s_i^2) + rho * (sum(w_i*s_i))^2 - rho * sum(w_i^2*s_i^2) )
     using a constant average pairwise correlation assumption.
 
+    Fix notes (2026-04-05, Tier-8 beta rescue):
+      - min_leverage raised from 0.5 to 0.8. The prior 0.5 floor let outlier
+        high-vol months slash net exposure to 50%, collapsing net beta to SPY
+        toward 0.25. User wants vol targeting to RANGE in [0.8, 1.3], not
+        [0.5, 1.3], so de-leveraging doesn't strip market exposure.
+      - Ex-ante vol estimate is clipped to [vol_floor, vol_ceiling] before
+        computing leverage. Outlier months (churn, ETF contamination,
+        small-cap spikes) otherwise drive leverage to the min floor and
+        destroy beta. 8-25% brackets the realistic range of a 20-stock
+        diversified long-only equity book.
+      - Diagnostic logging added: median / min / max leverage and the date
+        of the heaviest de-leveraging event.
+
     Parameters
     ----------
     weights         : (date x ticker) target weights (may sum to <= 1.0)
@@ -147,7 +162,9 @@ def apply_vol_targeting(
     target_vol      : desired annualized portfolio vol (e.g. 0.16 = 16%)
     avg_correlation : assumed average pairwise correlation between holdings
     max_leverage    : cap scaling factor (1.3 = up to 30% margin; 1.0 = no margin)
-    min_leverage    : floor scaling factor (prevents going all-cash on vol spike)
+    min_leverage    : floor scaling factor (default 0.8; prevents beta collapse)
+    vol_floor       : clamp ex-ante vol estimate (annualized) from below
+    vol_ceiling     : clamp ex-ante vol estimate (annualized) from above
     """
     aligned_vol = realized_vol.reindex(index=weights.index, columns=weights.columns)
     w = weights.fillna(0.0)
@@ -159,7 +176,29 @@ def apply_vol_targeting(
     port_var = diag + avg_correlation * (cross - diag)
     port_vol = port_var.clip(lower=1e-8).pow(0.5)
 
-    leverage = (target_vol / port_vol).clip(lower=min_leverage, upper=max_leverage)
+    # Clip the vol estimate to a sane range before computing leverage.
+    # This prevents outlier churn months from distorting leverage (see docstring).
+    port_vol_clipped = port_vol.clip(lower=vol_floor, upper=vol_ceiling)
+
+    leverage = (target_vol / port_vol_clipped).clip(lower=min_leverage, upper=max_leverage)
+
+    # Diagnostic logging — only log for rows where we actually have weights.
+    active_mask = w.abs().sum(axis=1) > 1e-6
+    if active_mask.any():
+        lev_active = leverage[active_mask]
+        vol_active = port_vol[active_mask]
+        try:
+            min_lev_date = lev_active.idxmin()
+            print(
+                f"  [vol-target] leverage: median={lev_active.median():.3f} "
+                f"min={lev_active.min():.3f} max={lev_active.max():.3f} | "
+                f"ex-ante vol: median={vol_active.median():.3f} "
+                f"min={vol_active.min():.3f} max={vol_active.max():.3f} | "
+                f"heaviest de-lever on {min_lev_date.strftime('%Y-%m-%d')}"
+            )
+        except Exception:
+            pass
+
     return weights.mul(leverage, axis=0)
 
 
@@ -191,7 +230,7 @@ def build_monthly_portfolio(
     spy_core_weight:  float = 0.0,
     spy_ticker:       str   = "SPY",
     force_mega_caps:  bool  = False,
-    signal_smooth_halflife: float = 0.0,
+    signal_smooth_halflife: float = 5.0,
     apply_rank_normal: bool = True,
     neutralize_factors: Optional[List[str]] = None,
     factor_panel:     Optional[Dict[str, pd.DataFrame]] = None,
@@ -406,6 +445,9 @@ def _select_and_weight(
     """
     scores = signal.loc[date].dropna()
 
+    # Pipeline funnel counters — emitted at the end if final count < n_positions
+    stage_counts = {"initial": len(scores)}
+
     if len(scores) < n_positions * 2:
         return pd.Series(0.0, index=signal.columns)
 
@@ -418,6 +460,7 @@ def _select_and_weight(
         positive_mom = mom_rank[mom_rank > 0.40].index
         if len(positive_mom) >= n_positions * 3:
             scores = scores.loc[positive_mom]
+    stage_counts["post_momentum"] = len(scores)
 
     # ── Pre-filter 2: Quality (soft) ─────────────────────────────────────
     # Require above 15th percentile (very soft — only excludes the worst junk).
@@ -427,6 +470,7 @@ def _select_and_weight(
         passing = qual[qual > 0.15].index
         if len(passing) >= n_positions * 3:
             scores = scores.loc[passing]
+    stage_counts["post_quality"] = len(scores)
 
     # ── Pre-filter 3: IPO buffer ─────────────────────────────────────────
     # Skip stocks with less than ~180 trading days of history. Recent IPOs
@@ -438,6 +482,7 @@ def _select_and_weight(
         mature_tickers = mature_mask[mature_mask].index
         if len(mature_tickers) >= n_positions * 3:
             scores = scores.loc[mature_tickers]
+    stage_counts["post_ipo"] = len(scores)
 
     # ── Pre-filter 4: Earnings exclusion zone ───────────────────────────
     # The earnings signal is cross-sectionally ranked [0,1] where HIGH rank
@@ -451,6 +496,7 @@ def _select_and_weight(
         safe_tickers = scores.index[~exclude]
         if len(safe_tickers) >= n_positions * 3:
             scores = scores.loc[safe_tickers]
+    stage_counts["post_earnings"] = len(scores)
 
     # ── Pre-filter 5: Liquidity pool cap ─────────────────────────────────
     # Training universe stays broad (~3000) but SELECTION only picks from
@@ -463,6 +509,7 @@ def _select_and_weight(
             pooled = scores.loc[scores.index.isin(liquid_tickers)]
             if len(pooled) >= n_positions * 2:
                 scores = pooled
+    stage_counts["post_liquidity"] = len(scores)
 
     # ── Step 1: Candidate pool (optionally vol-bucket-neutral) ───────────
     # Vol buckets force balanced picks across volatility terciles, which
@@ -480,6 +527,7 @@ def _select_and_weight(
             scores_pool = scores  # fallback to full universe
     else:
         scores_pool = scores
+    stage_counts["post_vol_bucket"] = len(scores_pool)
 
     # ── Step 2: Sector caps ──────────────────────────────────────────────
     n_candidates = min(n_positions * 2, len(scores_pool))
@@ -489,6 +537,7 @@ def _select_and_weight(
         sector_map=sector_map,
         max_sector_pct=max_sector_pct,
     )
+    stage_counts["post_sector_cap"] = len(candidates)
 
     # ── Step 3: Correlation filter ───────────────────────────────────────
     # Prune stocks with >0.80 pairwise correlation to existing picks.
@@ -502,6 +551,15 @@ def _select_and_weight(
         )
     else:
         selected = candidates[:n_positions]
+    stage_counts["post_correlation"] = len(selected)
+
+    # Diagnostic: if selection fell short of the target, log the funnel.
+    if len(selected) < n_positions:
+        funnel = " -> ".join(f"{k}={v}" for k, v in stage_counts.items())
+        print(
+            f"  [select] {date.strftime('%Y-%m-%d')} short "
+            f"(got {len(selected)}/{n_positions}): {funnel}"
+        )
 
     if len(selected) == 0:
         return pd.Series(0.0, index=signal.columns)
@@ -744,13 +802,28 @@ def compute_portfolio_stats(
     gross_exposure = weights.sum(axis=1)
     n_positions = (weights > 0.001).sum(axis=1)
 
+    # Turnover must measure ACTUAL trades (position reshuffles at rebalances),
+    # NOT day-over-day weight drift caused by vol-targeting leverage scaling.
+    # Previously this diffed the raw weights DataFrame: since apply_vol_targeting
+    # rescales gross exposure on every single day (leverage shifts with daily
+    # realized-vol), the day-over-day diff was nonzero on every row and the
+    # `* 252` annualization turned that drift into phantom 1500%+ turnover.
+    # Fix: normalize each row to gross=1 BEFORE diffing (removes leverage
+    # churn so only actual position changes count), then annualize by the
+    # true elapsed years instead of mean*252.
+    n_rebalances = len(rebalance_dates) if rebalance_dates else 0
+    gross_for_norm = weights.sum(axis=1).replace(0, np.nan)
+    normed = weights.div(gross_for_norm, axis=0).fillna(0.0)
+
     daily_turnover = []
-    for i in range(1, len(weights)):
-        diff = (weights.iloc[i] - weights.iloc[i - 1]).abs().sum() / 2.0
+    for i in range(1, len(normed)):
+        diff = (normed.iloc[i] - normed.iloc[i - 1]).abs().sum() / 2.0
         daily_turnover.append(diff)
     daily_turnover = pd.Series(daily_turnover)
 
-    n_rebalances = len(rebalance_dates) if rebalance_dates else 0
+    n_years = len(weights) / 252.0 if len(weights) > 0 else 1.0
+    annualized_turnover = daily_turnover.sum() / n_years if n_years > 0 else 0.0
+
     max_weight_ts = weights.max(axis=1)
     top5_weight_ts = weights.apply(lambda row: row.nlargest(5).sum(), axis=1)
 
@@ -761,7 +834,7 @@ def compute_portfolio_stats(
         "avg_top5_weight":     top5_weight_ts.mean(),
         "n_rebalances":        n_rebalances,
         "avg_daily_turnover":  daily_turnover.mean(),
-        "annualized_turnover": daily_turnover.mean() * 252,
+        "annualized_turnover": annualized_turnover,
     }
 
 

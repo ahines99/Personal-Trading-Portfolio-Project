@@ -370,8 +370,14 @@ def run_backtest(
             current_w = current_w / nav
         current_w = current_w.reindex(weights.columns, fill_value=0.0)
 
+        # Turnover = change in TARGET weights day-over-day (NOT drift-vs-target).
+        # Between rebalances the target is constant, so turnover is zero on
+        # non-trading days. At a rebalance, it jumps by |new_target - old_target|/2.
+        # Summing this across the year gives the true annual fraction of the
+        # portfolio that was traded, without inflating from intraday drift.
         today_target = weights.loc[date].fillna(0.0)
-        turnover = (today_target - current_w).abs().sum() / 2.0
+        prev_target  = weights.loc[prev_date].fillna(0.0) if prev_date in weights.index else today_target
+        turnover = (today_target - prev_target).abs().sum() / 2.0
 
         # -------------------------------------------------------------------
         # Step 4: Record state

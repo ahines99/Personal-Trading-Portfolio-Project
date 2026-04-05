@@ -27,10 +27,16 @@ import requests
 _CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# SEC REQUIRES a descriptive User-Agent with contact email (policy since 2021).
+# Requests without this may get 403/429. Rate limit: 10 req/sec.
 _EDGAR_HEADERS = {
     "User-Agent": "quant-research-project contact@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
+
+# Cache key version — bump to invalidate stale/partial caches.
+_SIC_CACHE_VERSION = "v2"
+_SECTOR_CACHE_VERSION = "v2"
 
 # ---------------------------------------------------------------------------
 # SIC code → GICS Sector mapping
@@ -128,6 +134,21 @@ _SIC_TO_SECTOR = {
 }
 
 
+# Hardcoded fallback mapping for top liquid US tickers (ETFs + mega-caps that
+# may not appear in EDGAR or may have unusual SIC codes). Used as last resort.
+_HARDCODED_SECTORS = {
+    # Broad-market & sector ETFs (not in EDGAR)
+    "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF", "DIA": "ETF", "VTI": "ETF",
+    "VOO": "ETF", "IVV": "ETF", "VEA": "ETF", "VWO": "ETF", "EFA": "ETF",
+    "EEM": "ETF", "AGG": "ETF", "BND": "ETF", "TLT": "ETF", "LQD": "ETF",
+    "HYG": "ETF", "GLD": "ETF", "SLV": "ETF", "USO": "ETF", "UNG": "ETF",
+    "XLK": "ETF", "XLF": "ETF", "XLE": "ETF", "XLV": "ETF", "XLI": "ETF",
+    "XLY": "ETF", "XLP": "ETF", "XLU": "ETF", "XLB": "ETF", "XLRE": "ETF",
+    "XLC": "ETF", "VNQ": "ETF", "XBI": "ETF", "SMH": "ETF", "SOXX": "ETF",
+    "ARKK": "ETF", "VIG": "ETF", "SCHD": "ETF", "VYM": "ETF",
+}
+
+
 def _sic_to_sector(sic_code: int) -> str:
     """Map a 4-digit SIC code to a GICS sector."""
     for sic_range, sector in _SIC_TO_SECTOR.items():
@@ -169,57 +190,159 @@ def _get_ticker_to_cik(use_cache: bool = True) -> Dict[str, str]:
 def fetch_sic_codes(
     tickers: List[str],
     use_cache: bool = True,
-    max_tickers: int = 5000,
+    max_tickers: int = 10000,
 ) -> Dict[str, int]:
     """
     Fetch SIC codes from EDGAR submissions endpoint.
 
-    Rate: 10 req/sec (SEC limit). 5000 tickers = ~8 minutes.
+    Rate: 10 req/sec (SEC limit). 5000 tickers = ~10 minutes with 4 threads.
     Cached permanently (SIC codes don't change).
-    """
-    cache_file = _CACHE_DIR / "edgar_sic_codes.pkl"
 
-    if use_cache and cache_file.exists():
-        cached = pickle.load(open(cache_file, "rb"))
-        coverage = sum(1 for t in tickers if t in cached) / max(len(tickers), 1)
-        if coverage > 0.30:
-            print(f"[sectors] SIC codes loaded from cache ({len(cached)} tickers, {coverage:.0%} coverage)")
-            return cached
+    Robustness fixes (2026-04-05):
+      - Per-thread requests.Session with keep-alive (avoids connection pool exhaustion)
+      - Retry on network errors / 429 with backoff
+      - Per-request throttle via threading.Lock to stay under 10 req/sec
+      - Diagnostic counters logged at end
+      - Merges with existing cache instead of overwriting
+    """
+    cache_file = _CACHE_DIR / f"edgar_sic_codes_{_SIC_CACHE_VERSION}.pkl"
+
+    # Load existing cache to merge with
+    existing: Dict[str, int] = {}
+    if cache_file.exists():
+        try:
+            existing = pickle.load(open(cache_file, "rb"))
+        except Exception:
+            existing = {}
+
+    if use_cache and existing:
+        coverage = sum(1 for t in tickers if t in existing) / max(len(tickers), 1)
+        if coverage > 0.60:
+            print(f"[sectors] SIC codes loaded from cache ({len(existing)} tickers, {coverage:.0%} coverage)")
+            return existing
 
     ticker_to_cik = _get_ticker_to_cik(use_cache=use_cache)
 
-    # Build list of (ticker, CIK) to fetch
+    # Build list of (ticker, CIK) to fetch — skip ones already cached
     to_fetch = []
+    skipped_no_cik = 0
     for ticker in tickers[:max_tickers]:
-        # Try direct match
+        if ticker in existing:
+            continue
         cik = ticker_to_cik.get(ticker)
-        # Try base ticker for _OLD
         if not cik and "_" in ticker:
             base = ticker.split("_")[0]
             cik = ticker_to_cik.get(base)
+        if not cik and "-" in ticker:
+            base = ticker.split("-")[0]
+            cik = ticker_to_cik.get(base)
         if cik:
             to_fetch.append((ticker, cik))
+        else:
+            skipped_no_cik += 1
+
+    if not to_fetch:
+        print(f"[sectors] All tickers covered by cache; {skipped_no_cik} had no CIK match")
+        return existing
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    # Thread-local sessions for keep-alive
+    _thread_local = threading.local()
+    _rate_lock = threading.Lock()
+    _last_request_time = [0.0]
+    _min_interval = 0.11  # ~9 req/sec global max, safely below 10/sec SEC limit
+
+    # Diagnostic counters
+    stats = {
+        "attempted": 0, "http_200": 0, "http_403": 0, "http_429": 0,
+        "http_other": 0, "parsed_sic": 0, "no_sic_key": 0, "exc": 0,
+    }
+    stats_lock = threading.Lock()
+    first_samples = []
+
+    def _get_session():
+        s = getattr(_thread_local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update(_EDGAR_HEADERS)
+            _thread_local.session = s
+        return s
+
+    def _throttle():
+        with _rate_lock:
+            now = time.time()
+            wait = _min_interval - (now - _last_request_time[0])
+            if wait > 0:
+                time.sleep(wait)
+            _last_request_time[0] = time.time()
 
     def _fetch_sic(ticker_cik):
         ticker, cik = ticker_cik
-        try:
-            url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-            resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                sic = data.get("sic")
-                if sic:
-                    return ticker, int(sic)
-        except Exception:
-            pass
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        session = _get_session()
+        for attempt in range(3):
+            _throttle()
+            try:
+                resp = session.get(url, timeout=15)
+                with stats_lock:
+                    stats["attempted"] += 1
+                    if resp.status_code == 200:
+                        stats["http_200"] += 1
+                    elif resp.status_code == 403:
+                        stats["http_403"] += 1
+                    elif resp.status_code == 429:
+                        stats["http_429"] += 1
+                    else:
+                        stats["http_other"] += 1
+                    if len(first_samples) < 5:
+                        first_samples.append(
+                            (ticker, cik, resp.status_code,
+                             (resp.text[:120] if resp.status_code != 200 else "OK"))
+                        )
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        with stats_lock:
+                            stats["exc"] += 1
+                        return ticker, None
+                    sic = data.get("sic")
+                    if sic:
+                        with stats_lock:
+                            stats["parsed_sic"] += 1
+                        try:
+                            return ticker, int(sic)
+                        except (ValueError, TypeError):
+                            return ticker, None
+                    else:
+                        with stats_lock:
+                            stats["no_sic_key"] += 1
+                        return ticker, None
+                elif resp.status_code == 429:
+                    time.sleep(2 ** attempt)
+                    continue
+                elif resp.status_code == 404:
+                    return ticker, None
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+            except Exception:
+                with stats_lock:
+                    stats["exc"] += 1
+                time.sleep(0.5 * (attempt + 1))
+                continue
         return ticker, None
 
-    # SEC allows 10 req/sec. Use 8 threads to stay safe.
-    print(f"[sectors] Fetching SIC codes from EDGAR for {len(to_fetch)} tickers (8 threads)...")
-    sic_codes: Dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # Use 4 threads + throttle to stay safely under SEC's 10 req/sec limit
+    n_workers = 4
+    print(f"[sectors] Fetching SIC codes from EDGAR for {len(to_fetch)} tickers ({n_workers} threads, ~9 req/sec)...")
+    if skipped_no_cik:
+        print(f"[sectors] (skipped {skipped_no_cik} tickers with no CIK mapping)")
+
+    sic_codes: Dict[str, int] = dict(existing)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_fetch_sic, tc): tc for tc in to_fetch}
         done = 0
         for future in as_completed(futures):
@@ -228,10 +351,25 @@ def fetch_sic_codes(
             if sic is not None:
                 sic_codes[ticker] = sic
             if done % 500 == 0:
-                print(f"    {done}/{len(to_fetch)} fetched ({len(sic_codes)} with SIC)")
+                print(f"    {done}/{len(to_fetch)} fetched ({len(sic_codes)} total with SIC)")
+                # Persist partial progress so a crash doesn't lose work
+                try:
+                    pickle.dump(sic_codes, open(cache_file, "wb"))
+                except Exception:
+                    pass
 
     pickle.dump(sic_codes, open(cache_file, "wb"))
-    print(f"[sectors] Got SIC codes for {len(sic_codes)} tickers")
+
+    # Diagnostic summary
+    print(f"[sectors] Fetch stats: attempted={stats['attempted']}, "
+          f"200={stats['http_200']}, 403={stats['http_403']}, 429={stats['http_429']}, "
+          f"other={stats['http_other']}, exc={stats['exc']}, "
+          f"sic_parsed={stats['parsed_sic']}, no_sic_key={stats['no_sic_key']}")
+    if first_samples:
+        print(f"[sectors] First 5 response samples:")
+        for s in first_samples:
+            print(f"    {s[0]} CIK={s[1]} status={s[2]} body={s[3]}")
+    print(f"[sectors] Got SIC codes for {len(sic_codes)} tickers total")
     return sic_codes
 
 
@@ -254,7 +392,7 @@ def get_sectors_from_edgar(
 
     Returns dict of ticker → sector name.
     """
-    cache_file = _CACHE_DIR / "sector_map_edgar.pkl"
+    cache_file = _CACHE_DIR / f"sector_map_edgar_{_SECTOR_CACHE_VERSION}.pkl"
 
     if use_cache and cache_file.exists():
         cached = pickle.load(open(cache_file, "rb"))
@@ -275,22 +413,27 @@ def get_sectors_from_edgar(
         sic = sic_codes.get(ticker)
         if sic:
             sector_map[ticker] = _sic_to_sector(sic)
-        else:
-            # Try base ticker for _OLD
-            if "_" in ticker:
-                base = ticker.split("_")[0]
-                base_sic = sic_codes.get(base)
-                if base_sic:
-                    sector_map[ticker] = _sic_to_sector(base_sic)
-                else:
-                    sector_map[ticker] = "Unknown"
-            else:
-                sector_map[ticker] = "Unknown"
+            continue
+        # Try base ticker for _OLD / hyphenated share classes
+        base_sic = None
+        if "_" in ticker:
+            base_sic = sic_codes.get(ticker.split("_")[0])
+        if not base_sic and "-" in ticker:
+            base_sic = sic_codes.get(ticker.split("-")[0])
+        if base_sic:
+            sector_map[ticker] = _sic_to_sector(base_sic)
+            continue
+        # Hardcoded fallback for ETFs / mega-caps
+        if ticker in _HARDCODED_SECTORS:
+            sector_map[ticker] = _HARDCODED_SECTORS[ticker]
+            continue
+        sector_map[ticker] = "Unknown"
 
     # Stats
     known = sum(1 for v in sector_map.values() if v != "Unknown")
     total = len(sector_map)
     print(f"[sectors] Mapped {known}/{total} tickers to sectors ({known/total*100:.1f}%)")
+    print(f"[sectors] Final EDGAR coverage: {known}/{total} tickers ({known/total*100:.1f}%)")
 
     counts = pd.Series([v for v in sector_map.values() if v != "Unknown"]).value_counts()
     if len(counts) > 0:

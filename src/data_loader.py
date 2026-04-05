@@ -43,6 +43,31 @@ except ImportError:
 CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# Universe Filtering Constants
+# ---------------------------------------------------------------------------
+# Cache version suffix — bump whenever universe-filter logic changes so that
+# stale pickles (built before the filter was added) are invalidated.
+_UNIVERSE_CACHE_VERSION = "v2_common_only"
+
+# EODHD Type values we keep. The bulk EOD endpoint returns all instruments
+# (ETFs, Funds, Notes, Warrants, etc.); we intersect against this whitelist
+# to keep only operating-company equities.
+_KEEP_EODHD_TYPES = {"Common Stock"}
+
+# Hardcoded ETF/fund blocklist — defensive fallback for instruments whose
+# Type field is missing, stale, or mislabelled by EODHD. Seeded with the
+# six ETFs that leaked into the 2026 backtest output (QYLD, MGV, PPH, LVHI,
+# WLDR, YLCO). Extend as more contaminants surface.
+_ETF_BLOCKLIST = {
+    # Leaked into 2026-04 backtest
+    "QYLD", "MGV", "PPH", "LVHI", "WLDR", "YLCO",
+    # Common broad-market ETFs
+    "SPY", "QQQ", "IWM", "IWB", "DIA", "GLD", "SLV", "TLT", "HYG", "LQD",
+    "VOO", "VTI", "IVV", "EEM", "EFA", "VEA", "VWO", "BND", "AGG",
+    "XLF", "XLK", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC", "XLRE",
+}
+
 # EODHD API
 # Load from .env file
 try:
@@ -79,6 +104,40 @@ def _clean_ticker(t: str) -> str:
     return t
 
 
+def _filter_common_stock(symbols: list, source_label: str = "") -> List[str]:
+    """
+    Filter a list of EODHD symbol dicts to Common Stock only.
+
+    EODHD's `exchange-symbol-list/US?type=common_stock` endpoint nominally
+    returns only Common Stock, but in practice the `Type` field can still
+    contain ETF, Fund, Warrant, Preferred Stock, etc. — so we double-check
+    against the Type field and the hardcoded blocklist.
+    """
+    kept = []
+    dropped_by_type = 0
+    dropped_by_blocklist = 0
+    for s in symbols:
+        code_raw = s.get("Code", "")
+        if not code_raw or len(code_raw) > 6:
+            continue
+        code = _clean_ticker(code_raw)
+        if not code:
+            continue
+        t = s.get("Type", "")
+        if t and t not in _KEEP_EODHD_TYPES:
+            dropped_by_type += 1
+            continue
+        if code in _ETF_BLOCKLIST:
+            dropped_by_blocklist += 1
+            continue
+        kept.append(code)
+    if dropped_by_type or dropped_by_blocklist:
+        print(f"[data_loader] {source_label} ETF filter: dropped "
+              f"{dropped_by_type} non-common-stock instruments "
+              f"(+ {dropped_by_blocklist} blocklisted tickers)")
+    return kept
+
+
 def build_eodhd_universe(
     include_delisted: bool = True,
     use_cache: bool = True,
@@ -88,37 +147,42 @@ def build_eodhd_universe(
 
     Returns ~47,000 tickers (19K active + 28K delisted).
     Cost: 2 API calls.
+
+    Applies a Type-field filter + hardcoded ETF blocklist to strip ETFs,
+    funds, warrants, preferred shares, etc. that EODHD sometimes returns
+    even from the `type=common_stock` endpoint.
     """
-    cache_file = CACHE_DIR / "eodhd_universe.pkl"
+    cache_file = CACHE_DIR / f"eodhd_universe_{_UNIVERSE_CACHE_VERSION}.pkl"
     if use_cache and cache_file.exists():
         with open(cache_file, "rb") as f:
             data = pickle.load(f)
-        print(f"[data_loader] Universe loaded from cache: {len(data)} tickers")
+        print(f"[data_loader] Universe loaded from cache: {len(data)} tickers "
+              f"(cache {_UNIVERSE_CACHE_VERSION})")
         return data
 
     print("[data_loader] Fetching US stock universe from EODHD...")
 
     # Active common stocks
-    active = _eodhd_get("exchange-symbol-list/US", {"type": "common_stock"})
-    active_tickers = [_clean_ticker(s.get("Code", "")) for s in active
-                      if s.get("Code") and len(s.get("Code", "")) <= 6]
-    print(f"  Active: {len(active_tickers)} common stocks")
+    active_raw = _eodhd_get("exchange-symbol-list/US", {"type": "common_stock"})
+    active_tickers = _filter_common_stock(active_raw, source_label="Active")
+    print(f"  Active: {len(active_tickers)} common stocks "
+          f"(from {len(active_raw)} raw symbols)")
 
     # Delisted common stocks
     delisted_tickers = []
     if include_delisted:
         try:
-            delisted = _eodhd_get("exchange-symbol-list/US", {
+            delisted_raw = _eodhd_get("exchange-symbol-list/US", {
                 "type": "common_stock", "delisted": "1"
             })
-            delisted_tickers = [_clean_ticker(s.get("Code", "")) for s in delisted
-                                if s.get("Code") and len(s.get("Code", "")) <= 6]
-            print(f"  Delisted: {len(delisted_tickers)} stocks")
+            delisted_tickers = _filter_common_stock(delisted_raw, source_label="Delisted")
+            print(f"  Delisted: {len(delisted_tickers)} stocks "
+                  f"(from {len(delisted_raw)} raw symbols)")
         except Exception as e:
             print(f"  Delisted fetch failed: {e}")
 
     all_tickers = sorted(set(active_tickers + delisted_tickers))
-    print(f"  Total universe: {len(all_tickers)} tickers")
+    print(f"  Total universe: {len(all_tickers)} tickers (Common Stock only)")
 
     with open(cache_file, "wb") as f:
         pickle.dump(all_tickers, f)
@@ -144,7 +208,10 @@ def build_top_liquidity_universe(
 
     This matches the approach used in the institutional L/S project.
     """
-    cache_file = CACHE_DIR / f"top_universe_{n}_{start}_{end}_{int(min_price)}_{int(min_adv)}.pkl"
+    cache_file = CACHE_DIR / (
+        f"top_universe_{n}_{start}_{end}_{int(min_price)}_{int(min_adv)}"
+        f"_{_UNIVERSE_CACHE_VERSION}.pkl"
+    )
     if use_cache and cache_file.exists():
         with open(cache_file, "rb") as f:
             tickers = pickle.load(f)
@@ -162,8 +229,12 @@ def build_top_liquidity_universe(
     print(f"  Filters: price>${min_price}, ADV>${min_adv/1e6:.1f}M")
 
     _skip_prefixes = ("^",)
-    _etfs = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "TLT", "HYG", "LQD",
-             "VOO", "VTI", "IVV", "EEM", "EFA", "VEA", "VWO", "BND", "AGG"}
+    # Union of the module-level ETF blocklist plus the legacy local set.
+    # The REAL ETF gate is the intersection with `all_common` below — the
+    # bulk EOD endpoint returns ALL instruments (ETFs, funds, notes, etc.),
+    # so we must restrict to tickers that passed the Common-Stock filter in
+    # build_eodhd_universe(). The blocklist is a defensive backup.
+    _etfs = set(_ETF_BLOCKLIST)
 
     def _screen_bulk(target_date: str) -> dict:
         """Fetch bulk data and return {code: dollar_vol} for eligible tickers."""
@@ -192,6 +263,12 @@ def build_top_liquidity_universe(
             if not code or any(code.startswith(p) for p in _skip_prefixes):
                 continue
             if code in _etfs:
+                continue
+            # Primary ETF gate: must be in the Common-Stock-only universe.
+            # EODHD's bulk EOD endpoint returns ETFs, funds, notes, warrants
+            # etc. alongside operating-company equities, so without this
+            # intersection ETFs like QYLD/MGV/PPH leak into the portfolio.
+            if code not in all_common:
                 continue
 
             base = code.split("_")[0] if "_" in code else code
