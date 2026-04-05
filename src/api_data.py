@@ -806,15 +806,30 @@ def load_all_api_data(
         all_features.update(sent_features)
         print(f"  [EODHD] Built {len(sent_features)} sentiment features")
 
-    # ── Finnhub: DISABLED until overnight fetch completes (fetch_finnhub.py)
-    # Partial data (193 tickers) would create sparse features that distort
-    # the model. Re-enable once fetch_finnhub.py has completed for all tickers.
-    # cached_fh = _load("finnhub_all_data")
-    # if cached_fh and len(cached_fh) >= 1000:  # only use if substantial coverage
-    #     fh_features = build_finnhub_features(cached_fh, tickers_index, date_index)
-    #     all_features.update(fh_features)
-    #     print(f"  [Finnhub] Built {len(fh_features)} features")
-    print("[API] Finnhub: disabled until overnight fetch completes.")
+    # ─────────────────────────────────────────────────────────────────────
+    # Finnhub: auto-gated on cached-ticker coverage.
+    #
+    # Finnhub features are auto-disabled below FINNHUB_MIN_COVERAGE cached
+    # tickers. Partial data creates sparse features that distort the model.
+    # Run `python fetch_finnhub.py --max 3000` overnight to populate the
+    # cache; then Finnhub features auto-activate on the next run.
+    #
+    # This is an opt-in-via-cache-completion path. Do NOT remove — leave the
+    # code path live so that once the cache is filled the features light up.
+    # ─────────────────────────────────────────────────────────────────────
+    FINNHUB_MIN_COVERAGE = 1000  # min cached tickers before Finnhub activates
+    cached_fh = _load("finnhub_all_data")
+    if cached_fh and len(cached_fh) >= FINNHUB_MIN_COVERAGE:
+        fh_features = build_finnhub_features(cached_fh, tickers_index, date_index)
+        all_features.update(fh_features)
+        print(f"  [Finnhub] Built {len(fh_features)} features "
+              f"(coverage: {len(cached_fh)} tickers)")
+    else:
+        n_cached = len(cached_fh) if cached_fh else 0
+        print(f"[API] Finnhub: disabled ({n_cached}/{FINNHUB_MIN_COVERAGE} "
+              f"cached tickers). Run `python fetch_finnhub.py --max 3000` "
+              f"overnight to populate; features auto-activate once cache "
+              f"reaches threshold.")
 
     print(f"\n[API] Total new features from paid APIs: {len(all_features)}")
     return all_features

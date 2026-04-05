@@ -904,6 +904,54 @@ def factor_decay_analysis(
     return pd.DataFrame(results).T
 
 
+# ---------------------------------------------------------------------------
+# Sector neutralization
+# ---------------------------------------------------------------------------
+
+def sector_neutralize(
+    feature_df: pd.DataFrame,
+    sector_map: dict,
+    min_per_sector: int = 3,
+) -> pd.DataFrame:
+    """Subtract sector-mean from each feature value cross-sectionally per date.
+
+    Groups tickers by sector, then for each date subtracts the per-sector mean
+    from each ticker's value. This removes the systematic sector-level
+    component of a feature, so downstream ranking/regression is within-sector
+    rather than cross-sector (JKP 2023, AQR best practice for quality / value /
+    momentum).
+
+    Args:
+        feature_df: DataFrame, index=dates, columns=tickers, values=feature
+        sector_map: dict mapping ticker → sector name (str)
+        min_per_sector: if a sector has fewer than N tickers on a given date,
+            skip neutralization for that sector (return raw values).
+
+    Returns:
+        DataFrame of sector-demeaned feature values (same shape as input).
+        Tickers missing from ``sector_map`` or in a sector with fewer than
+        ``min_per_sector`` members are returned unchanged.
+    """
+    if feature_df is None or feature_df.empty or not sector_map:
+        return feature_df.copy() if feature_df is not None else feature_df
+
+    result = feature_df.copy()
+
+    # Build a sector label Series indexed by ticker (aligned to df columns)
+    sectors = pd.Series(sector_map).reindex(feature_df.columns)
+
+    # Iterate sector groups, subtract per-row sector mean vectorially
+    for sector, group_tickers in sectors.groupby(sectors):
+        cols = group_tickers.index.tolist()
+        if len(cols) < min_per_sector:
+            continue
+        # Per-date sector mean across the sector's tickers (NaN-safe)
+        sector_mean = feature_df[cols].mean(axis=1, skipna=True)
+        result[cols] = feature_df[cols].sub(sector_mean, axis=0)
+
+    return result
+
+
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))

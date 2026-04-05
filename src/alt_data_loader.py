@@ -161,7 +161,7 @@ def load_edgar_fundamentals(
     ----------
     max_tickers : safety ceiling on tickers to fetch (default = all)
     """
-    cache_name = f"edgar_fundamentals_{start}_{end}_{max_tickers}"
+    cache_name = f"edgar_fundamentals_{start}_{end}_{max_tickers}_v2raw"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -271,6 +271,26 @@ def load_edgar_fundamentals(
         # Current Ratio change (Piotroski F-Score component)
         cr = ca_d / cl_d.replace(0, np.nan)
         ticker_df["current_ratio_chg"] = cr.diff(252).clip(-2, 2)
+
+        # ── Raw fields (exposed for downstream Tier 3B signals) ──────────
+        # Expose raw daily-aligned underlying values so downstream feature
+        # builders can compose new ratios (value composites, Piotroski
+        # F-Score, cash-based operating profitability, etc.).
+        ticker_df["raw_assets"]             = ast_d
+        ticker_df["raw_liabilities"]        = lb_d
+        ticker_df["raw_equity"]             = eq_d
+        ticker_df["raw_net_income"]         = ni_d
+        ticker_df["raw_gross_profit"]       = gp_d
+        ticker_df["raw_revenue"]            = rev_d
+        ticker_df["raw_eps"]                = eps_d
+        ticker_df["raw_operating_cf"]       = ocf_d
+        ticker_df["raw_cash"]               = cash_d
+        ticker_df["raw_lt_debt"]            = debt_d
+        ticker_df["raw_shares_out"]         = shr_d
+        ticker_df["raw_sga"]                = sga_d
+        ticker_df["raw_interest_expense"]   = int_d
+        ticker_df["raw_current_assets"]     = ca_d
+        ticker_df["raw_current_liabilities"] = cl_d
 
         results[ticker] = ticker_df
         time.sleep(sleep_sec)

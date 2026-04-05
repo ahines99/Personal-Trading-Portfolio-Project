@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from data_loader import load_prices, get_close, get_returns, get_volume, get_sectors
 from features import build_composite_signal, realized_volatility, momentum
 from model import build_feature_matrix, build_labels, WalkForwardModel
-from portfolio import build_monthly_portfolio, compute_portfolio_stats
+from portfolio import build_monthly_portfolio, compute_portfolio_stats, apply_vol_targeting
 from backtest import run_backtest, TransactionCostModel
 from metrics import (compute_full_tearsheet, sharpe_ratio, annualized_return,
                      max_drawdown, sortino_ratio, annualized_volatility,
@@ -101,6 +101,12 @@ def load_shared_data(args):
             earnings_dict=earnings_dict,
             insider_dict=insider_dict,
             analyst_dict=analyst_dict,
+            sector_map=sector_map,
+            close=close,
+            # Point-in-time gates: keep OFF until historical time-series data
+            # is integrated (FINRA short-interest archive; SEC 13F-HR filings).
+            use_short_interest=False,
+            use_institutional_holdings=False,
         )
     except Exception as e:
         print(f"  Alt data loading failed: {e}")
@@ -153,7 +159,7 @@ def generate_ml_signal(data, forward_window=21, min_train_days=252,
 # ---------------------------------------------------------------------------
 
 def run_single_test(test_name, data, signal, portfolio_kwargs, spy_series,
-                    cost_model=None, capital=100_000):
+                    cost_model=None, capital=100_000, vol_target=0.0):
     """Run portfolio construction + backtest + metrics for one config."""
     t0 = time.time()
 
@@ -162,6 +168,13 @@ def run_single_test(test_name, data, signal, portfolio_kwargs, spy_series,
 
     try:
         weights, rebalance_dates = build_monthly_portfolio(signal=signal, **portfolio_kwargs)
+
+        # Optional volatility targeting overlay
+        if vol_target > 0:
+            weights = apply_vol_targeting(
+                weights, realized_vol=data["rvol"],
+                target_vol=vol_target, max_leverage=1.0, min_leverage=0.3,
+            )
 
         result = run_backtest(
             weights, data["prices"],
@@ -241,7 +254,11 @@ def get_baseline_portfolio_kwargs(data):
 
 
 def build_tests(data):
-    """Return list of (test_name, signal_kwargs, portfolio_kwargs_override) tuples."""
+    """Return list of (test_name, signal_kwargs, portfolio_kwargs_override) tuples.
+
+    signal_kwargs may include a reserved 'vol_target' key (float) which is
+    stripped before passing to the model and applied to portfolio weights.
+    """
     tests = []
     base_pk = get_baseline_portfolio_kwargs(data)
 
@@ -287,6 +304,71 @@ def build_tests(data):
                                          "ridge_weight": 0.50, "mlp_weight": 0.0}, {}))
     tests.append(("D8_lgbm30_xgb25_ridge25_mlp20_baseline", {}, {}))
 
+    # ── E: LIGHTGBM REGULARIZATION (NEW — previously hardcoded) ────────
+    # L1/L2 and min_gain_to_split were hardcoded at 5.0/10.0/0.05. Test whether
+    # current defaults are over- or under-regularized for this feature count.
+    tests.append(("E1_l1_0.5_l2_1",   {"lambda_l1": 0.5,  "lambda_l2": 1.0},   {}))
+    tests.append(("E2_l1_2_l2_5",     {"lambda_l1": 2.0,  "lambda_l2": 5.0},   {}))
+    tests.append(("E3_l1_5_l2_10_baseline", {"lambda_l1": 5.0, "lambda_l2": 10.0}, {}))
+    tests.append(("E4_l1_10_l2_20",   {"lambda_l1": 10.0, "lambda_l2": 20.0},  {}))
+    tests.append(("E5_l1_25_l2_50",   {"lambda_l1": 25.0, "lambda_l2": 50.0},  {}))
+    tests.append(("E6_mindata50",     {"min_child_samples": 50},               {}))
+    tests.append(("E7_mindata100",    {"min_child_samples": 100},              {}))
+    tests.append(("E8_maxdepth4",     {"max_depth": 4},                        {}))
+    tests.append(("E9_maxdepth10",    {"max_depth": 10},                       {}))
+    tests.append(("E10_featfrac0.3",  {"feature_fraction": 0.3},               {}))
+    tests.append(("E11_featfrac0.7",  {"feature_fraction": 0.7},               {}))
+    tests.append(("E12_featfrac0.9",  {"feature_fraction": 0.9},               {}))
+
+    # ── F: RIDGE ALPHA (previously hardcoded at 50.0, Optuna suggestion ignored) ─
+    tests.append(("F1_ridge5",    {"ridge_alpha": 5.0},   {}))
+    tests.append(("F2_ridge20",   {"ridge_alpha": 20.0},  {}))
+    tests.append(("F3_ridge50_baseline", {"ridge_alpha": 50.0}, {}))
+    tests.append(("F4_ridge100",  {"ridge_alpha": 100.0}, {}))
+    tests.append(("F5_ridge200",  {"ridge_alpha": 200.0}, {}))
+
+    # ── G: ENSEMBLE MIX (never walk-forward validated) ─────────────────
+    tests.append(("G1_lgbm_only",   {"lgbm_weight": 1.0, "xgb_weight": 0.0,
+                                      "ridge_weight": 0.0, "mlp_weight": 0.0}, {}))
+    tests.append(("G2_ridge_only",  {"lgbm_weight": 0.0, "xgb_weight": 0.0,
+                                      "ridge_weight": 1.0, "mlp_weight": 0.0}, {}))
+    tests.append(("G3_gbm_heavy",   {"lgbm_weight": 0.50, "xgb_weight": 0.30,
+                                      "ridge_weight": 0.20, "mlp_weight": 0.0}, {}))
+    tests.append(("G4_linear_heavy",{"lgbm_weight": 0.25, "xgb_weight": 0.15,
+                                      "ridge_weight": 0.50, "mlp_weight": 0.10}, {}))
+    tests.append(("G5_no_mlp",      {"lgbm_weight": 0.40, "xgb_weight": 0.30,
+                                      "ridge_weight": 0.30, "mlp_weight": 0.0}, {}))
+    tests.append(("G6_no_xgb",      {"lgbm_weight": 0.40, "xgb_weight": 0.0,
+                                      "ridge_weight": 0.35, "mlp_weight": 0.25}, {}))
+
+    # ── H: TRAINING WINDOW (min_train_days was never tested) ───────────
+    tests.append(("H1_train126",  {"min_train_days": 126},  {}))
+    tests.append(("H2_train252_baseline", {"min_train_days": 252}, {}))
+    tests.append(("H3_train504",  {"min_train_days": 504},  {}))
+    tests.append(("H4_train756",  {"min_train_days": 756},  {}))
+
+    # ── V: VOLATILITY TARGETING (Moreira & Muir 2017) ──────────────────
+    # Scale gross exposure inversely to ex-ante portfolio vol.
+    # Expected +0.2 to +0.4 Sharpe lift per academic literature.
+    tests.append(("V1_voltgt10",  {"vol_target": 0.10}, {}))
+    tests.append(("V2_voltgt12",  {"vol_target": 0.12}, {}))
+    tests.append(("V3_voltgt15",  {"vol_target": 0.15}, {}))
+    tests.append(("V4_voltgt18",  {"vol_target": 0.18}, {}))
+    tests.append(("V5_voltgt20",  {"vol_target": 0.20}, {}))
+
+    # ── X: COMBINED "BEST GUESS" CONFIGS ───────────────────────────────
+    # Stack known winners: no momentum filter, momentum-heavy blend, vol target.
+    tests.append(("X1_no_mom_filter_voltgt15", {"vol_target": 0.15}, {"momentum_filter": None}))
+    tests.append(("X2_mom_heavy_voltgt15", {"ml_blend": 0.30, "mom_blend": 0.70, "vol_target": 0.15}, {}))
+    tests.append(("X3_pure_mom_voltgt12", {"ml_blend": 0.0, "mom_blend": 1.0, "vol_target": 0.12}, {}))
+    tests.append(("X4_ml50_mom50_voltgt15_15pos",
+                  {"ml_blend": 0.50, "mom_blend": 0.50, "vol_target": 0.15}, {"n_positions": 15}))
+    tests.append(("X5_no_mom_filter_mom_heavy",
+                  {"ml_blend": 0.30, "mom_blend": 0.70}, {"momentum_filter": None}))
+    tests.append(("X6_ensemble_gbm_heavy_voltgt15",
+                  {"lgbm_weight": 0.50, "xgb_weight": 0.30, "ridge_weight": 0.20,
+                   "mlp_weight": 0.0, "vol_target": 0.15}, {}))
+
     return tests
 
 
@@ -301,7 +383,8 @@ def main():
     parser.add_argument("--quick", action="store_true",
                         help="Portfolio tests only (skip ML retraining)")
     parser.add_argument("--category", default=None,
-                        help="Run specific category: A, B, C, D")
+                        help="Run specific category: A, B, C, D, E, F, G, H, V, X "
+                             "(comma-separate for multiple, e.g. 'V,X')")
     args = parser.parse_args()
 
     RESULTS_FILE.parent.mkdir(exist_ok=True)
@@ -312,13 +395,14 @@ def main():
     # Build test list
     all_tests = build_tests(data)
 
-    # Filter by category
+    # Filter by category (accepts comma-separated list)
     if args.category:
-        all_tests = [(n, s, p) for n, s, p in all_tests if n.startswith(args.category)]
+        cats = tuple(c.strip() for c in args.category.split(",") if c.strip())
+        all_tests = [(n, s, p) for n, s, p in all_tests if n.startswith(cats)]
     elif args.quick:
-        # Quick mode: only B and C (portfolio + blend tests that reuse cached ML)
+        # Quick mode: portfolio + vol-target tests that reuse cached ML
         all_tests = [(n, s, p) for n, s, p in all_tests
-                     if n.startswith("B") or n.startswith("C")]
+                     if n.startswith(("B", "C", "V", "X"))]
 
     print(f"\n{'='*60}")
     print(f"  TEST SUITE: {len(all_tests)} tests")
@@ -350,6 +434,13 @@ def main():
             "mom_blend": 0.30,
             "num_leaves": 31,
             "learning_rate": 0.05,
+            "feature_fraction": 0.5,
+            "bagging_fraction": 0.7,
+            "min_child_samples": 20,
+            "lambda_l1": 5.0,
+            "lambda_l2": 10.0,
+            "max_depth": 7,
+            "ridge_alpha": 50.0,
             "lgbm_weight": 0.30,
             "xgb_weight": 0.25,
             "ridge_weight": 0.25,
@@ -357,11 +448,12 @@ def main():
         }
         sig_params.update(signal_kwargs)
 
-        # Separate model kwargs from blend kwargs
+        # Extract non-model keys
         ml_blend = sig_params.pop("ml_blend")
         mom_blend = sig_params.pop("mom_blend")
         fwd_window = sig_params.pop("forward_window")
         min_train = sig_params.pop("min_train_days")
+        vol_target = sig_params.pop("vol_target", 0.0)
 
         signal, wf = generate_ml_signal(
             data, forward_window=fwd_window, min_train_days=min_train,
@@ -372,7 +464,8 @@ def main():
         pk = dict(base_pk)
         pk.update(pk_override)
 
-        metrics = run_single_test(test_name, data, signal, pk, spy_series)
+        metrics = run_single_test(test_name, data, signal, pk, spy_series,
+                                  vol_target=vol_target)
         results.append(metrics)
 
         # Print summary

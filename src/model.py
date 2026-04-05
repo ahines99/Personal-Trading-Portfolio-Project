@@ -25,6 +25,17 @@ from typing import Dict, List, Optional
 _CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _cs_winsorize(df: pd.DataFrame, pct_low: float = 0.01, pct_high: float = 0.99) -> pd.DataFrame:
+    """Clip each date's cross-section at the given lower/upper percentiles.
+
+    Per-date cross-sectional winsorization — only uses within-date
+    information, so it introduces no temporal leakage.
+    """
+    lo = df.quantile(pct_low, axis=1)
+    hi = df.quantile(pct_high, axis=1)
+    return df.clip(lower=lo, upper=hi, axis=0)
+
 try:
     import lightgbm as lgb
     LGBM_AVAILABLE = True
@@ -55,6 +66,49 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 # Feature matrix builder
 # ---------------------------------------------------------------------------
 
+def size_neutralize(
+    feature_df: pd.DataFrame,
+    log_mcap_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Regress ``feature_df`` on ``log_mcap_df`` cross-sectionally per date
+    and return the residuals.
+
+    Both inputs must share index (dates) and columns (tickers). For each date
+    (row), we run a single-variable OLS of feature ~ a + b * log_mcap using
+    only tickers where both values are finite, and return the residual
+    (feature - (a + b * log_mcap)). Rows with fewer than 10 valid tickers or
+    zero variance in log_mcap are returned unchanged (after ffill alignment).
+    """
+    # Align
+    lm = log_mcap_df.reindex(index=feature_df.index, columns=feature_df.columns)
+    out = feature_df.copy()
+
+    x_arr = lm.to_numpy(dtype=float)
+    y_arr = feature_df.to_numpy(dtype=float)
+    res = y_arr.copy()
+
+    for i in range(y_arr.shape[0]):
+        x = x_arr[i]
+        y = y_arr[i]
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 10:
+            continue
+        xv = x[mask]
+        yv = y[mask]
+        xm = xv.mean()
+        ym = yv.mean()
+        dx = xv - xm
+        denom = (dx * dx).sum()
+        if denom <= 0 or not np.isfinite(denom):
+            continue
+        beta = (dx * (yv - ym)).sum() / denom
+        alpha = ym - beta * xm
+        pred = alpha + beta * x  # full row (NaNs stay NaN)
+        res[i] = y - pred
+    out.iloc[:, :] = res
+    return out
+
+
 def build_feature_matrix(
     close: pd.DataFrame,
     returns: pd.DataFrame,
@@ -63,6 +117,11 @@ def build_feature_matrix(
     alt_features: Optional[Dict[str, pd.DataFrame]] = None,
     use_cache: bool = True,
     sector_map: Optional[Dict[str, str]] = None,
+    size_neutralize: bool = True,  # noqa: shadows helper name intentionally (public API)
+    shares_outstanding: Optional[pd.DataFrame] = None,
+    sector_neutralize_features: bool = True,
+    winsorize: bool = True,
+    cs_zscore_all: bool = True,
 ) -> pd.DataFrame:
     """
     Build long-format feature matrix for the ML model.
@@ -80,12 +139,30 @@ def build_feature_matrix(
       Extra:           ranked low-vol feature
       Alt data:        fundamentals, macro, VIX term structure,
                        short interest, earnings surprise (if provided)
+
+    Parameters
+    ----------
+    size_neutralize : if True, add ``_sn`` variants of the most size-contaminated
+        features (momentum, volatility, beta, Amihud) by regressing each one
+        cross-sectionally on ``log_mcap_z`` per date and taking residuals.
+    shares_outstanding : optional DataFrame (index=dates, columns=tickers) of
+        shares outstanding. Used to compute market cap = close * shares. If
+        None or sparse, falls back to log(21d rolling dollar volume) as a
+        size proxy.
     """
+    # Local alias for the module-level helper (parameter of the same name
+    # shadows it inside this function).
+    _size_neutralize_fn = globals()["size_neutralize"]
+    _do_size_neutralize = bool(size_neutralize)
+
     # ── feature panel cache ──────────────────────────────────────────────────
     _cache_key = hashlib.md5(
         f"{close.index[0]}_{close.index[-1]}_{close.shape}_{sorted(ranked_signals.keys())}"
         f"_{sorted(alt_features.keys()) if alt_features else []}"
-        f"_sector={bool(sector_map)}".encode()
+        f"_sector={bool(sector_map)}"
+        f"_sn={bool(size_neutralize)}_shr={shares_outstanding is not None}"
+        f"_sni={bool(sector_neutralize_features)}"
+        f"_wz={bool(winsorize)}_csz={bool(cs_zscore_all)}".encode()
     ).hexdigest()[:12]
     _cache_file = _CACHE_DIR / f"feature_panel_{_cache_key}.pkl"
 
@@ -124,6 +201,7 @@ def build_feature_matrix(
         short_term_reversal,
         volume_confirmed_reversal,
         sector_relative_momentum,
+        sector_neutralize as _sector_neutralize_fn,
     )
 
     features = {}
@@ -208,6 +286,89 @@ def build_feature_matrix(
         key = f"mom_{mom_w}d"
         if key in features:
             features[f"z_{key}"] = _cs_zscore(features[key])
+
+    # ── Size feature: log market cap (cross-sectionally z-scored) ────────────
+    # Market cap = Close * SharesOutstanding (ffilled within each ticker,
+    # since shares update quarterly). If shares_outstanding is missing or
+    # too sparse, fall back to log(21d rolling dollar volume) as a proxy.
+    log_mcap_raw = None
+    _used_shares = False
+    if shares_outstanding is not None:
+        try:
+            shr = shares_outstanding.reindex(index=close.index, columns=close.columns)
+            shr = shr.ffill()
+            # require ≥20% coverage on average to consider usable
+            if shr.notna().mean().mean() > 0.20:
+                mcap = close * shr
+                mcap = mcap.where(mcap > 0)
+                log_mcap_raw = np.log(mcap)
+                _used_shares = True
+        except Exception:
+            log_mcap_raw = None
+
+    if log_mcap_raw is None:
+        # Fallback: 21-day rolling dollar volume
+        dollar_vol = (close * volume).rolling(21, min_periods=5).mean()
+        dollar_vol = dollar_vol.where(dollar_vol > 0)
+        log_mcap_raw = np.log(dollar_vol)
+
+    log_mcap_z = _cs_zscore(log_mcap_raw)
+    features["log_mcap_z"] = log_mcap_z
+    print(
+        f"      [size] log_mcap_z built from "
+        f"{'shares outstanding' if _used_shares else 'dollar-volume proxy'}"
+    )
+
+    # ── Size-neutralized variants of size-contaminated features ─────────────
+    # Regress each feature cross-sectionally on log_mcap_z per date and keep
+    # the residual. This purges the systematic small-cap tilt without
+    # shrinking the training universe.
+    if _do_size_neutralize:
+        _sn_targets = [
+            "mom_21d", "mom_63d", "mom_126d",
+            "z_mom_63d", "z_mom_126d",
+            "rvol_21d", "idiovol_21d",
+            "z_rvol_21d", "z_idiovol_21d",
+            "mkt_beta_63d", "z_mkt_beta_63d",
+            "amihud_21d", "z_amihud_21d",
+        ]
+        _sn_added = []
+        for feat_name in _sn_targets:
+            if feat_name not in features:
+                continue
+            try:
+                features[f"{feat_name}_sn"] = _size_neutralize_fn(
+                    features[feat_name], log_mcap_z
+                )
+                _sn_added.append(feat_name)
+            except Exception as _e:
+                warnings.warn(f"size_neutralize failed for {feat_name}: {_e}")
+        print(f"      [size] added {len(_sn_added)} size-neutralized _sn variants")
+
+    # ── Sector-neutralized variants of sector-contaminated features ─────────
+    # Subtract the per-date, per-sector mean from each feature value. This
+    # removes systematic sector tilts so downstream ranking measures purely
+    # within-industry stock-picking (JKP 2023, AQR best practice).
+    if sector_neutralize_features and sector_map:
+        _sni_targets = [
+            "mom_63d", "mom_126d",
+            "z_mom_63d", "z_mom_126d",
+            "idiovol_21d", "z_idiovol_21d",
+            "mkt_beta_63d", "z_mkt_beta_63d",
+            "rvol_21d", "z_rvol_21d",
+        ]
+        _sni_added = []
+        for feat_name in _sni_targets:
+            if feat_name not in features:
+                continue
+            try:
+                features[f"{feat_name}_sni"] = _sector_neutralize_fn(
+                    features[feat_name], sector_map
+                )
+                _sni_added.append(feat_name)
+            except Exception as _e:
+                warnings.warn(f"sector_neutralize failed for {feat_name}: {_e}")
+        print(f"      [sector] added {len(_sni_added)} sector-neutralized _sni variants")
 
     # ── Calendar / seasonality features ──────────────────────────────────────
     # January effect (small caps), Q4 window dressing, Q1 tax selling.
@@ -343,6 +504,46 @@ def build_feature_matrix(
 
         features["sector_momentum_63d"] = sector_mom
 
+    # ── Winsorize + cross-sectionally z-score continuous features ──────────
+    # Apply to ALL continuous numeric features EXCEPT:
+    #   - rank_* features (already in [0,1])
+    #   - z_* features (already cross-sectionally z-scored)
+    #   - boolean/binary signals
+    # Per-date cross-sectional operations only use within-date information,
+    # so they introduce no temporal leakage (fold-safe).
+    def _is_continuous_feat(name: str, df: pd.DataFrame) -> bool:
+        if name.startswith("rank_") or name.startswith("z_"):
+            return False
+        # Exclude booleans
+        try:
+            if df.dtypes.apply(lambda t: t == bool).all():
+                return False
+        except Exception:
+            pass
+        return True
+
+    _continuous_feats = [n for n, d in features.items() if _is_continuous_feat(n, d)]
+
+    if winsorize:
+        for name in _continuous_feats:
+            try:
+                features[name] = _cs_winsorize(features[name], 0.01, 0.99)
+            except Exception:
+                pass
+        print(f"      [winsor] winsorized {len(_continuous_feats)} continuous features at 1/99 pct")
+
+    if cs_zscore_all:
+        # Per-date cross-sectional z-score — only uses same-date information,
+        # so introduces NO temporal leakage (no rolling window required).
+        _csz_added = 0
+        for name in _continuous_feats:
+            try:
+                features[f"{name}_csz"] = _cs_zscore(features[name])
+                _csz_added += 1
+            except Exception:
+                pass
+        print(f"      [csz] added {_csz_added} cross-sectional z-scored _csz variants")
+
     panels = []
     for feat_name, df in features.items():
         s = df.stack(future_stack=True)
@@ -362,9 +563,10 @@ def build_feature_matrix(
 
 def build_labels(
     returns: pd.DataFrame,
-    forward_window: int = 21,
-    risk_adjust: bool = True,
+    forward_window: int = 5,
+    risk_adjust: bool = False,
     sector_map: Optional[Dict[str, str]] = None,
+    sector_rank_weight: float = 0.0,
 ) -> pd.Series:
     """
     Build 6-grade relevance labels for LambdaRank.
@@ -383,12 +585,11 @@ def build_labels(
       Grade 4: 80-95%        (good)
       Grade 5: top 5%        (superstar — what we're hunting for)
 
-    Risk-adjusted labels (default):
-      Instead of ranking raw forward returns, we rank forward_return / trailing_vol.
-      This trains the model to find CONSISTENT winners rather than volatile lottery
-      tickets. A stock returning +8% at 15% vol scores higher than one returning
-      +12% at 50% vol. For a concentrated 20-stock portfolio, consistency compounds
-      better than variance.
+    Risk-adjusted labels (opt-in, default OFF):
+      If risk_adjust=True, ranks forward_return / trailing_vol instead of raw
+      forward return. This was the historical default, but empirically vol-
+      scaling systematically down-weights momentum stocks (where the alpha
+      lives) and hurt realized Sharpe. Left available for experiments.
 
     Labels for the last `forward_window` days are NaN (unrealized returns).
     """
@@ -405,11 +606,13 @@ def build_labels(
 
     # Within-industry ranking: rank each stock vs its sector peers.
     # This forces the model to learn stock selection, not sector bets.
-    # Blend: 50% within-sector rank + 50% universe-wide rank.
-    # Pure within-sector would ignore cross-sector opportunities.
+    # Blend is parameterized via sector_rank_weight:
+    #   0.0 = pure universe rank (default — captures cross-sector mega-cap alpha)
+    #   0.5 = 50/50 blend (legacy behavior)
+    #   1.0 = pure within-sector rank
     universe_rank = fwd_signal.rank(axis=1, pct=True)
 
-    if sector_map is not None:
+    if sector_map is not None and sector_rank_weight > 0.0:
         sector_rank = pd.DataFrame(np.nan, index=fwd_signal.index, columns=fwd_signal.columns)
         sector_groups: Dict[str, list] = {}
         for ticker in fwd_signal.columns:
@@ -423,7 +626,7 @@ def build_labels(
             else:
                 sector_rank[tickers] = fwd_signal[tickers].rank(axis=1, pct=True)
 
-        pct_rank = 0.50 * universe_rank + 0.50 * sector_rank
+        pct_rank = (1.0 - sector_rank_weight) * universe_rank + sector_rank_weight * sector_rank
     else:
         pct_rank = universe_rank
 
@@ -465,7 +668,9 @@ class WalkForwardModel:
         self,
         min_train_days: int = 126,
         retrain_freq: int = 21,
-        forward_window: int = 1,
+        forward_window: int = 5,
+        risk_adjust: bool = False,
+        sector_rank_weight: float = 0.0,
         # LightGBM hyperparams
         n_estimators: int = 500,
         learning_rate: float = 0.03,
@@ -479,6 +684,13 @@ class WalkForwardModel:
         # to produce more diverse trees (de-correlation effect).
         bagging_fraction: float = 0.7,
         min_child_samples: int = 20,
+        # LightGBM regularization (previously hardcoded in _fit_lgbm)
+        lambda_l1: float = 5.0,
+        lambda_l2: float = 10.0,
+        min_gain_to_split: float = 0.05,
+        max_depth: int = 7,
+        # Ridge alpha (previously hardcoded to 50.0)
+        ridge_alpha: float = 50.0,
         # Ensemble blend weights (4 models)
         lgbm_weight: float = 0.30,
         xgb_weight: float = 0.25,
@@ -497,16 +709,26 @@ class WalkForwardModel:
         # Feature neutralization: regress out vol from all features before
         # training. Forces model to find orthogonal signal, not vol-sort.
         neutralize_vol: bool = False,
+        # MLP: default OFF. MLP adds ~20% training time for marginal
+        # contribution. Opt-in via use_mlp=True.
+        use_mlp: bool = False,
     ):
         self.min_train_days    = min_train_days
         self.retrain_freq      = retrain_freq
         self.forward_window    = forward_window
+        self.risk_adjust       = risk_adjust
+        self.sector_rank_weight = sector_rank_weight
         self.n_estimators      = n_estimators
         self.learning_rate     = learning_rate
         self.num_leaves        = num_leaves
         self.feature_fraction  = feature_fraction
         self.bagging_fraction  = bagging_fraction
         self.min_child_samples = min_child_samples
+        self.lambda_l1         = lambda_l1
+        self.lambda_l2         = lambda_l2
+        self.min_gain_to_split = min_gain_to_split
+        self.max_depth         = max_depth
+        self.ridge_alpha       = ridge_alpha
         self.lgbm_weight       = lgbm_weight
         self.xgb_weight   = xgb_weight
         self.ridge_weight      = ridge_weight
@@ -516,6 +738,18 @@ class WalkForwardModel:
         self.max_feature_corr  = max_feature_corr
         self.max_train_days    = max_train_days
         self.neutralize_vol    = neutralize_vol
+        self.use_mlp           = use_mlp
+
+        # If MLP disabled, zero its weight and renormalize the other model
+        # weights so the ensemble still sums to 1.0. User-configured
+        # lgbm/xgb/ridge weights are preserved proportionally.
+        if not self.use_mlp:
+            self.mlp_weight = 0.0
+            _other = self.lgbm_weight + self.xgb_weight + self.ridge_weight
+            if _other > 0:
+                self.lgbm_weight  = self.lgbm_weight  / _other
+                self.xgb_weight   = self.xgb_weight   / _other
+                self.ridge_weight = self.ridge_weight / _other
 
         self.models_: List[dict] = []
         self.feature_names_: Optional[List[str]] = None
@@ -555,10 +789,10 @@ class WalkForwardModel:
             # L1 encourages sparse leaf outputs, L2 shrinks all leaf weights.
             # Prevents overfitting to noise in cross-sectional financial data.
             # Values calibrated per Qlib benchmark + practitioner literature.
-            "lambda_l1":         5.0,
-            "lambda_l2":         10.0,
-            "min_gain_to_split": 0.05,  # prevent splits on noise
-            "max_depth":         7,     # secondary guard on leaf-wise depth
+            "lambda_l1":         self.lambda_l1,
+            "lambda_l2":         self.lambda_l2,
+            "min_gain_to_split": self.min_gain_to_split,  # prevent splits on noise
+            "max_depth":         self.max_depth,           # secondary guard on leaf-wise depth
             "num_threads":       -1,
             "verbose":           -1,
             "device":            "gpu" if TORCH_AVAILABLE else "cpu",
@@ -572,7 +806,7 @@ class WalkForwardModel:
 
     def _fit_ridge(self, X: np.ndarray, y: np.ndarray,
                    sample_weight: Optional[np.ndarray] = None):
-        model = Ridge(alpha=50.0)
+        model = Ridge(alpha=self.ridge_alpha)
         model.fit(X, y, sample_weight=sample_weight)
         return model
 
@@ -940,7 +1174,7 @@ class WalkForwardModel:
         ensemble["ridge"] = self._fit_ridge(X_vals, y_vals,
                                             sample_weight=sample_weight)
 
-        if TORCH_AVAILABLE:
+        if self.use_mlp and TORCH_AVAILABLE:
             mlp = self._fit_mlp(X_vals, y_vals)
             if mlp is not None:
                 ensemble["mlp"] = mlp
@@ -1044,7 +1278,7 @@ class WalkForwardModel:
             f"{self.learning_rate}_{self.prune_features}_"
             f"{self.feature_fraction}_{self.bagging_fraction}_"
             f"{self.max_feature_corr}_{self.max_train_days}_"
-            f"{self.neutralize_vol}".encode()
+            f"{self.neutralize_vol}_{self.use_mlp}".encode()
         ).hexdigest()[:12]
         _cache_file = _CACHE_DIR / f"ml_predictions_{_cache_key}.pkl"
 
@@ -1239,11 +1473,23 @@ def optimize_hyperparameters(
     eval_dates = all_dates[eval_start:]
 
     def objective(trial):
-        num_leaves = trial.suggest_int("num_leaves", 10, 50)
+        num_leaves = trial.suggest_int("num_leaves", 10, 63)
         lr = trial.suggest_float("learning_rate", 0.01, 0.1, log=True)
         feat_frac = trial.suggest_float("feature_fraction", 0.4, 0.9)
-        n_est = trial.suggest_int("n_estimators", 100, 400, step=50)
+        bag_frac = trial.suggest_float("bagging_fraction", 0.5, 0.9)
+        n_est = trial.suggest_int("n_estimators", 100, 500, step=50)
         ridge_alpha = trial.suggest_float("ridge_alpha", 5.0, 200.0, log=True)
+        lambda_l1 = trial.suggest_float("lambda_l1", 0.1, 50.0, log=True)
+        lambda_l2 = trial.suggest_float("lambda_l2", 0.1, 100.0, log=True)
+        min_child = trial.suggest_int("min_child_samples", 10, 50)
+        max_depth = trial.suggest_int("max_depth", 4, 10)
+        # Ensemble weight ratios (normalized later)
+        lgbm_w = trial.suggest_float("lgbm_weight", 0.1, 0.6)
+        xgb_w = trial.suggest_float("xgb_weight", 0.0, 0.5)
+        ridge_w = trial.suggest_float("ridge_weight", 0.1, 0.5)
+        mlp_w = trial.suggest_float("mlp_weight", 0.0, 0.4)
+        total_w = lgbm_w + xgb_w + ridge_w + mlp_w
+        lgbm_w, xgb_w, ridge_w, mlp_w = [w / total_w for w in (lgbm_w, xgb_w, ridge_w, mlp_w)]
 
         wf = WalkForwardModel(
             min_train_days=252,
@@ -1251,7 +1497,17 @@ def optimize_hyperparameters(
             num_leaves=num_leaves,
             learning_rate=lr,
             feature_fraction=feat_frac,
+            bagging_fraction=bag_frac,
             n_estimators=n_est,
+            min_child_samples=min_child,
+            max_depth=max_depth,
+            lambda_l1=lambda_l1,
+            lambda_l2=lambda_l2,
+            ridge_alpha=ridge_alpha,
+            lgbm_weight=lgbm_w,
+            xgb_weight=xgb_w,
+            ridge_weight=ridge_w,
+            mlp_weight=mlp_w,
             prune_features=False,  # skip pruning for speed
         )
 

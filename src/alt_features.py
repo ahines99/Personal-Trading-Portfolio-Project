@@ -67,6 +67,9 @@ def build_fundamental_signals(
     edgar_df: pd.DataFrame,
     tickers: pd.Index,
     date_index: pd.DatetimeIndex,
+    sector_map: Optional[Dict[str, str]] = None,
+    sector_neutralize_signals: bool = True,
+    close: Optional[pd.DataFrame] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Parameters
@@ -130,6 +133,187 @@ def build_fundamental_signals(
         if not higher_is_better:
             df = -df
         signals[f"{factor}_signal"] = _cs_rank(df)
+
+    # ── Tier 3B: helper to build daily panel of a raw fundamentals field ────
+    _FILING_LAG_RAW = _FILING_LAG
+
+    def _raw_panel(field: str) -> Optional[pd.DataFrame]:
+        """Build (dates × tickers) panel of a raw_* edgar field, filing-lagged."""
+        frames = {}
+        for ticker in tickers:
+            if (ticker, field) in edgar_df.columns:
+                raw = edgar_df[(ticker, field)].dropna()
+                if raw.empty:
+                    continue
+                lagged = raw.copy()
+                lagged.index = lagged.index + _FILING_LAG_RAW
+                frames[ticker] = lagged.reindex(date_index, method="ffill")
+        if not frames:
+            return None
+        return pd.DataFrame(frames, index=date_index).reindex(columns=tickers)
+
+    assets_p   = _raw_panel("raw_assets")
+    liab_p     = _raw_panel("raw_liabilities")
+    equity_p   = _raw_panel("raw_equity")
+    netinc_p   = _raw_panel("raw_net_income")
+    gprofit_p  = _raw_panel("raw_gross_profit")
+    revenue_p  = _raw_panel("raw_revenue")
+    ocf_p      = _raw_panel("raw_operating_cf")
+    cash_p     = _raw_panel("raw_cash")
+    ltdebt_p   = _raw_panel("raw_lt_debt")
+    shares_p   = _raw_panel("raw_shares_out")
+    sga_p      = _raw_panel("raw_sga")
+    intexp_p   = _raw_panel("raw_interest_expense")
+    ca_p       = _raw_panel("raw_current_assets")
+    cl_p       = _raw_panel("raw_current_liabilities")
+
+    # Market cap (Close × Shares Outstanding) — required for value yields
+    market_cap = None
+    if close is not None and shares_p is not None:
+        close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
+        market_cap = close_aligned * shares_p
+
+    # ── Tier 3B Feature 1: Multi-factor Value Composite ────────────────────
+    # Asness-Frazzini "Devil in HML's Details" (2013); Loughran-Wellman (2011)
+    new_signals: Dict[str, pd.DataFrame] = {}
+
+    if market_cap is not None:
+        mc_safe = market_cap.replace(0, np.nan)
+
+        # earnings_yield = Net Income / Market Cap
+        if netinc_p is not None:
+            ey = (netinc_p / mc_safe).clip(-5, 5)
+            new_signals["earnings_yield_signal"] = _cs_rank(ey)
+
+        # sales_yield = Revenue / Market Cap
+        if revenue_p is not None:
+            sy = (revenue_p / mc_safe).clip(-50, 50)
+            new_signals["sales_yield_signal"] = _cs_rank(sy)
+
+        # fcf_yield ≈ Operating CF / Market Cap (Capex unavailable)
+        if ocf_p is not None:
+            fy = (ocf_p / mc_safe).clip(-5, 5)
+            new_signals["fcf_yield_signal"] = _cs_rank(fy)
+
+        # ebit_to_ev = (NetIncome + InterestExpense) / (MarketCap + Debt - Cash)
+        if netinc_p is not None and intexp_p is not None:
+            ebit_num = netinc_p + intexp_p.fillna(0)
+            debt_term = ltdebt_p.fillna(0) if ltdebt_p is not None else 0
+            cash_term = cash_p.fillna(0) if cash_p is not None else 0
+            ev = (market_cap + debt_term - cash_term).replace(0, np.nan)
+            ebit_ev = (ebit_num / ev).clip(-5, 5)
+            new_signals["ebit_ev_signal"] = _cs_rank(ebit_ev)
+
+        # Composite: mean of ranked yields across available ones per row
+        yield_ranks = [
+            new_signals[k] for k in
+            ("earnings_yield_signal", "sales_yield_signal",
+             "fcf_yield_signal", "ebit_ev_signal")
+            if k in new_signals
+        ]
+        if yield_ranks:
+            composite = sum(yield_ranks) / len(yield_ranks)
+            # composite is already in [0,1] range (mean of ranks), rerank
+            # cross-sectionally so it's a clean [0,1] signal
+            new_signals["value_composite_signal"] = _cs_rank(composite)
+
+    # ── Tier 3B Feature 2: Cash-Based Operating Profitability ──────────────
+    # Ball, Gerakos, Linnainmaa, Nikolaev (2016)
+    # = (Revenue - COGS - SGA - ΔWC) / Total Assets
+    # where COGS = Revenue - GrossProfit, WC = CurrentAssets - CurrentLiabilities
+    if (revenue_p is not None and gprofit_p is not None and assets_p is not None):
+        cogs_p = revenue_p - gprofit_p
+        sga_term = sga_p.fillna(0) if sga_p is not None else 0
+        if ca_p is not None and cl_p is not None:
+            wc = ca_p - cl_p
+            delta_wc = wc.diff(252)
+        else:
+            delta_wc = 0
+        cbop_num = revenue_p - cogs_p - sga_term - (delta_wc if not isinstance(delta_wc, int) else 0)
+        cbop = (cbop_num / assets_p.replace(0, np.nan)).clip(-5, 5)
+        new_signals["cash_based_op_prof_signal"] = _cs_rank(cbop)
+
+    # ── Tier 3B Feature 3: Piotroski F-Score (9-signal composite) ──────────
+    # Piotroski (2000)
+    if assets_p is not None and netinc_p is not None:
+        assets_safe = assets_p.replace(0, np.nan)
+        roa = netinc_p / assets_safe
+
+        f1 = (roa > 0).astype(float)                                     # 1
+        f2 = ((ocf_p > 0).astype(float)
+              if ocf_p is not None else pd.DataFrame(0.0, index=date_index, columns=tickers))  # 2
+        f3 = (roa.diff(252) > 0).astype(float)                           # 3
+        if ocf_p is not None:
+            f4 = (ocf_p > netinc_p).astype(float)                        # 4
+        else:
+            f4 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+        # 5: Long-term Debt / Assets decreasing YoY (use total Debt proxy if needed)
+        debt_for_lev = ltdebt_p if ltdebt_p is not None else liab_p
+        if debt_for_lev is not None:
+            lev_ratio = debt_for_lev / assets_safe
+            f5 = (lev_ratio.diff(252) < 0).astype(float)
+        else:
+            f5 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+        # 6: Current Ratio increasing YoY
+        if ca_p is not None and cl_p is not None:
+            curr_ratio = ca_p / cl_p.replace(0, np.nan)
+            f6 = (curr_ratio.diff(252) > 0).astype(float)
+        else:
+            f6 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+        # 7: Shares NOT increasing YoY
+        if shares_p is not None:
+            f7 = (shares_p.diff(252) <= 0).astype(float)
+        else:
+            f7 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+        # 8: Gross Margin increasing YoY
+        if gprofit_p is not None and revenue_p is not None:
+            gm = gprofit_p / revenue_p.replace(0, np.nan)
+            f8 = (gm.diff(252) > 0).astype(float)
+        else:
+            f8 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+        # 9: Asset Turnover increasing YoY
+        if revenue_p is not None:
+            at_ratio = revenue_p / assets_safe
+            f9 = (at_ratio.diff(252) > 0).astype(float)
+        else:
+            f9 = pd.DataFrame(0.0, index=date_index, columns=tickers)
+
+        f_score = f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9
+        # mask out rows where we have no fundamentals at all (roa all NaN)
+        f_score = f_score.where(roa.notna())
+        new_signals["piotroski_f_score_signal"] = _cs_rank(f_score)
+
+    # merge the Tier 3B signals into the main dict
+    signals.update(new_signals)
+
+    # ── Sector-neutralized variants ─────────────────────────────────────────
+    # Subtract per-date sector mean from each fundamental signal so the signal
+    # captures within-industry differences rather than sector-level tilts
+    # (JKP 2023, AQR best practice for quality / value / momentum).
+    if sector_neutralize_signals and sector_map:
+        try:
+            from features import sector_neutralize as _sector_neutralize_fn
+        except ImportError:
+            from src.features import sector_neutralize as _sector_neutralize_fn
+        _sni_factors = [
+            "book_to_market", "roe", "gross_margin", "asset_growth",
+            "leverage", "gross_profitability", "accruals",
+            "net_operating_assets", "net_share_issuance",
+            "operating_profitability", "current_ratio_chg",
+            # Tier 3B additions
+            "earnings_yield", "sales_yield", "fcf_yield", "ebit_ev",
+            "value_composite", "cash_based_op_prof", "piotroski_f_score",
+        ]
+        for factor in _sni_factors:
+            sig_name = f"{factor}_signal"
+            if sig_name not in signals:
+                continue
+            try:
+                signals[f"{sig_name}_sni"] = _sector_neutralize_fn(
+                    signals[sig_name], sector_map
+                )
+            except Exception:
+                pass
 
     return signals
 
@@ -274,6 +458,9 @@ def build_earnings_signals(
     date_index: pd.DatetimeIndex,
     surprise_carry_days: int = 60,
     days_to_earnings_window: int = 30,
+    close: Optional[pd.DataFrame] = None,
+    sector_map: Optional[Dict[str, str]] = None,
+    sector_neutralize_signals: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
     Parameters
@@ -345,6 +532,65 @@ def build_earnings_signals(
     # Negate days so *closer* = higher rank (more signal)
     if days_panel.notna().any().any():
         signals["days_to_earnings_signal"] = _cs_rank(-days_panel)
+
+    # ── Tier 3B Feature 4: 3-day Earnings Announcement Return (EAR) ─────────
+    # Brandt-Kishore-Santa-Clara-Venkatachalam (2008) — orthogonal to PEAD.
+    # For each earnings date t, compute (close[t+1] - close[t-1]) / close[t-1]
+    # and carry forward for `surprise_carry_days` business days.
+    if close is not None:
+        close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
+        ear_panel = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+
+        for ticker in tickers:
+            if ticker not in earnings_dict:
+                continue
+            earn = earnings_dict[ticker]
+            if earn is None or earn.empty:
+                continue
+            if ticker not in close_aligned.columns:
+                continue
+            px = close_aligned[ticker]
+            if px.dropna().empty:
+                continue
+
+            ear_ts = pd.Series(np.nan, index=date_index)
+            for edate in earn.index:
+                edate_norm = pd.Timestamp(edate).normalize()
+                # Anchor t = first business day >= announcement
+                valid = date_index[date_index >= edate_norm]
+                if len(valid) == 0:
+                    continue
+                t_idx = date_index.get_loc(valid[0])
+                if t_idx < 1 or t_idx + 1 >= len(date_index):
+                    continue
+                p_pre = px.iloc[t_idx - 1]
+                p_post = px.iloc[t_idx + 1]
+                if pd.isna(p_pre) or pd.isna(p_post) or p_pre == 0:
+                    continue
+                ear_val = (p_post - p_pre) / p_pre
+                # Carry forward for surprise_carry_days
+                post_dates = date_index[t_idx:t_idx + surprise_carry_days]
+                ear_ts.loc[post_dates] = ear_val
+            ear_panel[ticker] = ear_ts
+
+        if ear_panel.notna().any().any():
+            signals["earnings_ann_return_signal"] = _cs_rank(ear_panel)
+
+    # ── Sector-neutralized variants (Tier 3A / 3B) ─────────────────────────
+    if sector_neutralize_signals and sector_map:
+        try:
+            from features import sector_neutralize as _sector_neutralize_fn
+        except ImportError:
+            from src.features import sector_neutralize as _sector_neutralize_fn
+        for base in ("earnings_ann_return_signal",):
+            if base not in signals:
+                continue
+            try:
+                signals[f"{base}_sni"] = _sector_neutralize_fn(
+                    signals[base], sector_map
+                )
+            except Exception:
+                pass
 
     return signals
 
@@ -639,11 +885,29 @@ def build_alt_features(
     vix_df: Optional[pd.DataFrame] = None,
     si_df: Optional[pd.DataFrame] = None,
     earnings_dict: Optional[Dict] = None,
+    sector_map: Optional[Dict[str, str]] = None,
+    close: Optional[pd.DataFrame] = None,
+    use_short_interest: bool = False,
+    use_institutional_holdings: bool = False,
     **kwargs,
 ) -> Dict[str, pd.DataFrame]:
     """
     Convenience wrapper that calls all five signal builders and returns a
     combined dict of signal_name → DataFrame (dates × tickers).
+
+    Parameters
+    ----------
+    use_short_interest : bool, default False
+        Gate for short-interest signals (short_ratio_signal, short_pct_float_signal).
+        DISABLED until historical FINRA bi-monthly short-interest archive is
+        integrated. Current snapshot-broadcast breaks point-in-time correctness
+        and creates lookahead bias.
+    use_institutional_holdings : bool, default False
+        Gate for institutional / insider ownership signals
+        (institutional_ownership_signal, insider_ownership_signal).
+        DISABLED until time-series 13F data is integrated (e.g., via SEC EDGAR
+        13F-HR filings). Current snapshot-broadcast breaks point-in-time
+        correctness.
     """
     all_signals: Dict[str, pd.DataFrame] = {}
 
@@ -652,13 +916,23 @@ def build_alt_features(
             if v is not None and not v.empty:
                 all_signals[k] = v.reindex(index=date_index, columns=tickers, method="ffill")
 
-    _merge(build_fundamental_signals(edgar_df, tickers, date_index))
+    _merge(build_fundamental_signals(
+        edgar_df, tickers, date_index, sector_map=sector_map, close=close,
+    ))
     _merge(build_macro_features(fred_df, tickers, date_index))
     _merge(build_vix_features(vix_df, tickers, date_index))
-    _merge(build_short_interest_signals(si_df, tickers, date_index))
+
+    # DISABLED until historical FINRA bi-monthly short-interest archive is
+    # integrated. Current snapshot-broadcast breaks point-in-time correctness
+    # and creates lookahead bias. Opt-in via use_short_interest=True.
+    if use_short_interest:
+        _merge(build_short_interest_signals(si_df, tickers, date_index))
 
     if earnings_dict is not None:
-        _merge(build_earnings_signals(earnings_dict, tickers, date_index))
+        _merge(build_earnings_signals(
+            earnings_dict, tickers, date_index,
+            close=close, sector_map=sector_map,
+        ))
 
     if kwargs.get("insider_dict"):
         _merge(build_insider_signals(kwargs["insider_dict"], tickers, date_index))
@@ -669,7 +943,10 @@ def build_alt_features(
     if kwargs.get("estimates_df") is not None:
         _merge(build_estimate_signals(kwargs["estimates_df"], tickers, date_index))
 
-    if kwargs.get("institutional_df") is not None:
+    # DISABLED until time-series 13F data is integrated (e.g., via SEC EDGAR
+    # 13F-HR filings). Current snapshot-broadcast breaks point-in-time
+    # correctness. Opt-in via use_institutional_holdings=True.
+    if use_institutional_holdings and kwargs.get("institutional_df") is not None:
         _merge(build_institutional_signals(kwargs["institutional_df"], tickers, date_index))
 
     return all_signals

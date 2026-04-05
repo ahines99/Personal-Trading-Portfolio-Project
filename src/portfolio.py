@@ -20,6 +20,67 @@ import numpy as np
 import pandas as pd
 
 
+# Hardcoded top-10 SPY mega caps (yfinance ticker format: BRK-B not BRK.B).
+# Used when force_mega_caps=True to prevent breadth collapse from pushing
+# model-liked mega-caps out via vol-bucket/sector-cap constraints.
+MEGA_CAPS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
+    "META", "TSLA", "BRK-B", "LLY", "JPM",
+]
+
+
+# ---------------------------------------------------------------------------
+# Volatility targeting overlay
+# ---------------------------------------------------------------------------
+
+def apply_vol_targeting(
+    weights: pd.DataFrame,
+    realized_vol: pd.DataFrame,
+    target_vol: float = 0.16,
+    avg_correlation: float = 0.45,
+    max_leverage: float = 1.3,
+    min_leverage: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Scale portfolio gross exposure inversely to ex-ante portfolio vol.
+
+    Moreira & Muir (2017) "Volatility-Managed Portfolios" and DeMiguel et al.
+    (JF 2024) — scaling by 1/vol has historically lifted net Sharpe ~0.2-0.4
+    (and up to +13% on multifactor portfolios) for US equity strategies.
+
+    Leverage note: values > 1.0 imply MARGIN use. Retail IBKR Reg-T typically
+    allows up to 2:1 overnight leverage on marginable equities, so the 1.3
+    default is deliberately conservative (30% margin ceiling) while still
+    capturing the Moreira-Muir Sharpe lift, which requires the ability to
+    *amplify* exposure during low-vol regimes (not just de-lever in high-vol).
+
+    Ex-ante portfolio vol is estimated as
+        sigma_p ≈ sqrt( sum(w_i^2 * s_i^2) + rho * (sum(w_i*s_i))^2 - rho * sum(w_i^2*s_i^2) )
+    using a constant average pairwise correlation assumption.
+
+    Parameters
+    ----------
+    weights         : (date x ticker) target weights (may sum to <= 1.0)
+    realized_vol    : (date x ticker) annualized realized volatility
+    target_vol      : desired annualized portfolio vol (e.g. 0.16 = 16%)
+    avg_correlation : assumed average pairwise correlation between holdings
+    max_leverage    : cap scaling factor (1.3 = up to 30% margin; 1.0 = no margin)
+    min_leverage    : floor scaling factor (prevents going all-cash on vol spike)
+    """
+    aligned_vol = realized_vol.reindex(index=weights.index, columns=weights.columns)
+    w = weights.fillna(0.0)
+    s = aligned_vol.fillna(aligned_vol.median(axis=1).median())
+
+    # Per-row ex-ante vol using constant-correlation assumption
+    diag = (w.pow(2) * s.pow(2)).sum(axis=1)
+    cross = (w * s).sum(axis=1).pow(2)
+    port_var = diag + avg_correlation * (cross - diag)
+    port_vol = port_var.clip(lower=1e-8).pow(0.5)
+
+    leverage = (target_vol / port_vol).clip(lower=min_leverage, upper=max_leverage)
+    return weights.mul(leverage, axis=0)
+
+
 # ---------------------------------------------------------------------------
 # Core: build the monthly portfolio
 # ---------------------------------------------------------------------------
@@ -43,6 +104,11 @@ def build_monthly_portfolio(
     quality_filter:   Optional[pd.DataFrame] = None,
     earnings_dates:   Optional[pd.DataFrame] = None,
     spy_trend_filter: Optional[pd.Series] = None,
+    use_vol_buckets:  bool  = False,
+    max_selection_pool: int = 1500,
+    spy_core_weight:  float = 0.0,
+    spy_ticker:       str   = "SPY",
+    force_mega_caps:  bool  = False,
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """
     Build a long-only concentrated portfolio with monthly rebalancing.
@@ -125,10 +191,22 @@ def build_monthly_portfolio(
                 quality_filter=quality_filter,
                 first_valid_date=first_valid_date,
                 earnings_dates=earnings_dates,
+                use_vol_buckets=use_vol_buckets,
+                max_selection_pool=max_selection_pool,
+                force_mega_caps=force_mega_caps,
             )
 
             if cash_frac > 0:
                 new_weights = new_weights * (1 - cash_frac)
+
+            # ── SPY core + satellite overlay ─────────────────────────────
+            # When spy_core_weight > 0, scale all stock picks by (1-core)
+            # and allocate `core` to SPY directly. Instant beta ~1.0 anchor.
+            if spy_core_weight > 0 and spy_ticker in new_weights.index:
+                satellite_scale = 1.0 - spy_core_weight
+                new_weights = new_weights * satellite_scale
+                # Add SPY core weight (additive; SPY likely wasn't picked)
+                new_weights[spy_ticker] = new_weights.get(spy_ticker, 0.0) + spy_core_weight
 
             current_weights = new_weights
 
@@ -212,6 +290,9 @@ def _select_and_weight(
     quality_filter:  Optional[pd.DataFrame] = None,
     first_valid_date: Optional[pd.Series] = None,
     earnings_dates:  Optional[pd.DataFrame] = None,
+    use_vol_buckets: bool = False,
+    max_selection_pool: int = 1500,
+    force_mega_caps: bool = False,
 ) -> pd.Series:
     """
     Full selection pipeline for a single rebalance date:
@@ -269,19 +350,29 @@ def _select_and_weight(
         if len(safe_tickers) >= n_positions * 3:
             scores = scores.loc[safe_tickers]
 
-    # ── Step 1: Vol-bucket candidate generation ──────────────────────────
-    # Instead of just picking top N (which loads up on high-vol junk),
-    # pick from each volatility quintile equally. This ensures the portfolio
-    # spans the vol spectrum: low-vol compounders AND high-vol alpha plays.
-    if realized_vol is not None and date in realized_vol.index:
+    # ── Pre-filter 5: Liquidity pool cap ─────────────────────────────────
+    # Training universe stays broad (~3000) but SELECTION only picks from
+    # top-N most liquid names by 21-day ADV as of this rebalance date.
+    # Prevents picking illiquid micro-caps while keeping ML training data rich.
+    if adv is not None and date in adv.index and max_selection_pool > 0:
+        adv_today = adv.loc[date].reindex(scores.index).dropna()
+        if len(adv_today) > max_selection_pool:
+            liquid_tickers = adv_today.nlargest(max_selection_pool).index
+            pooled = scores.loc[scores.index.isin(liquid_tickers)]
+            if len(pooled) >= n_positions * 2:
+                scores = pooled
+
+    # ── Step 1: Candidate pool (optionally vol-bucket-neutral) ───────────
+    # Vol buckets force balanced picks across volatility terciles, which
+    # structurally suppresses beta (V4 hit beta=0.53 from this). Default OFF.
+    # When OFF, we select top candidates directly by signal score, still
+    # subject to sector caps + correlation filter downstream.
+    if use_vol_buckets and realized_vol is not None and date in realized_vol.index:
         vol_today = realized_vol.loc[date].reindex(scores.index)
-        # 3 vol terciles (low/mid/high) — less restrictive than 5 quintiles.
-        # V4 used 5 buckets which diluted alpha too much (beta 0.53).
         raw_candidates = _vol_bucket_candidates(
             scores, vol_today, n_per_bucket=max(6, n_positions // 3 * 2),
             n_buckets=3,
         )
-        # Use the vol-bucket pool for downstream selection
         scores_pool = scores.loc[scores.index.isin(raw_candidates)]
         if len(scores_pool) < n_positions:
             scores_pool = scores  # fallback to full universe
@@ -327,6 +418,35 @@ def _select_and_weight(
         realized_vol=realized_vol.loc[date, selected] if realized_vol is not None and date in realized_vol.index else None,
         adv=adv_series,
     )
+
+    # ── Step 5: Force mega-cap inclusion ─────────────────────────────────
+    # Breadth collapse 2015-2024: if the model likes a mega-cap but
+    # vol/sector caps pushed it out, force-include at minimum 3% weight.
+    # Only includes mega-caps whose raw signal rank is in top 40% of universe.
+    if force_mega_caps:
+        raw_scores = signal.loc[date].dropna()
+        if len(raw_scores) > 0:
+            mega_rank = raw_scores.rank(pct=True)
+            min_mega_w = 0.03
+            to_force: List[str] = []
+            for mc in MEGA_CAPS:
+                if mc in w.index:
+                    continue  # already picked
+                if mc not in mega_rank.index:
+                    continue  # not in universe this date
+                if mega_rank.loc[mc] >= 0.60:  # top 40%
+                    to_force.append(mc)
+            if to_force:
+                forced_total = min_mega_w * len(to_force)
+                # Scale existing weights down to make room
+                scale = max(0.0, 1.0 - forced_total)
+                w = w * scale
+                for mc in to_force:
+                    w[mc] = min_mega_w
+                # Re-normalize just in case
+                total = w.sum()
+                if total > 0:
+                    w = w / total
 
     full_weights = pd.Series(0.0, index=signal.columns)
     full_weights[w.index] = w.values

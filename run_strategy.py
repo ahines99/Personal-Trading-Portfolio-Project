@@ -74,12 +74,43 @@ def parse_args():
     p.add_argument("--skip-alt-data",   action="store_true")
     p.add_argument("--skip-robustness", action="store_true")
     p.add_argument("--n-bootstrap",     default=500, type=int)
-    p.add_argument("--forward-window",  default=21, type=int,
-                   help="Forward return window for ML labels (default 21 = monthly)")
+    p.add_argument("--forward-window",  default=5, type=int,
+                   help="Forward return window for ML labels (default 5 = weekly; "
+                        "aligns with where alpha decays to — 21d IC is negative, 5d IC_IR=0.062)")
+    p.add_argument("--risk-adjust-labels", action="store_true",
+                   help="Vol-scale forward returns before ranking labels (default OFF — "
+                        "vol-scaling down-weights momentum stocks where alpha lives)")
+    p.add_argument("--sector-rank-weight", default=0.0, type=float,
+                   help="Weight on within-sector rank in label construction "
+                        "(0.0 = pure universe rank, default; 0.5 = legacy 50/50 blend)")
     p.add_argument("--stop-loss",       default=0.15, type=float,
                    help="Stop-loss threshold (default 15%%)")
     p.add_argument("--cash-in-bear",    default=0.15, type=float,
                    help="Fraction of portfolio in cash during bear regimes (default 15%%)")
+    p.add_argument("--optimize-ml",     action="store_true",
+                   help="Run Optuna Bayesian hyperparameter search before final fit")
+    p.add_argument("--optuna-trials",   default=40, type=int,
+                   help="Number of Optuna trials when --optimize-ml is set (default 40)")
+    p.add_argument("--vol-target",      default=0.16, type=float,
+                   help="Annualized vol target for portfolio leverage scaling "
+                        "(default 0.16 = 16%%, ENABLED by default per Moreira-Muir 2017 "
+                        "and DeMiguel et al. JF 2024; pass 0 or --no-vol-target to disable)")
+    p.add_argument("--no-vol-target",   action="store_true",
+                   help="Disable vol targeting overlay (overrides --vol-target)")
+    p.add_argument("--max-leverage",    default=1.3, type=float,
+                   help="Max leverage cap for vol targeting (default 1.3 = up to 30%% margin; "
+                        "Moreira-Muir requires leverage > 1 to capture the Sharpe lift during "
+                        "low-vol regimes. IBKR Reg-T allows 2:1, so 1.3 is conservative)")
+    p.add_argument("--use-vol-buckets", action="store_true",
+                   help="Use vol-bucket-neutral selection (V4 default, now OFF — suppresses beta)")
+    p.add_argument("--max-selection-pool", default=1500, type=int,
+                   help="Cap selection candidates to top-N most liquid by ADV (0 = disabled)")
+    p.add_argument("--spy-core",        default=0.0, type=float,
+                   help="SPY core weight for core+satellite mode (e.g. 0.4 = 40%% SPY, 60%% picks)")
+    p.add_argument("--spy-ticker",      default="SPY",
+                   help="SPY ticker symbol in the price panel (default 'SPY')")
+    p.add_argument("--force-mega-caps", action="store_true",
+                   help="Force-include top-10 mega-caps at min 3%% when model ranks them in top 40%%")
     return p.parse_args()
 
 
@@ -154,6 +185,14 @@ def run(args):
             analyst_dict   = analyst_dict,
             estimates_df    = estimates_df if not estimates_df.empty else None,
             institutional_df = inst_df if not inst_df.empty else None,
+            sector_map      = sector_map,
+            close           = close,
+            # Point-in-time gates: keep OFF until historical time-series data
+            # is integrated (FINRA short-interest archive; SEC 13F-HR filings).
+            # Current loaders return a single snapshot that would be broadcast
+            # across the full backtest, which is a lookahead bias.
+            use_short_interest         = False,
+            use_institutional_holdings = False,
         )
         n_alt = len(alt_features_dict)
         print(f"      {n_alt} alt feature panels loaded")
@@ -219,22 +258,50 @@ def run(args):
             sector_map=sector_map,
         )
         labels = build_labels(returns, forward_window=args.forward_window,
-                              sector_map=sector_map)
+                              risk_adjust=args.risk_adjust_labels,
+                              sector_map=sector_map,
+                              sector_rank_weight=args.sector_rank_weight)
         print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
 
-        print("[3b/6] Walk-forward LightGBM training...")
-        # 252-day warmup (1 year). 504 was too conservative — lost a full year
-        # of predictions. 252 gives enough data for 90+ features while maximizing
-        # the OOS evaluation period.
-        wf = WalkForwardModel(
+        # Optional: Bayesian hyperparameter search via Optuna
+        ml_kwargs = dict(
             min_train_days=252,
             retrain_freq=21,
             forward_window=args.forward_window,
+            risk_adjust=args.risk_adjust_labels,
+            sector_rank_weight=args.sector_rank_weight,
             num_leaves=31,
             learning_rate=0.05,
             lgbm_weight=0.60,
             ridge_weight=0.40,
         )
+        if args.optimize_ml:
+            print(f"[3a/6] Optuna hyperparameter search ({args.optuna_trials} trials)...")
+            from model import optimize_hyperparameters
+            best = optimize_hyperparameters(panel, labels, n_trials=args.optuna_trials)
+            if best:
+                # Override tunable params (keep min_train_days/retrain_freq/forward_window)
+                for k in ("num_leaves", "learning_rate", "feature_fraction",
+                          "bagging_fraction", "n_estimators", "ridge_alpha",
+                          "lambda_l1", "lambda_l2", "min_child_samples", "max_depth",
+                          "lgbm_weight", "xgb_weight", "ridge_weight", "mlp_weight"):
+                    if k in best:
+                        ml_kwargs[k] = best[k]
+                # Normalize ensemble weights if all four were suggested
+                w = [ml_kwargs.get(k, 0) for k in ("lgbm_weight", "xgb_weight", "ridge_weight", "mlp_weight")]
+                if sum(w) > 0:
+                    s = sum(w)
+                    ml_kwargs["lgbm_weight"]  = w[0] / s
+                    ml_kwargs["xgb_weight"]   = w[1] / s
+                    ml_kwargs["ridge_weight"] = w[2] / s
+                    ml_kwargs["mlp_weight"]   = w[3] / s
+                print(f"       Applied: {best}")
+
+        print("[3b/6] Walk-forward LightGBM training...")
+        # 252-day warmup (1 year). 504 was too conservative — lost a full year
+        # of predictions. 252 gives enough data for 90+ features while maximizing
+        # the OOS evaluation period.
+        wf = WalkForwardModel(**ml_kwargs)
         ml_signal = wf.fit_predict(panel, labels)
 
         # Light smoothing (5-day)
@@ -292,6 +359,13 @@ def run(args):
         # higher rank = closer to earnings. Invert: rank 1.0 = 0 days away.
         earnings_days_df = alt_features_dict.get("days_to_earnings_signal")
 
+    # SPY core+satellite mode requires SPY to be a column in the signal panel.
+    # Training universe may not include SPY by default — warn if so.
+    if args.spy_core > 0 and args.spy_ticker not in final_signal.columns:
+        print(f"  [WARNING] --spy-core {args.spy_core} requested but '{args.spy_ticker}' "
+              f"is not in the price/signal panel. SPY core allocation will be SKIPPED. "
+              f"Add SPY to the universe (e.g. via load_prices) to enable this feature.")
+
     print("[4/6] Building monthly portfolio...")
     weights, rebalance_dates = build_monthly_portfolio(
         signal          = final_signal,
@@ -311,7 +385,41 @@ def run(args):
         quality_filter  = quality_signal,
         earnings_dates  = earnings_days_df,
         spy_trend_filter= spy_trend,
+        use_vol_buckets = args.use_vol_buckets,
+        max_selection_pool = args.max_selection_pool,
+        spy_core_weight = args.spy_core,
+        spy_ticker      = args.spy_ticker,
+        force_mega_caps = args.force_mega_caps,
     )
+
+    # ── Volatility targeting overlay (ENABLED by default) ─────────────
+    # Moreira & Muir (2017) "Volatility-Managed Portfolios" + DeMiguel et al.
+    # (JF 2024) — scaling exposure inversely to ex-ante portfolio vol lifts
+    # net Sharpe ~0.2-0.4 (up to +13% on multifactor portfolios). This REQUIRES
+    # leverage > 1 during low-vol regimes to capture the full lift; a
+    # de-lever-only overlay (max_leverage=1.0) leaves most of the Sharpe
+    # gain on the table.
+    #
+    # SPY-core interaction: vol targeting is applied to the *entire* weight
+    # vector here, including the SPY core slice. This is a known simplification
+    # — ideally we would only scale the satellite (non-SPY) book so the SPY
+    # anchor stays at its specified target weight. For now, the effective
+    # leverage on SPY is identical to satellite leverage; if spy_core is large,
+    # revisit to apply vol-targeting only to the risky satellite portion.
+    vol_target_active = (not args.no_vol_target) and args.vol_target > 0
+    if vol_target_active:
+        from portfolio import apply_vol_targeting
+        print(f"  [vol-target] Scaling exposure to {args.vol_target*100:.0f}% annualized vol "
+              f"(max_leverage={args.max_leverage:.2f})")
+        weights = apply_vol_targeting(
+            weights,
+            realized_vol=rvol,
+            target_vol=args.vol_target,
+            max_leverage=args.max_leverage,
+            min_leverage=0.5,
+        )
+    else:
+        print("  [vol-target] disabled")
 
     port_stats = compute_portfolio_stats(weights, rebalance_dates)
     print(f"      Positions:  {port_stats['avg_positions']:.0f} avg")
