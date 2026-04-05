@@ -343,10 +343,17 @@ def build_feature_matrix(
             sb_N, sb_P, sb_Mplus, sb_Mminus = semi_beta_decomposition(
                 returns, market_returns, window=252
             )
+            # Semi-beta sign convention (Bollerslev-Patton-Quaedvlieg 2022):
+            #   beta^N  (concordant downside: both r_i<0, r_m<0) → POSITIVE premium → keep raw
+            #   beta^P  (concordant upside:   both r_i>0, r_m>0) → NEGATIVE premium → negate
+            #   beta^M+ (mixed: r_i>0, r_m<0)                   → ~zero/negative premium → negate
+            #   beta^M- (mixed: r_i<0, r_m>0)                   → NEGATIVE premium → negate
+            # Negating aligns each signal so that higher score = higher expected return,
+            # consistent with other Tier-6 signals.
             features["semi_beta_N"] = sb_N
-            features["semi_beta_P"] = sb_P
-            features["semi_beta_Mplus"] = sb_Mplus
-            features["semi_beta_Mminus"] = sb_Mminus
+            features["semi_beta_P"] = -sb_P
+            features["semi_beta_Mplus"] = -sb_Mplus
+            features["semi_beta_Mminus"] = -sb_Mminus
             features["tail_dep_lower"] = tail_dependence(
                 returns, market_returns, window=252, q=0.1
             )
@@ -703,13 +710,27 @@ def build_feature_matrix(
         # Per-date cross-sectional z-score — only uses same-date information,
         # so introduces NO temporal leakage (no rolling window required).
         _csz_added = 0
+        _csz_skipped_broadcast = 0
         for name in _continuous_feats:
             try:
-                features[f"{name}_csz"] = _cs_zscore(features[name])
+                feat_df = features[name]
+                # Skip broadcast features (e.g. market breadth) where every ticker
+                # has the same value per date → cross-sectional std = 0 → the _csz
+                # column would be all-NaN (then all-zero after fillna). Detect
+                # automatically via per-date cross-sectional variance.
+                if feat_df.std(axis=1).max() <= 0 or not np.isfinite(
+                    feat_df.std(axis=1).max()
+                ):
+                    _csz_skipped_broadcast += 1
+                    continue
+                features[f"{name}_csz"] = _cs_zscore(feat_df)
                 _csz_added += 1
             except Exception:
                 pass
-        print(f"      [csz] added {_csz_added} cross-sectional z-scored _csz variants")
+        print(
+            f"      [csz] added {_csz_added} cross-sectional z-scored _csz variants "
+            f"(skipped {_csz_skipped_broadcast} zero-variance broadcast features)"
+        )
 
     panels = []
     for feat_name, df in features.items():

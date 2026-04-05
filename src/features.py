@@ -96,8 +96,10 @@ def rsi(close: pd.DataFrame, window: int = 14) -> pd.DataFrame:
     consistent with a mean-reversion signal.
     """
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(window).mean()
-    loss = (-delta.clip(upper=0)).rolling(window).mean()
+    # Wilder smoothing (1978): EWMA with alpha = 1/window, matching standard
+    # RSI charting packages. Equivalent to recursive avg = (prev*(n-1) + x) / n.
+    gain = delta.clip(lower=0).ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi_ = 100 - (100 / (1 + rs))
     return 50 - rsi_
@@ -623,29 +625,9 @@ def cross_asset_sector_signal(
 
 
 # ---------------------------------------------------------------------------
-# Net Share Issuance (buyback signal)
+# Net Share Issuance: handled in alt_features.build_fundamental_signals using
+# SharesOutstanding from EDGAR. Stub removed (was a zero-filled placeholder).
 # ---------------------------------------------------------------------------
-
-def net_share_issuance_signal(
-    close: pd.DataFrame,
-    window: int = 252,
-) -> pd.DataFrame:
-    """
-    Proxy for net share issuance using split-adjusted price behavior.
-
-    When a company buys back shares, the remaining shares represent more
-    of the company, creating a subtle upward drift in per-share metrics.
-
-    True net issuance requires shares outstanding data (from EDGAR).
-    This proxy uses the ratio of actual returns to price returns as
-    an approximation. Negated so buybacks (negative issuance) get high scores.
-
-    Note: This is a weak proxy. For production, use quarterly shares
-    outstanding from SEC filings.
-    """
-    # Without shares outstanding data, return zeros (placeholder)
-    # Will be populated when EDGAR shares data is integrated
-    return pd.DataFrame(0.0, index=close.index, columns=close.columns)
 
 
 # ---------------------------------------------------------------------------

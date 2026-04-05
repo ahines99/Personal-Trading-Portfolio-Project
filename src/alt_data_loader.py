@@ -87,26 +87,69 @@ _EDGAR_CONCEPTS = {
 
 
 def _get_cik_map(tickers: List[str]) -> Dict[str, str]:
-    """Download SEC ticker→CIK mapping (cached 7 days)."""
+    """
+    Download SEC ticker→CIK mapping (cached 7 days).
+
+    Combines two SEC sources to improve coverage for delisted tickers:
+      1. company_tickers.json          — currently-listed firms (primary)
+      2. company_tickers_exchange.json — broader, sometimes includes former
+                                         tickers / additional exchange listings
+    Both sources are still survivorship-biased (SEC does not publish a full
+    historical former-ticker archive here); truly delisted tickers may still
+    fail lookup. Per-CIK former tickers live under
+    https://data.sec.gov/submissions/CIK{cik}.json which would require
+    per-ticker crawling — not done here to keep rate-limit footprint small.
+    """
     cache_name = "edgar_cik_map"
     cached = _load(cache_name)
     if cached is not None and (time.time() - cached["ts"]) < 7 * 86400:
         return cached["data"]
 
-    url = "https://www.sec.gov/files/company_tickers.json"
+    mapping: Dict[str, str] = {}
+
+    # Primary: currently-listed company tickers
+    url_primary = "https://www.sec.gov/files/company_tickers.json"
     try:
-        resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=30)
+        resp = requests.get(url_primary, headers=_EDGAR_HEADERS, timeout=30)
         resp.raise_for_status()
         raw = resp.json()
-        mapping = {
-            v["ticker"].upper(): str(v["cik_str"]).zfill(10)
-            for v in raw.values()
-        }
+        for v in raw.values():
+            t = str(v.get("ticker", "")).upper()
+            cik = v.get("cik_str")
+            if t and cik is not None:
+                mapping[t] = str(cik).zfill(10)
+    except Exception as e:
+        warnings.warn(f"EDGAR primary CIK map download failed: {e}")
+
+    # Supplementary: exchange-listed tickers (broader coverage)
+    url_exchange = "https://www.sec.gov/files/company_tickers_exchange.json"
+    try:
+        resp = requests.get(url_exchange, headers=_EDGAR_HEADERS, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+        # format: {"fields": [...], "data": [[cik, name, ticker, exchange], ...]}
+        fields = raw.get("fields", [])
+        data = raw.get("data", [])
+        if fields and data:
+            try:
+                i_cik = fields.index("cik")
+                i_tic = fields.index("ticker")
+                for row in data:
+                    t = str(row[i_tic] or "").upper()
+                    cik = row[i_cik]
+                    if t and cik is not None and t not in mapping:
+                        mapping[t] = str(cik).zfill(10)
+            except ValueError:
+                pass
+    except Exception as e:
+        warnings.warn(f"EDGAR exchange CIK map download failed: {e}")
+
+    if mapping:
         _save({"ts": time.time(), "data": mapping}, cache_name)
         return mapping
-    except Exception as e:
-        warnings.warn(f"EDGAR CIK map download failed: {e}")
-        return cached["data"] if cached else {}
+
+    # Total failure — fall back to previously cached map if available
+    return cached["data"] if cached else {}
 
 
 def _fetch_company_facts(cik: str) -> Optional[dict]:
@@ -122,11 +165,37 @@ def _fetch_company_facts(cik: str) -> Optional[dict]:
         return None
 
 
-def _extract_annual_series(facts: dict, concept: str, taxonomy: str = "us-gaap") -> pd.Series:
+def _extract_annual_series(
+    facts: dict,
+    concept: str,
+    taxonomy: str = "us-gaap",
+    include_quarterly: bool = True,
+) -> pd.Series:
     """
-    Extract annual (10-K) filings for a concept into a date-indexed Series.
+    Extract fundamental filings for a concept into a date-indexed Series.
     Uses 'filed' date (point-in-time) not period end date to avoid look-ahead.
+
+    By default now includes 10-Q (quarterly) in addition to 10-K (annual),
+    giving ~4x the data resolution and much fresher signals. Set
+    include_quarterly=False to restore annual-only behavior.
+
+    CAVEAT — 10-Q data is PARTIAL-YEAR year-to-date, not standalone-quarter:
+      - Q1 10-Q  = 3 months YTD
+      - Q2 10-Q  = 6 months YTD
+      - Q3 10-Q  = 9 months YTD
+      - Q4       = 10-K (12 months FY)
+    Flow concepts (Revenues, NetIncomeLoss, GrossProfit, OCF, InterestExpense,
+    SGA) are YTD-accumulated within a fiscal year, so raw diff(252) in
+    downstream features compares mixed periods and should be replaced by
+    same-quarter YoY diffs (Q3 2024 vs Q3 2023) for flow items.
+    Stock concepts (Assets, Liabilities, Equity, Shares, Cash, LTDebt,
+    AssetsCurrent, LiabilitiesCurrent, EPS) are point-in-time balances and
+    not affected by the YTD accumulation issue.
+    TODO: downstream flow-factor features should switch to same-quarter YoY.
     """
+    allowed_forms = ("10-K", "10-K/A")
+    if include_quarterly:
+        allowed_forms = allowed_forms + ("10-Q", "10-Q/A")
     try:
         units = facts["facts"][taxonomy][concept]["units"]
         # prefer USD, fall back to shares for EPS concepts
@@ -134,7 +203,7 @@ def _extract_annual_series(facts: dict, concept: str, taxonomy: str = "us-gaap")
         rows = units[unit_key]
         records = []
         for r in rows:
-            if r.get("form") in ("10-K", "10-K/A") and "filed" in r and "val" in r:
+            if r.get("form") in allowed_forms and "filed" in r and "val" in r:
                 records.append({"filed": pd.to_datetime(r["filed"]), "val": r["val"]})
         if not records:
             return pd.Series(dtype=float)
@@ -173,6 +242,12 @@ def load_edgar_fundamentals(
     date_idx  = pd.bdate_range(start, end)
     results   = {}
 
+    missing = [t for t in tickers if t not in cik_map]
+    if missing:
+        print(
+            f"      [EDGAR] Warning: {len(missing)} tickers have no CIK mapping "
+            f"(likely delisted / non-SEC registrants — no fundamentals available)"
+        )
     subset = [t for t in tickers if t in cik_map][:max_tickers]
     for i, ticker in enumerate(subset):
         cik   = cik_map[ticker]

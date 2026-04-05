@@ -82,7 +82,8 @@ def run_backtest(
     adv:             Optional[pd.DataFrame] = None,
     stop_loss_pct:   float = 0.0,
     drawdown_halt_pct: float = 0.0,  # disabled by default — whipsaws in practice
-    monthly_loss_limit: float = 0.08,
+    monthly_loss_limit: float = 0.0,
+    risk_free_series: Optional[pd.Series] = None,
     verbose:         bool = True,
 ) -> BacktestResult:
     """
@@ -90,7 +91,10 @@ def run_backtest(
 
     Parameters
     ----------
-    weights         : (date x ticker) target portfolio weights.
+    weights         : (date x ticker) target portfolio weights. Must be
+                      forward-filled to daily frequency internally — sparse
+                      rebalance-only frames are reindexed at the top of this
+                      function so weights.loc[date] is always defined.
     prices          : full price DataFrame from data_loader.py
     initial_capital : starting NAV in dollars
     cost_model      : TransactionCostModel instance (uses defaults if None)
@@ -102,6 +106,19 @@ def run_backtest(
     stop_loss_pct   : if > 0, sell positions that drop this much from their
                       entry price. E.g. 0.15 = sell if down 15% from purchase.
                       Only active between rebalance dates.
+    monthly_loss_limit : if > 0, liquidate to cash for the rest of the
+                      calendar month after losing this fraction of
+                      month-start NAV. DISABLED by default (0.0) — V4 showed
+                      an 8% limit killed recovery trades. Pass 0.08 (or any
+                      positive value) explicitly to re-enable.
+    risk_free_series : optional daily series of annualized T-bill yields
+                      (e.g. FRED DGS3MO expressed as a decimal, 0.04 = 4%).
+                      If provided, uninvested cash accrues rf_annual/252
+                      each trading day. Missing dates are forward-filled
+                      from the last valid observation. If None, cash earns
+                      0% (preserves original behavior). Over a 13-year
+                      backtest a 4% T-bill on a 15% cash sleeve is ~60bps
+                      of annual drag, so supplying this is recommended.
     verbose         : print progress
 
     Returns
@@ -114,9 +131,23 @@ def run_backtest(
     close  = prices["Close"]
     open_  = prices["Open"]
 
-    # Align weights to dates available in price data
-    common_dates = weights.index.intersection(close.index)
-    weights = weights.loc[common_dates]
+    # Align weights to dates available in price data.
+    # IMPORTANT: weights must be daily-broadcast (forward-filled across all
+    # trading days), NOT sparse on rebalance rows only. The turnover loop
+    # below does weights.loc[prev_date], which fails if prev_date isn't in
+    # the index. Reindexing with ffill makes weights.loc[date] always valid
+    # and represents the standing target between rebalances.
+    common_dates = close.index[
+        (close.index >= weights.index.min()) & (close.index <= weights.index.max())
+    ]
+    weights = weights.reindex(common_dates, method="ffill").fillna(0.0)
+
+    # Prepare risk-free rate series (daily annualized yields, forward-filled).
+    # rf_daily = rf_annual / 252 applied each day to the cash balance.
+    if risk_free_series is not None:
+        rf_series = risk_free_series.reindex(common_dates, method="ffill").fillna(0.0)
+    else:
+        rf_series = pd.Series(0.0, index=common_dates)
 
     # -----------------------------------------------------------------------
     # State variables
@@ -184,6 +215,14 @@ def run_backtest(
             continue
 
         prev_date = common_dates[i - 1]
+
+        # ---- Accrue T-bill interest on uninvested cash --------------------
+        # Cash balance grows at rf_annual / 252 per trading day. If no
+        # risk_free_series was supplied, rf_series is 0 everywhere and this
+        # is a no-op (preserves legacy behavior).
+        rf_annual = rf_series.loc[date]
+        if cash > 0 and rf_annual > 0:
+            cash *= (1.0 + rf_annual / 252.0)
 
         # ---- Monthly loss budget check ------------------------------------
         date_month = (date.year, date.month)
@@ -375,8 +414,12 @@ def run_backtest(
         # non-trading days. At a rebalance, it jumps by |new_target - old_target|/2.
         # Summing this across the year gives the true annual fraction of the
         # portfolio that was traded, without inflating from intraday drift.
+        # weights is daily-broadcast (ffilled at top of function), so
+        # weights.loc[prev_date] and weights.loc[date] are both guaranteed
+        # to exist. Between rebalances they are identical, so turnover is
+        # zero on non-trading days — exactly what we want.
         today_target = weights.loc[date].fillna(0.0)
-        prev_target  = weights.loc[prev_date].fillna(0.0) if prev_date in weights.index else today_target
+        prev_target  = weights.loc[prev_date].fillna(0.0)
         turnover = (today_target - prev_target).abs().sum() / 2.0
 
         # -------------------------------------------------------------------

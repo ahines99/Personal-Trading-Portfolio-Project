@@ -659,19 +659,22 @@ def _vol_bucket_candidates(
 # ---------------------------------------------------------------------------
 
 def _select_with_sector_caps(
-    scores:         pd.Series,
-    n_positions:    int,
-    sector_map:     Optional[Dict[str, str]],
-    max_sector_pct: float,
+    scores:                 pd.Series,
+    n_positions:            int,
+    sector_map:             Optional[Dict[str, str]],
+    max_sector_pct:         float,
+    unknown_sector_exempt:  bool = False,
 ) -> List[str]:
     """
     Greedy sector-capped selection from ranked candidates.
 
-    "Unknown" sector is EXEMPT from the cap. These are mostly delisted stocks
-    and small caps without yfinance sector data. Capping them as one group
-    would artificially limit selection from 58% of our universe, defeating
-    the purpose of including delisted stocks. The cap only applies to known
-    sectors (Technology, Healthcare, etc.) to prevent concentrated industry bets.
+    By default, "Unknown" sector is treated as a pseudo-sector subject to the
+    SAME cap as other sectors. With roughly half the universe classified as
+    "Unknown" (mostly delisted / small-cap illiquid names), exempting it would
+    defeat the cap's purpose and concentrate risk in fragile names.
+
+    Set unknown_sector_exempt=True to restore the old behavior (Unknown
+    bypasses the cap entirely).
     """
     ranked = scores.sort_values(ascending=False)
 
@@ -687,12 +690,15 @@ def _select_with_sector_caps(
             break
         sector = sector_map.get(ticker, "Unknown")
 
-        # Unknown sector exempt from cap — don't limit delisted/small-cap selection
-        if sector != "Unknown":
-            current_count = sector_counts.get(sector, 0)
-            if current_count >= max_per_sector:
-                continue
-            sector_counts[sector] = current_count + 1
+        # Unknown is capped by default; only exempt if explicitly requested.
+        if unknown_sector_exempt and sector == "Unknown":
+            selected.append(ticker)
+            continue
+
+        current_count = sector_counts.get(sector, 0)
+        if current_count >= max_per_sector:
+            continue
+        sector_counts[sector] = current_count + 1
 
         selected.append(ticker)
 

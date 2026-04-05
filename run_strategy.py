@@ -82,6 +82,11 @@ def parse_args():
     p.add_argument("--forward-window",  default=5, type=int,
                    help="Forward return window for ML labels (default 5 = weekly; "
                         "aligns with where alpha decays to — 21d IC is negative, 5d IC_IR=0.062)")
+    p.add_argument("--retrain-freq", default=21, type=int,
+                   help="ML retraining frequency in trading days (default 21 = monthly; "
+                        "applies to BOTH Optuna search and final fit for consistency)")
+    p.add_argument("--min-train-days", default=252, type=int,
+                   help="Minimum training window for walk-forward (default 252 = 1 year)")
     p.add_argument("--risk-adjust-labels", action="store_true",
                    help="Vol-scale forward returns before ranking labels (default OFF — "
                         "vol-scaling down-weights momentum stocks where alpha lives)")
@@ -130,6 +135,87 @@ def parse_args():
     p.add_argument("--optuna-warm-start", action=argparse.BooleanOptionalAction, default=True,
                    help="Warm-start Optuna from prior best trials in "
                         "data/cache/optuna_best_params.pkl (default ON)")
+
+    # ── Tier 1-7: Label / ML objective flags ─────────────────────────────
+    p.add_argument("--forward-windows", default=None,
+                   type=lambda s: [int(x) for x in s.split(",")],
+                   help="Comma-separated forward-horizon list for multi-horizon "
+                        "ensemble labels (e.g. '1,5,21'). If omitted, uses the "
+                        "single --forward-window horizon.")
+    p.add_argument("--lambdarank-truncation", default=20, type=int,
+                   help="LambdaRank truncation level (default 20)")
+    p.add_argument("--use-return-decile-gain", action="store_true",
+                   help="Use return-decile gain mapping in ranking objective")
+    p.add_argument("--use-magnitude-weights", action="store_true",
+                   help="Weight samples by absolute forward-return magnitude")
+    p.add_argument("--huber-weight", default=0.0, type=float,
+                   help="Blend weight on Huber regression head (default 0.0)")
+    p.add_argument("--quantile-weight", default=0.0, type=float,
+                   help="Blend weight on quantile regression head (default 0.0)")
+    p.add_argument("--quantile-alpha", default=0.75, type=float,
+                   help="Quantile level for quantile regression head (default 0.75)")
+    p.add_argument("--use-meta-labeling", action="store_true",
+                   help="Enable meta-labeling second-stage classifier")
+
+    # ── Sample-weight + regularization flags ─────────────────────────────
+    p.add_argument("--min-data-in-leaf", default=200, type=int,
+                   help="LightGBM min_data_in_leaf (default 200)")
+    p.add_argument("--use-uniqueness-weights", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply label uniqueness sample-weights (default ON)")
+    p.add_argument("--use-per-date-weights", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply per-date sample-weight normalization (default ON)")
+    p.add_argument("--early-stop-on-ic", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Early-stop boosters on rank-IC rather than loss (default ON)")
+    p.add_argument("--lgbm-num-seeds", default=1, type=int,
+                   help="Number of LightGBM seeds to average (default 1)")
+    p.add_argument("--use-mlp", action="store_true",
+                   help="Include MLP head in ensemble (default OFF)")
+    p.add_argument("--random-state", default=42, type=int,
+                   help="Random seed for ML models (default 42)")
+
+    # ── Feature panel flags ──────────────────────────────────────────────
+    p.add_argument("--size-neutralize", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Size-neutralize features (default ON)")
+    p.add_argument("--sector-neutralize-features", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Sector-neutralize features (default ON)")
+    p.add_argument("--winsorize", action=argparse.BooleanOptionalAction, default=True,
+                   help="Winsorize feature panel (default ON)")
+    p.add_argument("--cs-zscore-all", action=argparse.BooleanOptionalAction, default=True,
+                   help="Cross-sectional z-score all features (default ON)")
+    p.add_argument("--use-higher-moment", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Include higher-moment (skew/kurt) features (default ON)")
+    p.add_argument("--use-breadth-wavelet", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Include breadth + wavelet features (default ON)")
+
+    # ── Alt-feature flags ────────────────────────────────────────────────
+    p.add_argument("--use-tier3-academic", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Enable Tier-3 academic value/quality + EAR gate (default ON)")
+    p.add_argument("--sector-neutralize-fundamentals", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Sector-neutralize fundamentals (default ON)")
+
+    # ── Portfolio signal shaping flags ───────────────────────────────────
+    p.add_argument("--signal-smooth-halflife", default=5.0, type=float,
+                   help="Exp half-life (days) for signal smoothing in portfolio "
+                        "construction (default 5.0)")
+    p.add_argument("--apply-rank-normal", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply rank-normal transform to signals pre-selection "
+                        "(default ON)")
+
+    # ── ML / momentum blend ──────────────────────────────────────────────
+    p.add_argument("--ml-blend", default=0.70, type=float,
+                   help="ML weight in final signal blend; momentum weight = "
+                        "1 - ml_blend (default 0.70 = 70%% ML / 30%% momentum)")
+
     return p.parse_args()
 
 
@@ -148,6 +234,8 @@ def optimize_hyperparameters_pruned(
     prune_threshold_ic: float = 0.2,
     warm_start: bool = True,
     warm_start_path: Path = Path("data/cache/optuna_best_params.pkl"),
+    min_train_days: int = 252,
+    retrain_freq: int = 21,
 ) -> dict:
     """
     Bayesian hyperparameter optimization with HyperbandPruner, per-fold
@@ -196,7 +284,7 @@ def optimize_hyperparameters_pruned(
         ]
 
         wf = WalkForwardModel(
-            min_train_days=252, retrain_freq=63,
+            min_train_days=min_train_days, retrain_freq=retrain_freq,
             num_leaves=num_leaves, learning_rate=lr,
             feature_fraction=feat_frac, bagging_fraction=bag_frac,
             n_estimators=n_est, min_child_samples=min_child,
@@ -378,8 +466,8 @@ def run(args):
             use_short_interest         = False,
             use_institutional_holdings = False,
             # Tier 3 academic value/quality + EAR gate (fundamentals)
-            use_tier3_academic             = True,
-            sector_neutralize_fundamentals = True,
+            use_tier3_academic             = args.use_tier3_academic,
+            sector_neutralize_fundamentals = args.sector_neutralize_fundamentals,
             # Tier 6 macro / distress auxiliary panels
             dxy_df            = dxy_df_,
             breakeven_df      = breakeven_df_,
@@ -454,23 +542,33 @@ def run(args):
             close, returns, volume, ranked_signals,
             alt_features=alt_features_dict,
             sector_map=sector_map,
-            use_higher_moment=True,
-            use_breadth_wavelet=True,
+            use_higher_moment=args.use_higher_moment,
+            use_breadth_wavelet=args.use_breadth_wavelet,
+            size_neutralize=args.size_neutralize,
+            sector_neutralize=args.sector_neutralize_features,
+            winsorize=args.winsorize,
+            cs_zscore_all=args.cs_zscore_all,
         )
         # Equal-weighted market-return proxy for beta-neutral labels
         mkt_return = returns.mean(axis=1) if args.beta_neutral_labels else None
-        labels = build_labels(returns, forward_window=args.forward_window,
-                              risk_adjust=args.risk_adjust_labels,
-                              sector_map=sector_map,
-                              sector_rank_weight=args.sector_rank_weight,
-                              beta_neutral=args.beta_neutral_labels,
-                              market_returns=mkt_return)
+        _label_kwargs = dict(
+            risk_adjust=args.risk_adjust_labels,
+            sector_map=sector_map,
+            sector_rank_weight=args.sector_rank_weight,
+            beta_neutral=args.beta_neutral_labels,
+            market_returns=mkt_return,
+        )
+        if args.forward_windows is not None:
+            _label_kwargs["forward_windows"] = args.forward_windows
+        else:
+            _label_kwargs["forward_window"] = args.forward_window
+        labels = build_labels(returns, **_label_kwargs)
         print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
 
         # Optional: Bayesian hyperparameter search via Optuna
         ml_kwargs = dict(
-            min_train_days=252,
-            retrain_freq=21,
+            min_train_days=args.min_train_days,
+            retrain_freq=args.retrain_freq,
             forward_window=args.forward_window,
             risk_adjust=args.risk_adjust_labels,
             sector_rank_weight=args.sector_rank_weight,
@@ -479,7 +577,23 @@ def run(args):
             learning_rate=0.05,
             lgbm_weight=0.60,
             ridge_weight=0.40,
+            lambdarank_truncation=args.lambdarank_truncation,
+            use_return_decile_gain=args.use_return_decile_gain,
+            use_magnitude_weights=args.use_magnitude_weights,
+            huber_weight=args.huber_weight,
+            quantile_weight=args.quantile_weight,
+            quantile_alpha=args.quantile_alpha,
+            use_meta_labeling=args.use_meta_labeling,
+            min_data_in_leaf=args.min_data_in_leaf,
+            use_uniqueness_weights=args.use_uniqueness_weights,
+            use_per_date_weights=args.use_per_date_weights,
+            early_stop_on_ic=args.early_stop_on_ic,
+            lgbm_num_seeds=args.lgbm_num_seeds,
+            use_mlp=args.use_mlp,
+            random_state=args.random_state,
         )
+        if args.forward_windows is not None:
+            ml_kwargs["forward_windows"] = args.forward_windows
         if args.optimize_ml:
             print(f"[3a/6] Optuna hyperparameter search ({args.optuna_trials} trials)...")
             best = optimize_hyperparameters_pruned(
@@ -489,6 +603,8 @@ def run(args):
                 prune_threshold_ic=args.prune_threshold_ic,
                 warm_start=args.optuna_warm_start,
                 warm_start_path=Path(__file__).parent / "data" / "cache" / "optuna_best_params.pkl",
+                min_train_days=args.min_train_days,
+                retrain_freq=args.retrain_freq,
             )
             if best:
                 # Override tunable params (keep min_train_days/retrain_freq/forward_window)
@@ -530,7 +646,8 @@ def run(args):
         mom_aligned = mom_12_1_ranked.reindex(
             index=ml_signal_smooth.index, columns=ml_signal_smooth.columns
         )
-        final_signal = (0.70 * ml_signal_smooth + 0.30 * mom_aligned.fillna(0.5))
+        final_signal = (args.ml_blend * ml_signal_smooth
+                        + (1.0 - args.ml_blend) * mom_aligned.fillna(0.5))
         final_signal = final_signal.rank(axis=1, pct=True)
 
         feature_imp = wf.feature_importance()
@@ -601,6 +718,8 @@ def run(args):
         spy_core_weight = args.spy_core,
         spy_ticker      = args.spy_ticker,
         force_mega_caps = args.force_mega_caps,
+        signal_smooth_halflife = args.signal_smooth_halflife,
+        apply_rank_normal = args.apply_rank_normal,
     )
 
     # ── Volatility targeting overlay (ENABLED by default) ─────────────
