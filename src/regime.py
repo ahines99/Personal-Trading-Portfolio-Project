@@ -48,9 +48,12 @@ def detect_volatility_regime(
     rvol        = market_returns.rolling(short_window).std() * np.sqrt(252)
     # Rolling 252-day percentile rank (no lookahead, avoids small-sample
     # bias from expanding rank where early days rank among 20 observations).
-    rvol_rank   = rvol.rolling(252, min_periods=63).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
-    )
+    # PERF fix (LOW): previously used .apply(lambda x: pd.Series(x).rank(...)
+    # .iloc[-1], raw=False) which reconstructs a Series on every window and
+    # runs ~20x slower than pandas' native vectorized rolling.rank. The
+    # .rank(pct=True) call returns the percentile rank of the LAST element
+    # within each window — which is exactly the semantic we want.
+    rvol_rank   = rvol.rolling(252, min_periods=63).rank(pct=True)
 
     regime = pd.Series("med_vol", index=market_returns.index)
     regime[rvol_rank <= low_vol_pct]  = "low_vol"
@@ -72,8 +75,14 @@ def detect_trend_regime(
     The 200d MA is the most widely-used trend signal in institutional trading.
     """
     ma     = market_prices.rolling(ma_window, min_periods=ma_window // 2).mean()
-    regime = pd.Series("bear", index=market_prices.index)
-    regime[market_prices > ma] = "bull"
+    # FIX (MED bug): previously returned "bear" by default, which mislabeled the
+    # MA warmup window (first ~100 days where MA is NaN) as bear markets even
+    # during raging bull runs. Now we emit "unknown" until the MA is populated
+    # so downstream consumers can exclude those dates from regime analysis.
+    regime = pd.Series(index=market_prices.index, dtype=object)
+    regime[ma.isna()] = "unknown"
+    regime[(ma.notna()) & (market_prices > ma)]  = "bull"
+    regime[(ma.notna()) & (market_prices <= ma)] = "bear"
     return regime
 
 
@@ -95,6 +104,11 @@ def detect_combined_regime(
     vol_binary   = vol_regime.map({"low_vol": "calm", "med_vol": "calm", "high_vol": "volatile"})
 
     combined = trend_regime + "_" + vol_binary
+    # If trend_regime is "unknown" (MA warmup) the concatenation above yields
+    # "unknown_calm" / "unknown_volatile"; collapse both to a single "unknown"
+    # label so downstream regime attribution treats the warmup window as one
+    # excludable bucket rather than two noisy states.
+    combined[trend_regime == "unknown"] = "unknown"
     return combined
 
 
@@ -112,9 +126,25 @@ def build_market_series(
         mkt_price  = close[market_ticker]
         mkt_return = mkt_price.pct_change()
     else:
-        # Proxy: equal-weight average of universe
-        mkt_return = close.pct_change().mean(axis=1)
-        mkt_price  = (1 + mkt_return).cumprod()
+        # FIX (MED bug): previously the equal-weight fallback used ALL columns,
+        # meaning stray ETFs, warrants, or bad-data tickers with blown-up price
+        # series could pollute the market proxy. Warn the user and defensively
+        # drop tickers whose cumulative return over the sample is implausible
+        # (e.g. delisted-to-zero survivors or 100x meme-stock outliers).
+        import warnings
+        warnings.warn(
+            f"{market_ticker} not in price panel. Falling back to equal-weighted "
+            f"universe proxy (filtered for sane cumulative returns)."
+        )
+
+        first_valid = close.bfill().iloc[0]
+        last_valid  = close.ffill().iloc[-1]
+        cum_ret     = last_valid / first_valid - 1
+        valid_mask  = (cum_ret > -0.99) & (cum_ret < 50.0) & first_valid.notna() & last_valid.notna()
+        valid_close = close.loc[:, valid_mask]
+
+        mkt_return = valid_close.pct_change().mean(axis=1)
+        mkt_price  = (1 + mkt_return.fillna(0)).cumprod()
 
     return mkt_price, mkt_return
 
@@ -194,21 +224,32 @@ def regime_transition_analysis(regime: pd.Series) -> pd.DataFrame:
     current_regime  = None
     current_start   = None
     current_count   = 0
+    prev_date       = None
 
+    # BOUNDARY fix (LOW): previously the "end" of closed episodes was set to
+    # `date` (the first day of the NEXT regime), while the final episode's
+    # "end" was the last day of data (still in the current regime). That made
+    # durations inconsistent — closed episodes were half-open [start, end)
+    # while the final one was fully inclusive [start, end]. Now ALL episodes
+    # use inclusive [start, end] within the same regime state; the trailing
+    # episode is flagged `ongoing=True` so callers know it may extend beyond
+    # the sample.
     for date, state in regime.items():
         if state != current_regime:
             if current_regime is not None:
                 records.append({
                     "regime":    current_regime,
                     "start":     current_start,
-                    "end":       date,
+                    "end":       prev_date,    # last day IN this regime
                     "duration":  current_count,
+                    "ongoing":   False,
                 })
             current_regime = state
             current_start  = date
             current_count  = 1
         else:
             current_count += 1
+        prev_date = date
 
     if current_regime is not None:
         records.append({
@@ -216,6 +257,7 @@ def regime_transition_analysis(regime: pd.Series) -> pd.DataFrame:
             "start":    current_start,
             "end":      regime.index[-1],
             "duration": current_count,
+            "ongoing":  True,
         })
 
     df = pd.DataFrame(records)
@@ -241,6 +283,11 @@ HISTORICAL_STRESS_PERIODS = {
     "Rate hike cycle (2022)":    ("2022-01-01", "2022-12-31"),
     "GFC peak-to-trough":        ("2007-10-09", "2009-03-09"),
     "Dot-com bust":              ("2000-03-10", "2002-10-09"),
+    "2018 Q4 selloff":           ("2018-09-20", "2018-12-24"),
+    "COVID recovery rally":      ("2020-04-01", "2021-01-31"),
+    "2022 bear market":          ("2022-01-03", "2022-10-12"),
+    "SVB/regional bank crisis":  ("2023-03-08", "2023-03-24"),
+    "2025 tariff shock":         ("2025-04-01", "2025-04-10"),
 }
 
 

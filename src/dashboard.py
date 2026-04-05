@@ -98,7 +98,13 @@ def equity_curve_chart(result, benchmark_equity=None, initial_capital=100_000):
 
 
 def drawdown_chart(result):
-    from metrics import drawdown_series
+    try:
+        from metrics import drawdown_series
+    except ImportError:
+        try:
+            from .metrics import drawdown_series
+        except ImportError:
+            from src.metrics import drawdown_series
     dd = drawdown_series(result.equity_curve) * 100
 
     fig = go.Figure()
@@ -116,7 +122,13 @@ def drawdown_chart(result):
 
 
 def rolling_sharpe_chart(result, window=126):
-    from metrics import rolling_sharpe
+    try:
+        from metrics import rolling_sharpe
+    except ImportError:
+        try:
+            from .metrics import rolling_sharpe
+        except ImportError:
+            from src.metrics import rolling_sharpe
     rs = rolling_sharpe(result.daily_returns, window=window)
 
     fig = go.Figure()
@@ -381,10 +393,12 @@ def factor_correlation_chart(corr_df):
     return fig
 
 
-def _empty_fig(msg):
+def _empty_fig(msg="No data available"):
     fig = go.Figure()
+    fig.update_layout(**LAYOUT_DEFAULTS)
     fig.add_annotation(text=msg, x=0.5, y=0.5, xref="paper", yref="paper",
-                       showarrow=False)
+                       showarrow=False,
+                       font=dict(size=16, color=COLORS["text_light"]))
     return fig
 
 
@@ -413,10 +427,22 @@ def build_dashboard(
     if not PLOTLY_AVAILABLE:
         raise ImportError("plotly required: pip install plotly")
 
-    from metrics import (
-        sharpe_ratio, sortino_ratio, annualized_return,
-        max_drawdown, win_rate, information_ratio,
-    )
+    try:
+        from metrics import (
+            sharpe_ratio, sortino_ratio, annualized_return,
+            max_drawdown, win_rate, information_ratio,
+        )
+    except ImportError:
+        try:
+            from .metrics import (
+                sharpe_ratio, sortino_ratio, annualized_return,
+                max_drawdown, win_rate, information_ratio,
+            )
+        except ImportError:
+            from src.metrics import (
+                sharpe_ratio, sortino_ratio, annualized_return,
+                max_drawdown, win_rate, information_ratio,
+            )
 
     r     = result.daily_returns
     eq    = result.equity_curve

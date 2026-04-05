@@ -43,7 +43,11 @@ try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
-    pass
+    import warnings
+    warnings.warn(
+        "python-dotenv not installed. Environment variables from .env won't be loaded. "
+        "Run: pip install python-dotenv"
+    )
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
 _BASE = "https://finnhub.io/api/v1"
 _CACHE_DIR = Path(__file__).parent / "data" / "cache" / "api"

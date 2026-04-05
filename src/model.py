@@ -972,6 +972,19 @@ def hrp_feature_clusters(feature_df: pd.DataFrame, threshold: float = 0.5) -> Di
     from scipy.cluster.hierarchy import linkage, fcluster
     from scipy.spatial.distance import squareform
 
+    # Fix 2 (LOW-polish): drop zero-variance columns BEFORE computing the
+    # correlation matrix. A constant column produces NaN correlations that
+    # fillna(0) would turn into distance=1, scattering identical-info columns
+    # across clusters. Dropping them up front avoids that pathology.
+    try:
+        variances = feature_df.var(axis=0)
+        nonzero_cols = variances[variances > 1e-10].index
+        if len(nonzero_cols) < len(feature_df.columns):
+            dropped = len(feature_df.columns) - len(nonzero_cols)
+            print(f"[HRP] Dropped {dropped} zero-variance features before clustering")
+            feature_df = feature_df[nonzero_cols]
+    except Exception:
+        pass
     cols = list(feature_df.columns)
     if len(cols) < 2:
         return {1: cols}
@@ -1114,6 +1127,10 @@ class WalkForwardModel:
         lgbm_num_seeds: int = 1,
         # ── Global random seed for all stochastic components ──────────────
         random_state: int = 42,
+        # ── Embargo buffer between train and test folds (AFML Ch. 7.4) ────
+        # Default equals typical forward_window=5 to avoid test-side
+        # serial-correlation leak from purged train samples.
+        embargo_days: int = 5,
     ):
         self.min_train_days    = min_train_days
         self.retrain_freq      = retrain_freq
@@ -1157,6 +1174,8 @@ class WalkForwardModel:
         self.use_per_date_weights = use_per_date_weights
         self.lgbm_num_seeds    = max(1, int(lgbm_num_seeds))
         self.random_state      = int(random_state)
+        # AFML Ch. 7.4: embargo buffer on the test side of each fold.
+        self.embargo_days      = max(0, int(embargo_days))
 
         # If MLP disabled, zero its weight and renormalize the other model
         # weights so the ensemble still sums to 1.0. User-configured
@@ -1394,9 +1413,19 @@ class WalkForwardModel:
 
     def _fit_ridge(self, X: np.ndarray, y: np.ndarray,
                    sample_weight: Optional[np.ndarray] = None):
-        model = Ridge(alpha=self.ridge_alpha)
-        model.fit(X, y, sample_weight=sample_weight)
-        return model
+        # Fix 3 (LOW-polish): Ridge's L2 penalty is scale-dependent, so
+        # feature magnitudes that differ wildly (e.g. log_mcap ~20 vs
+        # z-scored features ~O(1)) get effectively different regularization.
+        # Even though Tier 4 added winsorize + cs_zscore_all upstream, we
+        # apply an explicit StandardScaler inside Ridge for belt-and-braces
+        # safety. The returned object is a dict {"model", "scaler"} — the
+        # predict path must apply the scaler before calling .predict.
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler().fit(X)
+        X_scaled = scaler.transform(X)
+        model = Ridge(alpha=self.ridge_alpha, random_state=self.random_state)
+        model.fit(X_scaled, y, sample_weight=sample_weight)
+        return {"model": model, "scaler": scaler}
 
     def _fit_xgboost(self, X: np.ndarray, y: np.ndarray,
                      groups: np.ndarray, feature_names: List[str]):
@@ -1446,13 +1475,26 @@ class WalkForwardModel:
         except Exception:
             return None
 
-    def _fit_mlp(self, X: np.ndarray, y: np.ndarray) -> Optional[object]:
+    def _fit_mlp(self, X: np.ndarray, y: np.ndarray,
+                 dates: Optional[pd.DatetimeIndex] = None,
+                 X_raw: Optional[np.ndarray] = None) -> Optional[object]:
         """
         Train a 3-layer MLP on GPU for cross-sectional stock ranking.
 
         Architecture: input → 128 → 64 → 32 → 1 with BatchNorm + Dropout.
         Learns different feature interactions than tree-based models,
         providing genuine ensemble diversity.
+
+        Fix 1 (rank-scaled targets): `y` here arrives as raw integer grade
+        labels, but MSE on categorical targets cannot learn a ranking. We
+        convert `y` to per-date cross-sectional rank-pct in [0,1] before
+        training so the MLP optimizes a monotone transformation of the
+        ensemble's ranking objective.
+
+        Fix 2 (train-only imputation): the caller passes `X_raw` (pre-impute
+        matrix) so we can compute medians on the training slice only and
+        re-impute val with those medians, eliminating the minor median-leak
+        that arose when medians were computed on the full matrix.
 
         Returns a dict with 'model' and 'scaler' for prediction.
         """
@@ -1467,17 +1509,60 @@ class WalkForwardModel:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.random_state)
 
+            split_mlp = int(len(X) * 0.8)
+
+            # ── Fix 2: recompute medians on training slice only ────────────
+            # If `X_raw` (pre-impute) is provided, we can recompute
+            # train-only medians and apply to val. Otherwise fall back to
+            # the already-imputed `X` (legacy behavior).
+            if X_raw is not None and len(X_raw) == len(X):
+                Xr = np.asarray(X_raw, dtype=float).copy()
+                Xr[~np.isfinite(Xr)] = np.nan
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    train_medians = np.nanmedian(Xr[:split_mlp], axis=0)
+                train_medians = np.where(
+                    np.isfinite(train_medians), train_medians, 0.0
+                )
+                X_tr_imp = Xr[:split_mlp].copy()
+                X_val_imp = Xr[split_mlp:].copy()
+                idx_tr = np.where(np.isnan(X_tr_imp))
+                if len(idx_tr[0]):
+                    X_tr_imp[idx_tr] = np.take(train_medians, idx_tr[1])
+                idx_val = np.where(np.isnan(X_val_imp))
+                if len(idx_val[0]):
+                    X_val_imp[idx_val] = np.take(train_medians, idx_val[1])
+            else:
+                X_tr_imp = X[:split_mlp]
+                X_val_imp = X[split_mlp:]
+
             # Scale features — fit ONLY on train split to avoid leaking
             # val statistics into training (scaler sees mean/std of val data).
-            split = int(len(X) * 0.8)
             scaler = StandardScaler()
-            X_tr_scaled = scaler.fit_transform(X[:split])
-            X_val_scaled = scaler.transform(X[split:])
+            X_tr_scaled = scaler.fit_transform(X_tr_imp)
+            X_val_scaled = scaler.transform(X_val_imp)
+
+            # ── Fix 1: convert integer grade labels to per-date rank-pct ────
+            # MSE on categorical integers doesn't learn ranking. Replace
+            # targets with cross-sectional rank-pct per date (values in
+            # [0,1]), which aligns the MLP head with the ranker objective.
+            y_float = np.asarray(y, dtype=float)
+            if dates is not None and len(dates) == len(y_float):
+                try:
+                    y_ser = pd.Series(
+                        y_float, index=pd.DatetimeIndex(dates, name="date")
+                    )
+                    y_rank = y_ser.groupby(level="date").rank(pct=True).values
+                    # Any all-NaN per-date groups fall back to 0.5 (neutral)
+                    y_rank = np.where(np.isfinite(y_rank), y_rank, 0.5)
+                    y_float = y_rank.astype(float)
+                except Exception:
+                    pass
 
             X_tr = torch.FloatTensor(X_tr_scaled).cuda()
-            y_tr = torch.FloatTensor(y[:split].astype(float)).cuda()
+            y_tr = torch.FloatTensor(y_float[:split_mlp]).cuda()
             X_val = torch.FloatTensor(X_val_scaled).cuda()
-            y_val = torch.FloatTensor(y[split:].astype(float)).cuda()
+            y_val = torch.FloatTensor(y_float[split_mlp:]).cuda()
 
             n_features = X_tr.shape[1]
 
@@ -1746,6 +1831,15 @@ class WalkForwardModel:
             X_ = X_.iloc[-max_train_samples:]
             y_ = y_.iloc[-max_train_samples:]
 
+        # LambdaRank integrity: `groups` is built from
+        # dates.value_counts().sort_index() which assumes X_ rows are in
+        # date-sorted order. A (ticker, date) MultiIndex can produce
+        # ticker-first ordering, which mis-aligns group boundaries with
+        # actual cross-sections. Sort by date (stable) so groups match rows.
+        if isinstance(X_.index, pd.MultiIndex):
+            X_ = X_.sort_index(level="date", sort_remaining=True)
+            y_ = y_.reindex(X_.index)
+
         feature_names         = list(X_.columns)
         ensemble: dict        = {"feature_subset": selected_features}
 
@@ -1842,7 +1936,11 @@ class WalkForwardModel:
                 ensemble["quantile"] = qmod
 
         if self.use_mlp and TORCH_AVAILABLE:
-            mlp = self._fit_mlp(X_imputed, y_vals)
+            # Pass raw (pre-impute) X and dates so MLP can (a) compute
+            # train-only imputation medians (Fix 2) and (b) convert
+            # integer labels to per-date rank-pct targets (Fix 1).
+            mlp = self._fit_mlp(X_imputed, y_vals,
+                                dates=dates, X_raw=X_vals)
             if mlp is not None:
                 ensemble["mlp"] = mlp
             # Free GPU memory after MLP training
@@ -2038,7 +2136,16 @@ class WalkForwardModel:
 
         if "xgboost" in ensemble:
             dmat = xgb.DMatrix(X_vals, feature_names=ensemble.get("feature_subset", None))
-            xgb_ranks = ranked(ensemble["xgboost"].predict(dmat))
+            # Use best_iteration from early stopping (not last iteration) to
+            # avoid scoring with over-fit trees trained past the validation peak.
+            best_iter = getattr(ensemble["xgboost"], "best_iteration", None)
+            if best_iter is not None:
+                xgb_raw = ensemble["xgboost"].predict(
+                    dmat, iteration_range=(0, int(best_iter) + 1)
+                )
+            else:
+                xgb_raw = ensemble["xgboost"].predict(dmat)
+            xgb_ranks = ranked(xgb_raw)
             scores  += xgb_ranks * self.xgb_weight
             total_w += self.xgb_weight
             model_ranks.append(xgb_ranks)
@@ -2079,7 +2186,15 @@ class WalkForwardModel:
         ridge_w = self.ridge_weight
         if total_w < 0.01:
             ridge_w = 1.0  # only Ridge available
-        ridge_ranks = ranked(ensemble["ridge"].predict(_get_imputed()))
+        # Fix 3: ensemble["ridge"] is a dict {"model", "scaler"} — apply the
+        # fitted scaler before predict so features match Ridge's trained scale.
+        _ridge_obj = ensemble["ridge"]
+        if isinstance(_ridge_obj, dict):
+            _ridge_X = _ridge_obj["scaler"].transform(_get_imputed())
+            ridge_ranks = ranked(_ridge_obj["model"].predict(_ridge_X))
+        else:
+            # Back-compat for any cached/legacy bare-Ridge objects.
+            ridge_ranks = ranked(_ridge_obj.predict(_get_imputed()))
         scores  += ridge_ranks * ridge_w
         total_w += ridge_w
         model_ranks.append(ridge_ranks)
@@ -2131,6 +2246,24 @@ class WalkForwardModel:
                 pass
 
         # ── Check cache ──────────────────────────────────────────────────
+        # Fix 4: include ALL constructor hyperparameters attached to self.*
+        # plus content hashes of the input panel and labels so that changes
+        # to regularization (ridge_alpha, L1/L2, etc.), tree shape
+        # (max_depth, min_child_samples, min_gain_to_split, n_estimators)
+        # or upstream feature/label construction invalidate the cache.
+        try:
+            _panel_hash = hashlib.md5(
+                pd.util.hash_pandas_object(panel, index=True).values
+            ).hexdigest()[:8]
+        except Exception:
+            _panel_hash = "na"
+        try:
+            _labels_hash = hashlib.md5(
+                pd.util.hash_pandas_object(labels, index=True).values
+            ).hexdigest()[:8]
+        except Exception:
+            _labels_hash = "na"
+
         _cache_key = hashlib.md5(
             f"{panel.shape}_{panel.index.get_level_values('date').min()}_"
             f"{panel.index.get_level_values('date').max()}_"
@@ -2147,7 +2280,16 @@ class WalkForwardModel:
             f"{self.use_meta_labeling}_{self.early_stop_on_ic}_"
             f"{self.min_data_in_leaf}_{sorted((self.monotone_constraints or {}).items())}_"
             f"{self.use_uniqueness_weights}_{self.use_per_date_weights}_"
-            f"{self.lgbm_num_seeds}_{self.random_state}".encode()
+            f"{self.lgbm_num_seeds}_{self.random_state}_"
+            f"emb={self.embargo_days}_"
+            # Previously-missing ctor hyperparams (Fix 4)
+            f"ra={self.ridge_alpha}_md={self.max_depth}_"
+            f"mgs={self.min_gain_to_split}_l1={self.lambda_l1}_"
+            f"l2={self.lambda_l2}_mcs={self.min_child_samples}_"
+            f"ne={self.n_estimators}_mic={self.min_ic}_"
+            f"ra_adj={self.risk_adjust}_srw={self.sector_rank_weight}_"
+            # Content hashes of inputs
+            f"ph={_panel_hash}_lh={_labels_hash}".encode()
         ).hexdigest()[:12]
         _cache_file = _CACHE_DIR / f"ml_predictions_{_cache_key}.pkl"
 
@@ -2203,7 +2345,18 @@ class WalkForwardModel:
                 if window_idx + 1 < len(train_cutoffs)
                 else all_dates[-1]
             )
-            pred_dates = all_dates[(all_dates > cutoff_date) & (all_dates <= next_cutoff)]
+            # AFML Ch. 7.4 embargo: shift test window forward by embargo_days
+            # to mirror the train-side purge (gap_dates). Without this, the
+            # first few test days share serial-correlated residuals with the
+            # last train labels, leaking information across the fold boundary.
+            if self.embargo_days > 0:
+                post = all_dates[all_dates > cutoff_date]
+                emb_start = post[self.embargo_days] if len(post) > self.embargo_days else (
+                    post[-1] if len(post) > 0 else cutoff_date
+                )
+                pred_dates = all_dates[(all_dates >= emb_start) & (all_dates <= next_cutoff)]
+            else:
+                pred_dates = all_dates[(all_dates > cutoff_date) & (all_dates <= next_cutoff)]
 
             print(
                 f"  [model] Window {window_idx+1}/{len(train_cutoffs)}: "
@@ -2241,10 +2394,14 @@ class WalkForwardModel:
                     continue
                 X_pred = panel.xs(pred_date, level="date").reindex(tickers).replace([np.inf, -np.inf], np.nan)
                 scores, conf = self._predict_ensemble(X_pred, current_ensemble)
-                # Penalize low-confidence predictions: multiply score by confidence.
-                # When LGBM and Ridge disagree (conf ~0.3), the score gets dampened.
-                # When they agree (conf ~0.9), the score is nearly unchanged.
-                adjusted = scores * (0.3 + 0.7 * conf)  # floor at 30% of score
+                # Fix 1 (LOW-polish): center scores before confidence scaling so
+                # the subsequent cross-sectional rank (pct=True) actually reflects
+                # the confidence signal. Multiplying raw scores by a positive
+                # factor is a no-op under rank — but subtracting 0.5 makes the
+                # rescaling asymmetric: low-confidence predictions get
+                # compressed toward neutral (0), while high-confidence ones
+                # retain their distance from the middle rank.
+                adjusted = (scores - 0.5) * (0.3 + 0.7 * conf)
                 predictions[pred_date] = pd.Series(adjusted, index=tickers)
 
         print()
@@ -2324,19 +2481,29 @@ class WalkForwardModel:
         return None
 
     def rolling_feature_importance(self) -> Optional[pd.DataFrame]:
+        # Fix 4 (LOW-polish): previously this only worked when live ensemble
+        # objects were attached — after a cache load those are stripped,
+        # so it silently returned None. We now ALSO accept the cached
+        # per-window importance dict stored in safe_m["lgbm_importance"]
+        # (keyed by cutoff_date), which survives pickle round-trips.
         records = []
         for m in self.models_:
-            if not isinstance(m.get("ensemble"), dict) or "lgbm" not in m["ensemble"]:
+            # Preferred: introspect live boosters when available.
+            if isinstance(m.get("ensemble"), dict) and "lgbm" in m["ensemble"]:
+                lgbm = m["ensemble"]["lgbm"]
+                boosters = lgbm if isinstance(lgbm, list) else [lgbm]
+                imp_vals = np.mean(
+                    [np.asarray(b.feature_importance(importance_type="gain"), dtype=float)
+                     for b in boosters], axis=0,
+                )
+                feat_names = boosters[0].feature_name()
+                records.append(pd.Series(imp_vals, index=feat_names,
+                                         name=m.get("cutoff_date")))
                 continue
-            lgbm = m["ensemble"]["lgbm"]
-            boosters = lgbm if isinstance(lgbm, list) else [lgbm]
-            # Average importance across seed-bagged boosters
-            imp_vals = np.mean(
-                [np.asarray(b.feature_importance(importance_type="gain"), dtype=float)
-                 for b in boosters], axis=0,
-            )
-            feat_names = boosters[0].feature_name()
-            records.append(pd.Series(imp_vals, index=feat_names, name=m["cutoff_date"]))
+            # Fallback: cached importance dict {feature_name: gain}.
+            if "lgbm_importance" in m:
+                s = pd.Series(m["lgbm_importance"], name=m.get("cutoff_date"))
+                records.append(s)
         return pd.DataFrame(records) if records else None
 
 
@@ -2349,12 +2516,23 @@ def optimize_hyperparameters(
     labels: pd.Series,
     n_trials: int = 50,
     n_eval_windows: int = 5,
+    search_lookback_days: int = 504,
+    eval_start: Optional[str] = None,
+    eval_end: Optional[str] = None,
 ) -> dict:
     """
     Bayesian hyperparameter optimization using Optuna.
 
     Runs a mini walk-forward on the LAST n_eval_windows training windows
     and maximizes mean OOS rank IC.
+
+    Fix 3: each Optuna trial previously ran fit_predict on the ENTIRE
+    panel (~150 walk-forward windows x 4 heads per trial), which made
+    tuning prohibitively expensive. We now restrict each trial's panel
+    and labels to the most recent `search_lookback_days` trading days
+    (default ~2 years). Callers can also bound the evaluation window
+    via `eval_start`/`eval_end` (ISO date strings). Set
+    `search_lookback_days=0` to restore the full-panel behavior.
 
     Returns the best hyperparameter dict.
     """
@@ -2368,9 +2546,27 @@ def optimize_hyperparameters(
     all_dates = panel.index.get_level_values("date").unique().sort_values()
     tickers = panel.index.get_level_values("ticker").unique()
 
+    # ── Fix 3: subset panel/labels to the trailing search window ────────
+    # Each trial only trains on `search_lookback_days` of history, which
+    # cuts trial cost roughly proportionally (e.g. 504/2500 ≈ 5x speedup
+    # on a 10-year panel with retrain_freq=63).
+    if search_lookback_days and len(all_dates) > search_lookback_days:
+        subset_start = all_dates[-search_lookback_days]
+        panel_dates = panel.index.get_level_values("date")
+        panel = panel[panel_dates >= subset_start]
+        label_dates = labels.index.get_level_values("date") \
+            if isinstance(labels.index, pd.MultiIndex) else labels.index
+        labels = labels[label_dates >= subset_start]
+        all_dates = panel.index.get_level_values("date").unique().sort_values()
+
     # Use last portion of data for optimization to be fast
-    eval_start = max(0, len(all_dates) - 504)  # last ~2 years
-    eval_dates = all_dates[eval_start:]
+    _eval_start = max(0, len(all_dates) - 504)  # last ~2 years
+    eval_dates = all_dates[_eval_start:]
+    # Optional caller-supplied ISO date bounds on the eval window
+    if eval_start is not None:
+        eval_dates = eval_dates[eval_dates >= pd.Timestamp(eval_start)]
+    if eval_end is not None:
+        eval_dates = eval_dates[eval_dates <= pd.Timestamp(eval_end)]
 
     def objective(trial):
         num_leaves = trial.suggest_int("num_leaves", 10, 63)
@@ -2389,6 +2585,12 @@ def optimize_hyperparameters(
         ridge_w = trial.suggest_float("ridge_weight", 0.1, 0.5)
         mlp_w = trial.suggest_float("mlp_weight", 0.0, 0.4)
         total_w = lgbm_w + xgb_w + ridge_w + mlp_w
+        # Fix 5 (LOW-polish): defensively guard against an all-zero weight
+        # sample. Optuna's lower bounds should prevent this, but a float
+        # underflow or bad suggestion shouldn't crash the trial with a
+        # ZeroDivisionError — just prune the trial.
+        if total_w < 1e-6:
+            return float("-inf")
         lgbm_w, xgb_w, ridge_w, mlp_w = [w / total_w for w in (lgbm_w, xgb_w, ridge_w, mlp_w)]
 
         wf = WalkForwardModel(

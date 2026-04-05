@@ -16,11 +16,12 @@ Usage:
     -> opens at http://localhost:8050
 """
 
+import re
 import sys
 from pathlib import Path
 
 import dash
-from dash import dcc, html, dash_table, callback, Input, Output, State
+from dash import dcc, html, dash_table, callback, Input, Output
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import plotly.express as px
@@ -28,11 +29,20 @@ import plotly.io as pio
 import pandas as pd
 import numpy as np
 
+_CATEGORY_LABEL_RE = re.compile(r"^([A-Z]{1,2})\d?")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Data Loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-RESULTS = Path("results")
+# Fix: anchor the results directory to this file's location so the dashboard
+# works regardless of the caller's current working directory. A bare
+# Path("results") silently resolved to an empty/nonexistent folder when the
+# app was launched from any directory other than the project root.
+RESULTS = Path(__file__).parent / "results"
+
+# OOS split date — matches test_suite.py default. Update here if that changes.
+OOS_START_DATE = "2024-01-01"
 
 def _read(name, index_col=0):
     fp = RESULTS / name
@@ -211,7 +221,7 @@ def build_overview():
     kpi1 = dbc.Row([
         dbc.Col(kpi_card("Sharpe Ratio", sharpe, "full period", sh_c), width=2),
         dbc.Col(kpi_card("CAGR", cagr, "annualized", ACCENT), width=2),
-        dbc.Col(kpi_card("OOS Sharpe", oos_sharpe, "2024+", GREEN if oos_sharpe != "N/A" else None), width=2),
+        dbc.Col(kpi_card("OOS Sharpe", oos_sharpe, f"OOS {OOS_START_DATE[:4]}+", GREEN if oos_sharpe != "N/A" else None), width=2),
         dbc.Col(kpi_card("Max Drawdown", maxdd, "peak-to-trough", dd_c), width=2),
         dbc.Col(kpi_card("Beta", beta, "to market"), width=2),
         dbc.Col(kpi_card("Win Rate", win_rate, "daily"), width=2),
@@ -324,8 +334,9 @@ def build_portfolio():
     st_fig = go.Figure()
     if not sector_alloc.empty:
         for s in [c for c in sector_alloc.columns if c != "date"]:
-            if sector_alloc[s].sum() > 0:
-                st_fig.add_trace(go.Scatter(x=sector_alloc["date"], y=sector_alloc[s]*100,
+            values = pd.to_numeric(sector_alloc[s], errors="coerce").fillna(0) * 100
+            if values.sum() > 0:
+                st_fig.add_trace(go.Scatter(x=sector_alloc["date"], y=values,
                                             name=s, stackgroup="one", mode="none"))
         st_fig.update_layout(title="Sector Allocation Over Time", yaxis_title="Allocation (%)",
                              height=380, legend=dict(font=dict(size=10), orientation="h", y=-0.15))
@@ -354,7 +365,7 @@ def build_performance():
         hm_fig = go.Figure(data=go.Heatmap(
             z=z, x=months, y=monthly["Year"].astype(str),
             colorscale=[[0, RED], [0.5, "#1A1D27"], [1, GREEN]],
-            zmid=0, text=np.where(np.isnan(z), "", z.round(1).astype(str)),
+            zmid=0, text=np.where(np.isnan(z), "", np.round(z, 1).astype(str)),
             texttemplate="%{text}%", textfont=dict(size=10, color=TEXT),
             hovertemplate="Year: %{y}<br>Month: %{x}<br>Return: %{z:.1f}%<extra></extra>",
         ))
@@ -381,16 +392,19 @@ def build_performance():
     # IS vs OOS
     oos_fig = go.Figure()
     if not oos_tear.empty and len(oos_tear) >= 2:
+        _first_legend_shown = False
         for m in ["Sharpe", "Ann. Return", "Ann. Vol", "Max DD"]:
             if m not in oos_tear.columns:
                 continue
             try:
                 is_v = float(str(oos_tear.iloc[0][m]).replace("%", ""))
                 oos_v = float(str(oos_tear.iloc[1][m]).replace("%", ""))
-                oos_fig.add_trace(go.Bar(x=[m], y=[is_v], name="IS" if m == "Sharpe" else None,
-                                         marker_color="#4A5568", showlegend=(m == "Sharpe")))
-                oos_fig.add_trace(go.Bar(x=[m], y=[oos_v], name="OOS" if m == "Sharpe" else None,
-                                         marker_color=ACCENT, showlegend=(m == "Sharpe")))
+                show_legend = not _first_legend_shown
+                oos_fig.add_trace(go.Bar(x=[m], y=[is_v], name="IS" if show_legend else None,
+                                         marker_color="#4A5568", showlegend=show_legend))
+                oos_fig.add_trace(go.Bar(x=[m], y=[oos_v], name="OOS" if show_legend else None,
+                                         marker_color=ACCENT, showlegend=show_legend))
+                _first_legend_shown = True
             except (ValueError, TypeError):
                 pass
         oos_fig.update_layout(title="In-Sample vs Out-of-Sample", height=320, barmode="group",
@@ -505,9 +519,27 @@ def build_test_suite():
         return card([html.P("No test suite results found.", style={"color": TEXT_MUTED})])
 
     tr = test_results.copy().sort_values("sharpe", ascending=False)
-    tr["category"] = tr["test"].str.extract(r"^([A-Z])\d")[0]
-    cat_labels = {"B": "ML/Momentum Blend", "C": "Portfolio Construction",
-                  "A": "Holding Period", "D": "Hyperparameters"}
+    tr["category"] = tr["test"].str.extract(_CATEGORY_LABEL_RE)[0]
+    cat_labels = {
+        "A": "Forward window",
+        "B": "Position count",
+        "C": "Signal blend",
+        "D": "Ensemble weights",
+        "E": "LGBM regularization",
+        "F": "Ridge alpha",
+        "G": "Ensemble mix",
+        "H": "Training window",
+        "V": "Vol targeting",
+        "X": "Combined configs",
+        "P": "Portfolio beta-attack",
+        "L": "Label engineering",
+        "R": "Reg hygiene",
+        "Z": "Training hygiene",
+        "FA": "Feature ablation (size)",
+        "FB": "Feature ablation (sector)",
+        "FG": "Feature ablation (distress)",
+        "FH": "Feature ablation (macro)",
+    }
     tr["category_label"] = tr["category"].map(cat_labels).fillna("Other")
 
     baseline_mean = tr[tr["test"].str.contains("baseline", na=False)]["sharpe"].mean()

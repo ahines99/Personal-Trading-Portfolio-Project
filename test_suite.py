@@ -756,12 +756,20 @@ def main():
         t = metrics.get("elapsed_sec", 0)
         print(f"Sharpe={s:.3f}  Return={r*100:.1f}%  MaxDD={dd*100:.1f}%  ({t:.0f}s)")
 
-        # Save incrementally
-        all_results = pd.DataFrame(results)
-        if RESULTS_FILE.exists():
-            prev = pd.read_csv(RESULTS_FILE)
-            all_results = pd.concat([prev, all_results], ignore_index=True)
-        all_results.to_csv(RESULTS_FILE, index=False)
+        # Fix: append only the current test's metrics as one row. The prior
+        # implementation rebuilt a DataFrame from the in-memory accumulator
+        # and concatenated it to the existing CSV each iteration, yielding
+        # N(N+1)/2 rows instead of N (quadratic duplication).
+        row_df = pd.DataFrame([metrics])
+        write_header = not RESULTS_FILE.exists()
+        row_df.to_csv(RESULTS_FILE, mode="a", header=write_header, index=False)
+
+    # Dedupe CSV on the `test` column to clean up any prior corruption from
+    # the old quadratic-append bug, keeping the most recent entry per test.
+    if RESULTS_FILE.exists():
+        _df = pd.read_csv(RESULTS_FILE)
+        _df = _df.drop_duplicates(subset="test", keep="last")
+        _df.to_csv(RESULTS_FILE, index=False)
 
     # Final summary
     print(f"\n{'='*60}")

@@ -46,7 +46,12 @@ _SECTOR_CACHE_VERSION = "v2"
 
 _SIC_TO_SECTOR = {
     # Agriculture, Forestry, Fishing (01-09)
-    range(100, 1000): "Consumer Defensive",
+    # Split per GICS: agriculture/livestock → Consumer Defensive,
+    # forestry/fishing → Basic Materials (2026-04-05 refinement)
+    range(100, 200): "Consumer Defensive",       # Agriculture/livestock (01)
+    range(200, 300): "Basic Materials",          # Forestry (02)
+    range(700, 800): "Consumer Defensive",       # Agricultural services (07)
+    range(800, 1000): "Basic Materials",         # Forestry/Fishing (08-09)
 
     # Mining (10-14)
     range(1000, 1500): "Energy",
@@ -103,7 +108,10 @@ _SIC_TO_SECTOR = {
     range(6400, 6500): "Financial Services",     # Insurance agents
     range(6500, 6600): "Real Estate",            # Real estate
     range(6600, 6700): "Financial Services",     # Combined RE/insurance
-    range(6700, 6800): "Financial Services",     # Holding/investment offices
+    range(6700, 6770): "Financial Services",     # Holding/investment offices
+    # SIC 6770-6799: blank checks / SPACs / REIT holding shells.
+    # Map to Unknown to avoid polluting Financials sector (2026-04-05 refinement).
+    range(6770, 6800): "Unknown",                 # Blank checks / SPAC shells
 
     # Services (70-89) — SPECIFIC ranges first, then broad
     range(7370, 7380): "Technology",             # Computer services/software (MSFT, GOOG, etc)

@@ -74,8 +74,18 @@ try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent.parent / ".env")
 except ImportError:
-    pass
+    import warnings
+    warnings.warn(
+        "python-dotenv not installed. Environment variables from .env won't be loaded. "
+        "Run: pip install python-dotenv"
+    )
 EODHD_KEY = os.environ.get("EODHD_API_KEY", "")
+if not EODHD_KEY:
+    import warnings
+    warnings.warn(
+        "EODHD_API_KEY not set. EODHD data fetching will fail with 401. "
+        "Set it in .env or as an environment variable."
+    )
 _EODHD_BASE = "https://eodhd.com/api"
 _EODHD_RATE = 0.02  # ~50 req/sec, well under 1000/min limit
 

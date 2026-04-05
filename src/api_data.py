@@ -44,15 +44,32 @@ _ROOT = Path(__file__).parent.parent
 _CACHE = _ROOT / "data" / "cache" / "api"
 _CACHE.mkdir(parents=True, exist_ok=True)
 
+# ── cache version ────────────────────────────────────────────────────────────
+# _API_DATA_CACHE_VERSION bumped 2026-04-05 (Tier 8): forces rebuild of
+# eodhd_bulk, eodhd_fundamentals, eodhd_dividends, eodhd_sentiment, and
+# finnhub_all_data caches after Tier 1-6 feature set changes. On next run,
+# these caches will be rebuilt from upstream APIs (one-time cost).
+_API_DATA_CACHE_VERSION = "v2"
+
 # Load API keys from .env file
 try:
     from dotenv import load_dotenv
     load_dotenv(_ROOT / ".env")
 except ImportError:
-    pass  # dotenv not installed, rely on env vars
+    import warnings
+    warnings.warn(
+        "python-dotenv not installed. Environment variables from .env won't be loaded. "
+        "Run: pip install python-dotenv"
+    )
 
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
 EODHD_KEY = os.environ.get("EODHD_API_KEY", "")
+if not FINNHUB_KEY:
+    import warnings
+    warnings.warn(
+        "FINNHUB_API_KEY not set. Finnhub data fetching will fail with 401. "
+        "Set it in .env or as an environment variable."
+    )
 
 
 def _cache_path(name: str) -> Path:
@@ -104,7 +121,7 @@ def load_eodhd_bulk_eod(
     Fetch EOD data for ALL tickers on an exchange in 1 API call.
     Returns DataFrame with columns: code, open, high, low, close, volume, etc.
     """
-    cache_name = f"eodhd_bulk_{exchange}_{date}"
+    cache_name = f"eodhd_bulk_{exchange}_{date}_{_API_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -134,7 +151,7 @@ def load_eodhd_fundamentals(
     Rate: ~5 calls/sec, ~3000 tickers = ~10 min first time.
     Cached indefinitely (fundamentals change quarterly).
     """
-    cache_name = "eodhd_fundamentals"
+    cache_name = f"eodhd_fundamentals_{_API_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -286,7 +303,7 @@ def load_eodhd_dividends(
     """Fetch historical dividends for tickers. Parallel: ~3 min for 4600 tickers."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    cache_name = f"eodhd_dividends_{start}"
+    cache_name = f"eodhd_dividends_{start}_{_API_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -342,7 +359,10 @@ def load_eodhd_sentiment(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    cache_name = f"eodhd_sentiment_{start}_{end}"
+    # Cache key bumped to v2 (2026-04-05): shift(1) now applied at load time,
+    # so old caches (unshifted) would produce a 0-day lag (lookahead). v2
+    # invalidates stale caches and forces re-fetch of PIT-correct data.
+    cache_name = f"eodhd_sentiment_v2_{start}_{end}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -363,7 +383,14 @@ def load_eodhd_sentiment(
                 if records and len(records) > 10:
                     df = pd.DataFrame(records)
                     df["date"] = pd.to_datetime(df["date"])
-                    return ticker, df.set_index("date").sort_index()
+                    df = df.set_index("date").sort_index()
+                    # Shift(1) applied here: sentiment scored on day D is
+                    # available as a feature on day D+1 (point-in-time correct).
+                    # Applying at the loader guarantees any caller gets PIT-safe
+                    # data — callers must not apply an additional shift.
+                    # Note: the first row becomes NaN after shifting.
+                    df = df.shift(1)
+                    return ticker, df
         except Exception:
             pass
         return ticker, None
@@ -446,7 +473,7 @@ def load_finnhub_data(
     At 60 calls/min, 500 tickers * 4 endpoints = 2000 calls = ~35 min.
     Cached after first fetch.
     """
-    cache_name = "finnhub_all_data"
+    cache_name = f"finnhub_all_data_{_API_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -619,14 +646,15 @@ def build_eodhd_sentiment_features(
     for ticker, df in sentiment_data.items():
         if ticker not in tickers:
             continue
+        # NOTE: shift(1) is applied inside load_eodhd_sentiment() so the
+        # incoming `df` is already point-in-time-correct. Do NOT shift again
+        # here or we'd introduce a 2-day lag. First row of each ticker's
+        # series is NaN (expected, handled by reindex+ffill+NaN-safe ranks).
         if "normalized" in df.columns:
-            # shift(1): sentiment aggregated at end-of-day is not available
-            # until the next morning. Without shift, we'd trade on today's
-            # sentiment using today's close — lookahead bias.
-            aligned = df["normalized"].reindex(date_index, method="ffill").shift(1)
+            aligned = df["normalized"].reindex(date_index, method="ffill")
             sent_panel[ticker] = aligned
         if "count" in df.columns:
-            aligned = df["count"].reindex(date_index, method="ffill").shift(1)
+            aligned = df["count"].reindex(date_index, method="ffill")
             count_panel[ticker] = aligned
 
     if sent_panel.notna().any().any():
@@ -655,6 +683,25 @@ def build_finnhub_features(
       fh_target_upside         — (target price / current) - 1
       fh_eps_surprise          — most recent EPS surprise %
       fh_news_sentiment        — positive - negative news ratio
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ LOOKAHEAD WARNING — READ BEFORE MODIFYING                            │
+    │                                                                      │
+    │ Finnhub's free-tier endpoints (recommendations, price targets, EPS   │
+    │ surprises, news) return ONLY current snapshots — they have no        │
+    │ historical time-series. If these snapshot values are tiled flat      │
+    │ across every historical date (as the previous implementation did),  │
+    │ the model trains on 2013 rows that "see" 2026 analyst consensus.    │
+    │ That is subtle but real lookahead bias.                              │
+    │                                                                      │
+    │ FIX: we now emit each feature ONLY at the LAST date in date_index,  │
+    │ leaving all earlier rows as NaN. This makes the features:            │
+    │   - HARMLESS in backtest (NaN columns contribute nothing)            │
+    │   - USEFUL in live trading (the final-row signal is populated for    │
+    │     today's forward inference)                                       │
+    │                                                                      │
+    │ DO NOT revert to np.tile / broadcast across all dates.               │
+    └──────────────────────────────────────────────────────────────────────┘
     """
     signals = {}
 
@@ -684,11 +731,10 @@ def build_finnhub_features(
 
     if rec_scores:
         s = pd.Series(rec_scores).reindex(tickers)
-        df = pd.DataFrame(
-            np.tile(s.values.reshape(1, -1), (len(date_index), 1)),
-            index=date_index, columns=tickers,
-        )
-        df.loc[:, s.isna()] = np.nan
+        # LOOKAHEAD FIX: emit snapshot only at the last date; NaN elsewhere.
+        df = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        if len(date_index) > 0:
+            df.iloc[-1] = s.values
         signals["fh_recommendation_score"] = _cs_rank(df)
 
     # 2. Target upside
@@ -702,11 +748,10 @@ def build_finnhub_features(
 
     if target_upside:
         s = pd.Series(target_upside).reindex(tickers)
-        df = pd.DataFrame(
-            np.tile(s.values.reshape(1, -1), (len(date_index), 1)),
-            index=date_index, columns=tickers,
-        )
-        df.loc[:, s.isna()] = np.nan
+        # LOOKAHEAD FIX: emit snapshot only at the last date; NaN elsewhere.
+        df = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        if len(date_index) > 0:
+            df.iloc[-1] = s.values
         signals["fh_target_upside"] = _cs_rank(df)
 
     # 3. EPS surprise
@@ -721,11 +766,10 @@ def build_finnhub_features(
 
     if eps_surprise:
         s = pd.Series(eps_surprise).reindex(tickers)
-        df = pd.DataFrame(
-            np.tile(s.values.reshape(1, -1), (len(date_index), 1)),
-            index=date_index, columns=tickers,
-        )
-        df.loc[:, s.isna()] = np.nan
+        # LOOKAHEAD FIX: emit snapshot only at the last date; NaN elsewhere.
+        df = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        if len(date_index) > 0:
+            df.iloc[-1] = s.values
         signals["fh_eps_surprise"] = _cs_rank(df)
 
     # 4. News sentiment
@@ -737,11 +781,10 @@ def build_finnhub_features(
 
     if sentiment:
         s = pd.Series(sentiment).reindex(tickers)
-        df = pd.DataFrame(
-            np.tile(s.values.reshape(1, -1), (len(date_index), 1)),
-            index=date_index, columns=tickers,
-        )
-        df.loc[:, s.isna()] = np.nan
+        # LOOKAHEAD FIX: emit snapshot only at the last date; NaN elsewhere.
+        df = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        if len(date_index) > 0:
+            df.iloc[-1] = s.values
         signals["fh_news_sentiment"] = _cs_rank(df)
 
     return signals
@@ -818,18 +861,27 @@ def load_all_api_data(
     # code path live so that once the cache is filled the features light up.
     # ─────────────────────────────────────────────────────────────────────
     FINNHUB_MIN_COVERAGE = 1000  # min cached tickers before Finnhub activates
-    cached_fh = _load("finnhub_all_data")
-    if cached_fh and len(cached_fh) >= FINNHUB_MIN_COVERAGE:
+    cached_fh = _load(f"finnhub_all_data_{_API_DATA_CACHE_VERSION}")
+    # BUG FIX: gate on OVERLAP with the current universe rather than raw cache
+    # size. A cache of 2000 stale tickers that don't match today's universe
+    # would otherwise activate Finnhub with near-empty coverage.
+    overlap = (
+        len(set(cached_fh.keys()) & set(tickers))
+        if cached_fh else 0
+    )
+    if cached_fh and overlap >= FINNHUB_MIN_COVERAGE:
         fh_features = build_finnhub_features(cached_fh, tickers_index, date_index)
         all_features.update(fh_features)
         print(f"  [Finnhub] Built {len(fh_features)} features "
-              f"(coverage: {len(cached_fh)} tickers)")
+              f"(overlap coverage: {overlap}/{len(tickers)} tickers; "
+              f"cache size: {len(cached_fh)})")
     else:
         n_cached = len(cached_fh) if cached_fh else 0
-        print(f"[API] Finnhub: disabled ({n_cached}/{FINNHUB_MIN_COVERAGE} "
-              f"cached tickers). Run `python fetch_finnhub.py --max 3000` "
-              f"overnight to populate; features auto-activate once cache "
-              f"reaches threshold.")
+        print(f"[API] Finnhub: disabled (overlap {overlap}/"
+              f"{FINNHUB_MIN_COVERAGE}; cache {n_cached}). "
+              f"Run `python fetch_finnhub.py --max 3000` overnight to "
+              f"populate; features auto-activate once overlap reaches "
+              f"threshold.")
 
     print(f"\n[API] Total new features from paid APIs: {len(all_features)}")
     return all_features

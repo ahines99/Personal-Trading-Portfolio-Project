@@ -166,26 +166,37 @@ def _fetch_iwb_holdings() -> List[str]:
 
 
 # ── known-bad ticker patterns to exclude ─────────────────────────────────────
+#
+# BUG FIX: The previous implementation mixed regex patterns and literal tickers
+# into a single set, then tried to detect regex via `startswith("r")` — but
+# none of the patterns actually started with "r" (they start with "." or "^"),
+# so ALL regex patterns were DEAD and only literal string equality worked.
+# Preferred shares (BRK-PA), warrants (-W/-WS/-WT), rights (-R), and units
+# (-U/-UN) were silently NOT being filtered.
+#
+# Fix: split into an explicit literal set and a compiled-regex list, with a
+# helper that checks both.
 
-_EXCLUDE_PATTERNS = {
-    # Preferred shares, warrants, rights, units
-    r".*-P[A-Z]$",   # preferred: BRK-PA
-    r".*-W[ST]?$",   # warrants
-    r".*-R$",        # rights
-    r".*-U$",        # units
-    # ETFs and funds that may sneak in
-    "SPY", "QQQ", "IWM", "IWB", "DIA", "GLD", "SLV", "TLT", "HYG", "LQD",
+# Literal tickers to exclude (exact match) — ETFs / funds that may sneak in.
+_EXCLUDE_LITERALS = {
+    "SPY", "QQQ", "IWM", "IWB", "DIA", "VOO", "VTI",
+    "GLD", "SLV", "TLT", "HYG", "LQD",
 }
+
+# Regex patterns for non-common-equity instruments.
+_EXCLUDE_REGEXES = [
+    re.compile(r".*-P[A-Z]?$"),           # Preferred shares: BRK-PA, WFC-PL, etc.
+    re.compile(r".*-W[ST]?$"),            # Warrants: XYZ-W, XYZ-WS, XYZ-WT
+    re.compile(r".*-R$"),                 # Rights
+    re.compile(r".*-U[N]?$"),             # Units: XYZ-U, XYZ-UN
+    re.compile(r"^[A-Z]{1,5}\.P[A-Z]$"),  # Preferred shares dot-notation
+]
 
 
 def _is_excluded(ticker: str) -> bool:
-    for pat in _EXCLUDE_PATTERNS:
-        if pat.startswith("r"):
-            if re.match(pat[2:-1], ticker):
-                return True
-        elif ticker == pat:
-            return True
-    return False
+    if ticker in _EXCLUDE_LITERALS:
+        return True
+    return any(rx.match(ticker) for rx in _EXCLUDE_REGEXES)
 
 
 # ── master builder ────────────────────────────────────────────────────────────

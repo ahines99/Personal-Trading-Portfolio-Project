@@ -32,6 +32,16 @@ _ROOT = Path(__file__).parent.parent
 _CACHE = _ROOT / "data" / "cache"
 _CACHE.mkdir(parents=True, exist_ok=True)
 
+# ── cache version ────────────────────────────────────────────────────────────
+# _ALT_DATA_CACHE_VERSION bumped 2026-04-05 (Tier 8): forces rebuild of
+# fred_macro, vix_term, analyst_actions, insider_subs, earnings_calendar,
+# short_interest_snapshot, earnings_estimates, institutional_holders,
+# edgar_cik_map, dxy, breakeven, vvix, oil_wti, copper_gold, cross_asset_panel,
+# ig_oas, sector_oas, ebp, treasury_yield_curve caches after Tier 1-6 feature
+# set changes. EDGAR fundamentals already have _v2raw suffix and are untouched.
+# On next run, these caches will be rebuilt from upstream APIs (one-time cost).
+_ALT_DATA_CACHE_VERSION = "v2"
+
 
 def _cache_path(name: str) -> Path:
     return _CACHE / f"{name}.pkl"
@@ -100,7 +110,7 @@ def _get_cik_map(tickers: List[str]) -> Dict[str, str]:
     https://data.sec.gov/submissions/CIK{cik}.json which would require
     per-ticker crawling — not done here to keep rate-limit footprint small.
     """
-    cache_name = "edgar_cik_map"
+    cache_name = f"edgar_cik_map_{_ALT_DATA_CACHE_VERSION}"
     cached = _load(cache_name)
     if cached is not None and (time.time() - cached["ts"]) < 7 * 86400:
         return cached["data"]
@@ -411,7 +421,7 @@ def load_fred_macro(
     Returns a DataFrame (DatetimeIndex × macro series) at daily frequency.
     Values are forward-filled to business days and shifted 1 day (point-in-time).
     """
-    cache_name = f"fred_macro_{start}_{end}"
+    cache_name = f"fred_macro_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -524,7 +534,7 @@ def load_vix_term_structure(
       vix_change_5d   (5d % change in VIX)
     All shifted 1 day for point-in-time correctness.
     """
-    cache_name = f"vix_term_{start}_{end}"
+    cache_name = f"vix_term_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -588,7 +598,7 @@ def load_short_interest(
     For real backtesting, the FINRA bi-monthly archive (finra.org/investors/learn-to-invest/
     advanced-investing/short-selling/regsho/short-sale-volume-data) would be needed.
     """
-    cache_name = "short_interest_snapshot"
+    cache_name = f"short_interest_snapshot_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -640,7 +650,7 @@ def load_earnings_calendar(
       earnings_date, eps_estimate, eps_actual, eps_surprise, eps_surprise_pct
     Uses yfinance .get_earnings_dates() (returns ~8 quarters of history).
     """
-    cache_name = f"earnings_calendar_{start}_{end}"
+    cache_name = f"earnings_calendar_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -732,7 +742,7 @@ def load_insider_transactions(
     insider activity signals. This is a proxy for buy/sell activity:
     more Form 4 filings = more insider trading = potential signal.
     """
-    cache_name = f"insider_subs_{start}_{end}"
+    cache_name = f"insider_subs_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -807,7 +817,7 @@ def load_earnings_estimates(
     'numberOfAnalysts', 'recommendationMean'.
     Cached to avoid repeated API calls.
     """
-    cache_name = "earnings_estimates"
+    cache_name = f"earnings_estimates_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -868,7 +878,7 @@ def load_analyst_actions(
       date, firm, to_grade, from_grade, action (e.g. 'up', 'down', 'main', 'init')
     Uses yfinance .upgrades_downgrades for historical analyst actions.
     """
-    cache_name = f"analyst_actions_{start}_{end}"
+    cache_name = f"analyst_actions_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -935,7 +945,7 @@ def load_institutional_holders(
     This is a current snapshot, not time-series. Broadcast to all dates
     in the feature builder (same as short interest).
     """
-    cache_name = "institutional_holders"
+    cache_name = f"institutional_holders_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1003,7 +1013,7 @@ def _yf_close(ticker: str, start: str, end: str) -> pd.Series:
 def load_dxy(start: str = "2013-01-01", end: str = "2026-01-01",
              use_cache: bool = True) -> pd.DataFrame:
     """Broad trade-weighted dollar (FRED DTWEXBGS). Returns DataFrame col='dxy'."""
-    cache_name = f"dxy_{start}_{end}"
+    cache_name = f"dxy_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1023,7 +1033,7 @@ def load_dxy(start: str = "2013-01-01", end: str = "2026-01-01",
 def load_breakeven_inflation(start: str = "2013-01-01", end: str = "2026-01-01",
                              use_cache: bool = True) -> pd.DataFrame:
     """10-yr breakeven inflation (FRED T10YIE). Returns DataFrame col='breakeven'."""
-    cache_name = f"breakeven_{start}_{end}"
+    cache_name = f"breakeven_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1044,7 +1054,7 @@ def load_vvix(start: str = "2013-01-01", end: str = "2026-01-01",
               use_cache: bool = True) -> pd.DataFrame:
     """VVIX (vol of VIX). Try yfinance ^VVIX, fallback to CBOE CSV.
     Returns DataFrame col='vvix'."""
-    cache_name = f"vvix_{start}_{end}"
+    cache_name = f"vvix_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1075,7 +1085,7 @@ def load_vvix(start: str = "2013-01-01", end: str = "2026-01-01",
 def load_oil_wti(start: str = "2013-01-01", end: str = "2026-01-01",
                  use_cache: bool = True) -> pd.DataFrame:
     """WTI crude (FRED DCOILWTICO). Returns DataFrame col='oil_wti'."""
-    cache_name = f"oil_wti_{start}_{end}"
+    cache_name = f"oil_wti_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1096,7 +1106,7 @@ def load_copper_gold(start: str = "2013-01-01", end: str = "2026-01-01",
                      use_cache: bool = True) -> pd.DataFrame:
     """Copper (HG=F) and Gold (GC=F) via yfinance. Returns DataFrame
     with cols: copper, gold, cu_au_ratio."""
-    cache_name = f"copper_gold_{start}_{end}"
+    cache_name = f"copper_gold_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1117,7 +1127,7 @@ def load_cross_asset_etf_panel(start: str = "2013-01-01", end: str = "2026-01-01
     """Six-ETF cross-asset panel (SPY, TLT, DBC, UUP, GLD, HYG). Returns a
     DataFrame with a 'close_<ticker>' column for each and 'mom12_1_<ticker>'
     (12-1 momentum: 252d return minus 21d return)."""
-    cache_name = f"cross_asset_panel_{start}_{end}"
+    cache_name = f"cross_asset_panel_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1144,7 +1154,7 @@ def load_cross_asset_etf_panel(start: str = "2013-01-01", end: str = "2026-01-01
 def load_ig_oas(start: str = "2013-01-01", end: str = "2026-01-01",
                 use_cache: bool = True) -> pd.DataFrame:
     """Investment grade OAS (FRED BAMLC0A0CM). Returns DataFrame col='ig_oas'."""
-    cache_name = f"ig_oas_{start}_{end}"
+    cache_name = f"ig_oas_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1165,7 +1175,7 @@ def load_sector_oas(start: str = "2013-01-01", end: str = "2026-01-01",
                     use_cache: bool = True) -> pd.DataFrame:
     """Rating-bucket OAS series from FRED. Returns DataFrame with columns
     BBB, BB, B, CCC (from BAMLC0A4CBBB, BAMLH0A1HYBB, BAMLH0A2HYB, BAMLH0A3HYC)."""
-    cache_name = f"sector_oas_{start}_{end}"
+    cache_name = f"sector_oas_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1197,7 +1207,7 @@ def load_excess_bond_premium(start: str = "2013-01-01", end: str = "2026-01-01",
     Downloads ebp_csv.csv and returns DataFrame with columns
     'ebp' and 'gz_spread' at daily bd frequency (monthly values ffilled).
     Cache auto-refreshes every ``cache_days`` days."""
-    cache_name = f"ebp_{start}_{end}"
+    cache_name = f"ebp_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
@@ -1245,7 +1255,7 @@ def load_treasury_yield_curve(start: str = "2013-01-01", end: str = "2026-01-01"
                               use_cache: bool = True) -> pd.DataFrame:
     """Full Treasury yield curve from FRED (DGS1MO, DGS3MO, DGS6MO, DGS1,
     DGS2, DGS5, DGS10, DGS30). Returns DataFrame with these columns at bd freq."""
-    cache_name = f"treasury_yield_curve_{start}_{end}"
+    cache_name = f"treasury_yield_curve_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
     if use_cache:
         cached = _load(cache_name)
         if cached is not None:
