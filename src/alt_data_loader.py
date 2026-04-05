@@ -890,3 +890,301 @@ def load_institutional_holders(
     _save(result, cache_name)
     print(f"      [13F] Loaded for {len(result)} tickers")
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10+. Additional macro / cross-asset loaders (Tier 6+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fred_series(series_id: str, start: str, end: str) -> pd.Series:
+    """Low-level helper: fetch one FRED series as date-indexed float Series."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    df = pd.read_csv(url, index_col=0, parse_dates=True)
+    df.index = pd.DatetimeIndex(df.index)
+    s = df.iloc[:, 0].replace(".", np.nan).astype(float)
+    s = s.loc[(s.index >= pd.Timestamp(start)) & (s.index <= pd.Timestamp(end))]
+    return s
+
+
+def _yf_close(ticker: str, start: str, end: str) -> pd.Series:
+    """Low-level helper: fetch yfinance Close as 1-D Series."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.Series(dtype=float)
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+        col = df["Close"]
+        if hasattr(col, "columns"):
+            col = col.iloc[:, 0]
+        col.index = pd.DatetimeIndex(col.index).tz_localize(None) if col.index.tz else pd.DatetimeIndex(col.index)
+        return col.astype(float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def load_dxy(start: str = "2013-01-01", end: str = "2026-01-01",
+             use_cache: bool = True) -> pd.DataFrame:
+    """Broad trade-weighted dollar (FRED DTWEXBGS). Returns DataFrame col='dxy'."""
+    cache_name = f"dxy_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    try:
+        s = _fred_series("DTWEXBGS", start, end)
+        s = s.reindex(date_idx, method="ffill").shift(1)
+    except Exception as e:
+        warnings.warn(f"DXY load failed: {e}")
+        s = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame({"dxy": s}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_breakeven_inflation(start: str = "2013-01-01", end: str = "2026-01-01",
+                             use_cache: bool = True) -> pd.DataFrame:
+    """10-yr breakeven inflation (FRED T10YIE). Returns DataFrame col='breakeven'."""
+    cache_name = f"breakeven_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    try:
+        s = _fred_series("T10YIE", start, end)
+        s = s.reindex(date_idx, method="ffill").shift(1)
+    except Exception as e:
+        warnings.warn(f"Breakeven load failed: {e}")
+        s = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame({"breakeven": s}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_vvix(start: str = "2013-01-01", end: str = "2026-01-01",
+              use_cache: bool = True) -> pd.DataFrame:
+    """VVIX (vol of VIX). Try yfinance ^VVIX, fallback to CBOE CSV.
+    Returns DataFrame col='vvix'."""
+    cache_name = f"vvix_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    s = _yf_close("^VVIX", start, end)
+    if s is None or s.empty:
+        try:
+            url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv"
+            df = pd.read_csv(url)
+            df.columns = [c.strip().upper() for c in df.columns]
+            date_col = "DATE" if "DATE" in df.columns else df.columns[0]
+            close_col = "VVIX" if "VVIX" in df.columns else ("CLOSE" if "CLOSE" in df.columns else df.columns[-1])
+            df[date_col] = pd.to_datetime(df[date_col])
+            s = df.set_index(date_col)[close_col].astype(float).sort_index()
+        except Exception as e:
+            warnings.warn(f"VVIX CBOE fallback failed: {e}")
+            s = pd.Series(dtype=float)
+    if s is None or s.empty:
+        s = pd.Series(np.nan, index=date_idx)
+    else:
+        s = s.reindex(date_idx, method="ffill").shift(1)
+    out = pd.DataFrame({"vvix": s}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_oil_wti(start: str = "2013-01-01", end: str = "2026-01-01",
+                 use_cache: bool = True) -> pd.DataFrame:
+    """WTI crude (FRED DCOILWTICO). Returns DataFrame col='oil_wti'."""
+    cache_name = f"oil_wti_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    try:
+        s = _fred_series("DCOILWTICO", start, end)
+        s = s.reindex(date_idx, method="ffill").shift(1)
+    except Exception as e:
+        warnings.warn(f"Oil WTI load failed: {e}")
+        s = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame({"oil_wti": s}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_copper_gold(start: str = "2013-01-01", end: str = "2026-01-01",
+                     use_cache: bool = True) -> pd.DataFrame:
+    """Copper (HG=F) and Gold (GC=F) via yfinance. Returns DataFrame
+    with cols: copper, gold, cu_au_ratio."""
+    cache_name = f"copper_gold_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    cu = _yf_close("HG=F", start, end)
+    au = _yf_close("GC=F", start, end)
+    cu_d = cu.reindex(date_idx, method="ffill").shift(1) if not cu.empty else pd.Series(np.nan, index=date_idx)
+    au_d = au.reindex(date_idx, method="ffill").shift(1) if not au.empty else pd.Series(np.nan, index=date_idx)
+    ratio = cu_d / au_d.replace(0, np.nan)
+    out = pd.DataFrame({"copper": cu_d, "gold": au_d, "cu_au_ratio": ratio}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_cross_asset_etf_panel(start: str = "2013-01-01", end: str = "2026-01-01",
+                               use_cache: bool = True) -> pd.DataFrame:
+    """Six-ETF cross-asset panel (SPY, TLT, DBC, UUP, GLD, HYG). Returns a
+    DataFrame with a 'close_<ticker>' column for each and 'mom12_1_<ticker>'
+    (12-1 momentum: 252d return minus 21d return)."""
+    cache_name = f"cross_asset_panel_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    etfs = ["SPY", "TLT", "DBC", "UUP", "GLD", "HYG"]
+    cols = {}
+    for etf in etfs:
+        s = _yf_close(etf, start, end)
+        if s is None or s.empty:
+            cols[f"close_{etf}"] = pd.Series(np.nan, index=date_idx)
+            cols[f"mom12_1_{etf}"] = pd.Series(np.nan, index=date_idx)
+            continue
+        s = s.reindex(date_idx, method="ffill").shift(1)
+        cols[f"close_{etf}"] = s
+        # 12-1 momentum: (P_{t-21}/P_{t-252}) - 1
+        mom = (s.shift(21) / s.shift(252) - 1.0)
+        cols[f"mom12_1_{etf}"] = mom
+    out = pd.DataFrame(cols, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_ig_oas(start: str = "2013-01-01", end: str = "2026-01-01",
+                use_cache: bool = True) -> pd.DataFrame:
+    """Investment grade OAS (FRED BAMLC0A0CM). Returns DataFrame col='ig_oas'."""
+    cache_name = f"ig_oas_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    try:
+        s = _fred_series("BAMLC0A0CM", start, end)
+        s = s.reindex(date_idx, method="ffill").shift(1)
+    except Exception as e:
+        warnings.warn(f"IG OAS load failed: {e}")
+        s = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame({"ig_oas": s}, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_sector_oas(start: str = "2013-01-01", end: str = "2026-01-01",
+                    use_cache: bool = True) -> pd.DataFrame:
+    """Rating-bucket OAS series from FRED. Returns DataFrame with columns
+    BBB, BB, B, CCC (from BAMLC0A4CBBB, BAMLH0A1HYBB, BAMLH0A2HYB, BAMLH0A3HYC)."""
+    cache_name = f"sector_oas_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    mapping = {
+        "BBB": "BAMLC0A4CBBB",
+        "BB":  "BAMLH0A1HYBB",
+        "B":   "BAMLH0A2HYB",
+        "CCC": "BAMLH0A3HYC",
+    }
+    frames = {}
+    for name, sid in mapping.items():
+        try:
+            s = _fred_series(sid, start, end)
+            frames[name] = s.reindex(date_idx, method="ffill").shift(1)
+        except Exception as e:
+            warnings.warn(f"sector OAS {sid} load failed: {e}")
+            frames[name] = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame(frames, index=date_idx)
+    _save(out, cache_name)
+    return out
+
+
+def load_excess_bond_premium(start: str = "2013-01-01", end: str = "2026-01-01",
+                             use_cache: bool = True,
+                             cache_days: int = 30) -> pd.DataFrame:
+    """Federal Reserve Excess Bond Premium (Gilchrist-Zakrajsek 2012).
+    Downloads ebp_csv.csv and returns DataFrame with columns
+    'ebp' and 'gz_spread' at daily bd frequency (monthly values ffilled).
+    Cache auto-refreshes every ``cache_days`` days."""
+    cache_name = f"ebp_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            ts = cached.get("ts") if isinstance(cached, dict) else None
+            if ts is not None and (time.time() - ts) < cache_days * 86400:
+                return cached["data"]
+    date_idx = pd.bdate_range(start, end)
+    try:
+        url = "https://www.federalreserve.gov/data/ebp_csv.csv"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        date_col = None
+        for c in df.columns:
+            if "date" in c:
+                date_col = c
+                break
+        if date_col is None:
+            date_col = df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col).sort_index()
+        # find ebp and gz_spread columns
+        ebp_col = next((c for c in df.columns if "ebp" in c), None)
+        gz_col = next((c for c in df.columns if "gz" in c), None)
+        out_cols = {}
+        if ebp_col:
+            out_cols["ebp"] = pd.to_numeric(df[ebp_col], errors="coerce")
+        if gz_col:
+            out_cols["gz_spread"] = pd.to_numeric(df[gz_col], errors="coerce")
+        monthly = pd.DataFrame(out_cols)
+        # reindex to daily bd, ffill monthly values, shift 1 for point-in-time
+        daily = monthly.reindex(date_idx, method="ffill").shift(1)
+    except Exception as e:
+        warnings.warn(f"EBP load failed: {e}")
+        daily = pd.DataFrame(
+            {"ebp": np.nan, "gz_spread": np.nan}, index=date_idx
+        )
+    _save({"ts": time.time(), "data": daily}, cache_name)
+    return daily
+
+
+def load_treasury_yield_curve(start: str = "2013-01-01", end: str = "2026-01-01",
+                              use_cache: bool = True) -> pd.DataFrame:
+    """Full Treasury yield curve from FRED (DGS1MO, DGS3MO, DGS6MO, DGS1,
+    DGS2, DGS5, DGS10, DGS30). Returns DataFrame with these columns at bd freq."""
+    cache_name = f"treasury_yield_curve_{start}_{end}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            return cached
+    date_idx = pd.bdate_range(start, end)
+    series_ids = ["DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS2", "DGS5", "DGS10", "DGS30"]
+    frames = {}
+    for sid in series_ids:
+        try:
+            s = _fred_series(sid, start, end)
+            frames[sid] = s.reindex(date_idx, method="ffill").shift(1)
+        except Exception as e:
+            warnings.warn(f"Treasury {sid} load failed: {e}")
+            frames[sid] = pd.Series(np.nan, index=date_idx)
+    out = pd.DataFrame(frames, index=date_idx)
+    _save(out, cache_name)
+    return out

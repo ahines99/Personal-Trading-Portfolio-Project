@@ -874,6 +874,478 @@ def build_institutional_signals(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tier 6: Distress / Default Signals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_sector_neutralize():
+    try:
+        from features import sector_neutralize as _fn
+    except ImportError:
+        from src.features import sector_neutralize as _fn
+    return _fn
+
+
+def _raw_panel_from_edgar(
+    edgar_df: pd.DataFrame,
+    field: str,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+    filing_lag_days: int = 45,
+) -> Optional[pd.DataFrame]:
+    """Build a daily (dates × tickers) panel of a raw_* EDGAR field."""
+    if edgar_df is None or edgar_df.empty:
+        return None
+    lag = pd.Timedelta(days=filing_lag_days)
+    frames = {}
+    for ticker in tickers:
+        if (ticker, field) in edgar_df.columns:
+            raw = edgar_df[(ticker, field)].dropna()
+            if raw.empty:
+                continue
+            lagged = raw.copy()
+            lagged.index = lagged.index + lag
+            frames[ticker] = lagged.reindex(date_index, method="ffill")
+    if not frames:
+        return None
+    return pd.DataFrame(frames, index=date_index).reindex(columns=tickers)
+
+
+def build_chs_distress_signal(
+    edgar_df: pd.DataFrame,
+    close: pd.DataFrame,
+    market_returns: pd.Series,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Campbell-Hilscher-Szilagyi (2008) 8-variable distress score.
+    Output is cross-sectionally ranked on descending distress so that
+    high distress maps to HIGH rank (short candidates). The downstream
+    interpretation is that distressed stocks underperform (NEGATIVE premium),
+    and the ranked signal is returned ready for a short tilt.
+    """
+    signals: Dict[str, pd.DataFrame] = {}
+    if close is None or edgar_df is None or edgar_df.empty:
+        return signals
+
+    equity_p  = _raw_panel_from_edgar(edgar_df, "raw_equity",       tickers, date_index)
+    liab_p    = _raw_panel_from_edgar(edgar_df, "raw_liabilities",  tickers, date_index)
+    netinc_p  = _raw_panel_from_edgar(edgar_df, "raw_net_income",   tickers, date_index)
+    cash_p    = _raw_panel_from_edgar(edgar_df, "raw_cash",         tickers, date_index)
+    shares_p  = _raw_panel_from_edgar(edgar_df, "raw_shares_out",   tickers, date_index)
+    if liab_p is None or netinc_p is None or shares_p is None:
+        return signals
+
+    close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
+    me = (close_aligned * shares_p).clip(lower=1e-6)          # market equity
+    tl = liab_p.fillna(0)
+    mta = (me + tl).replace(0, np.nan)                        # market total assets
+
+    nimta = netinc_p / mta
+    # 4-qtr geom-weighted avg ≈ 252-day rolling mean of NIMTA
+    nimtaavg = nimta.rolling(252, min_periods=63).mean()
+
+    tlmta = tl / mta
+    cashmta = (cash_p.fillna(0) / mta) if cash_p is not None else pd.DataFrame(0.0, index=date_index, columns=tickers)
+
+    # Excess returns vs market (SPY)
+    rets = close_aligned.pct_change()
+    mkt = market_returns.reindex(date_index).fillna(0.0) if market_returns is not None else pd.Series(0.0, index=date_index)
+    exret = rets.subtract(mkt, axis=0)
+    # geometrically-decayed 12m average: approximate with EWMA half-life ~63d
+    exretavg = exret.ewm(halflife=63, min_periods=63).mean()
+
+    # 3-month daily vol
+    sigma = rets.rolling(63, min_periods=21).std() * np.sqrt(252)
+
+    # Relative size: log(ME / SPX total market cap) — proxy SPX ME with sum
+    total_me = me.sum(axis=1).replace(0, np.nan)
+    rsize = np.log(me.div(total_me, axis=0).replace(0, np.nan))
+
+    # Market-to-book
+    book = equity_p.replace(0, np.nan) if equity_p is not None else tl.replace(0, np.nan)
+    mb = (me / book).clip(-50, 50)
+
+    # Log price, capped at 15
+    price_log = np.log(close_aligned.clip(upper=15).replace(0, np.nan))
+
+    chs = (
+        -9.164
+        - 20.264 * nimtaavg
+        + 1.416  * tlmta
+        - 7.129  * exretavg
+        + 1.411  * sigma
+        - 0.045  * rsize
+        - 2.132  * cashmta
+        + 0.075  * mb
+        - 0.058  * price_log
+    )
+
+    # High CHS → more distress → short candidate → rank descending
+    signals["chs_distress_signal"] = _cs_rank(chs)
+    return signals
+
+
+def build_naive_dtd_signal(
+    edgar_df: pd.DataFrame,
+    close: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Bharath-Shumway (2008) naive Distance-to-Default."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if close is None or edgar_df is None or edgar_df.empty:
+        return signals
+    liab_p   = _raw_panel_from_edgar(edgar_df, "raw_liabilities",  tickers, date_index)
+    shares_p = _raw_panel_from_edgar(edgar_df, "raw_shares_out",   tickers, date_index)
+    debt_p   = _raw_panel_from_edgar(edgar_df, "raw_lt_debt",      tickers, date_index)
+    if liab_p is None or shares_p is None:
+        return signals
+
+    close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
+    E = (close_aligned * shares_p).clip(lower=1e-6)
+    # Face debt: short-term debt + 0.5 * long-term debt — approximate with total liabilities
+    F = liab_p.clip(lower=1e-6) if debt_p is None else (liab_p.fillna(0) - 0.5 * debt_p.fillna(0)).clip(lower=1e-6)
+    V = E + F
+
+    rets = close_aligned.pct_change()
+    sigma_E = rets.rolling(252, min_periods=63).std() * np.sqrt(252)
+    # asset vol
+    sigma_V = (E / V) * sigma_E + (F / V) * (0.05 + 0.25 * sigma_E)
+    # trailing 1y log return
+    mu = np.log(close_aligned / close_aligned.shift(252))
+    T = 1.0
+    num = np.log(V / F) + (mu - 0.5 * sigma_V**2) * T
+    den = (sigma_V * np.sqrt(T)).replace(0, np.nan)
+    dtd = num / den
+
+    # High DtD = safe, low DtD = distressed.
+    signals["naive_dtd_signal"] = _cs_rank(dtd)
+    return signals
+
+
+def build_altman_z_signal(
+    edgar_df: pd.DataFrame,
+    close: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Altman Z-score: low Z = distress."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if close is None or edgar_df is None or edgar_df.empty:
+        return signals
+    assets_p  = _raw_panel_from_edgar(edgar_df, "raw_assets",       tickers, date_index)
+    liab_p    = _raw_panel_from_edgar(edgar_df, "raw_liabilities",  tickers, date_index)
+    equity_p  = _raw_panel_from_edgar(edgar_df, "raw_equity",       tickers, date_index)
+    netinc_p  = _raw_panel_from_edgar(edgar_df, "raw_net_income",   tickers, date_index)
+    intexp_p  = _raw_panel_from_edgar(edgar_df, "raw_interest_expense", tickers, date_index)
+    rev_p     = _raw_panel_from_edgar(edgar_df, "raw_revenue",      tickers, date_index)
+    shares_p  = _raw_panel_from_edgar(edgar_df, "raw_shares_out",   tickers, date_index)
+    ca_p      = _raw_panel_from_edgar(edgar_df, "raw_current_assets", tickers, date_index)
+    cl_p      = _raw_panel_from_edgar(edgar_df, "raw_current_liabilities", tickers, date_index)
+    if assets_p is None or liab_p is None or equity_p is None or shares_p is None:
+        return signals
+
+    ta = assets_p.replace(0, np.nan)
+    wc = (ca_p - cl_p) if (ca_p is not None and cl_p is not None) else (assets_p - liab_p)
+    # Retained earnings proxy = equity (paid-in-capital not available)
+    re = equity_p
+    ebit = (netinc_p.fillna(0) + (intexp_p.fillna(0) if intexp_p is not None else 0))
+    close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
+    me = close_aligned * shares_p
+    sales = rev_p if rev_p is not None else pd.DataFrame(0.0, index=date_index, columns=tickers)
+
+    z = (
+        1.2 * (wc / ta)
+        + 1.4 * (re / ta)
+        + 3.3 * (ebit / ta)
+        + 0.6 * (me / liab_p.replace(0, np.nan))
+        + 1.0 * (sales / ta)
+    ).clip(-20, 20)
+
+    signals["altman_z_signal"] = _cs_rank(z)
+    return signals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6: Macro cross-sectional beta signals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rolling_beta(y: pd.DataFrame, x: pd.Series, window: int, min_periods: int) -> pd.DataFrame:
+    """Compute rolling beta of each column of y on scalar x."""
+    x_s = x.reindex(y.index)
+    x_mean = x_s.rolling(window, min_periods=min_periods).mean()
+    x_var = x_s.rolling(window, min_periods=min_periods).var().replace(0, np.nan)
+    out = {}
+    for col in y.columns:
+        ys = y[col]
+        y_mean = ys.rolling(window, min_periods=min_periods).mean()
+        cov = (ys * x_s).rolling(window, min_periods=min_periods).mean() - (y_mean * x_mean)
+        out[col] = cov / x_var
+    return pd.DataFrame(out, index=y.index)
+
+
+def build_dxy_beta_signal(
+    returns: pd.DataFrame,
+    dxy_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """36-month rolling beta to ΔDXY. Emit -β (long when DXY falls), plus
+    interaction with 3M DXY momentum regime."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or dxy_df is None or dxy_df.empty or "dxy" not in dxy_df.columns:
+        return signals
+    rets = returns.reindex(index=date_index, columns=tickers)
+    dxy = dxy_df["dxy"].reindex(date_index).ffill()
+    ddxy = dxy.pct_change()
+    window = 756  # ~36 months of bdays
+    beta = _rolling_beta(rets, ddxy, window=window, min_periods=252)
+    neg_beta = -beta
+    signals["dxy_beta_signal"] = _cs_rank(neg_beta)
+
+    # 3M dxy momentum regime sign
+    dxy_mom = dxy.pct_change(63)
+    regime = np.sign(dxy_mom).fillna(0.0)
+    interaction = neg_beta.mul(regime, axis=0)
+    signals["dxy_beta_x_dxy_mom_regime"] = _cs_rank(interaction)
+    return signals
+
+
+def build_yield_curve_pca_betas(
+    returns: pd.DataFrame,
+    yields_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """PCA on weekly yield changes → PC1 (level), PC2 (slope), PC3 (curvature).
+    For each stock compute 60-month rolling beta to PC2 changes."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or yields_df is None or yields_df.empty:
+        return signals
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        return signals
+
+    yld = yields_df.reindex(date_index).ffill()
+    # weekly changes
+    weekly = yld.resample("W-FRI").last().diff().dropna(how="all")
+    weekly = weekly.dropna(axis=1, how="all").dropna(how="any")
+    if weekly.empty or weekly.shape[1] < 3 or weekly.shape[0] < 30:
+        return signals
+    try:
+        pca = PCA(n_components=3)
+        pcs = pca.fit_transform(weekly.values)
+    except Exception:
+        return signals
+    pc2_weekly = pd.Series(pcs[:, 1], index=weekly.index)
+    # expand back to daily
+    pc2_daily = pc2_weekly.reindex(date_index, method="ffill")
+
+    rets = returns.reindex(index=date_index, columns=tickers)
+    window = 1260  # ~60 months bd
+    beta = _rolling_beta(rets, pc2_daily.diff(), window=window, min_periods=252)
+    signals["pc2_slope_beta_signal"] = _cs_rank(beta)
+    return signals
+
+
+def build_copper_gold_regime_features(
+    returns: pd.DataFrame,
+    cu_au_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Copper/gold ratio z-score, 3m rate-of-change, and per-stock 60m beta."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if cu_au_df is None or cu_au_df.empty or "cu_au_ratio" not in cu_au_df.columns:
+        return signals
+    ratio = cu_au_df["cu_au_ratio"].reindex(date_index).ffill()
+    mu = ratio.rolling(252, min_periods=63).mean()
+    sd = ratio.rolling(252, min_periods=63).std().replace(0, np.nan)
+    z = ((ratio - mu) / sd).clip(-4, 4)
+    roc_3m = ratio.pct_change(63)
+
+    signals["cu_au_zscore"] = _broadcast(z, tickers)
+    signals["cu_au_roc_3m"] = _broadcast(roc_3m, tickers)
+
+    if returns is not None:
+        rets = returns.reindex(index=date_index, columns=tickers)
+        beta = _rolling_beta(rets, ratio.pct_change(), window=1260, min_periods=252)
+        signals["cyclicality_cu_au_signal"] = _cs_rank(beta)
+    return signals
+
+
+def build_credit_beta_signal(
+    returns: pd.DataFrame,
+    hy_oas: pd.Series,
+    ig_oas: pd.Series,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """36m rolling beta of each stock to Δ(HY-IG) spread."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or hy_oas is None or ig_oas is None:
+        return signals
+    hy = hy_oas.reindex(date_index).ffill()
+    ig = ig_oas.reindex(date_index).ffill()
+    spread = (hy - ig).diff()
+    rets = returns.reindex(index=date_index, columns=tickers)
+    beta = _rolling_beta(rets, spread, window=756, min_periods=252)
+    signals["credit_beta_signal"] = _cs_rank(beta)
+    return signals
+
+
+def build_cross_asset_momentum_features(
+    cross_asset_panel: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Broadcast 12-1 momentum of SPY/TLT/DBC/UUP/GLD/HYG as global features."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if cross_asset_panel is None or cross_asset_panel.empty:
+        return signals
+    panel = cross_asset_panel.reindex(date_index).ffill()
+    for etf in ("SPY", "TLT", "DBC", "UUP", "GLD", "HYG"):
+        col = f"mom12_1_{etf}"
+        if col in panel.columns:
+            signals[f"mom_{etf.lower()}_12_1"] = _broadcast(panel[col], tickers)
+    return signals
+
+
+def build_breakeven_inflation_beta_signal(
+    returns: pd.DataFrame,
+    breakeven_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """60m rolling inflation beta, interacted with sign(Δbreakeven)."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or breakeven_df is None or breakeven_df.empty:
+        return signals
+    col = "breakeven" if "breakeven" in breakeven_df.columns else breakeven_df.columns[0]
+    bei = breakeven_df[col].reindex(date_index).ffill()
+    dbei = bei.diff()
+    rets = returns.reindex(index=date_index, columns=tickers)
+    beta = _rolling_beta(rets, dbei, window=1260, min_periods=252)
+    regime = np.sign(dbei).fillna(0.0)
+    interaction = beta.mul(regime, axis=0)
+    signals["inflation_sensitivity_signal"] = _cs_rank(interaction)
+    return signals
+
+
+def build_oil_beta_signal(
+    returns: pd.DataFrame,
+    oil_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """60m rolling beta to oil monthly returns + interaction with 3m oil momentum."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or oil_df is None or oil_df.empty:
+        return signals
+    col = "oil_wti" if "oil_wti" in oil_df.columns else oil_df.columns[0]
+    oil = oil_df[col].reindex(date_index).ffill()
+    oil_mret = oil.pct_change(21)
+    rets = returns.reindex(index=date_index, columns=tickers)
+    # use daily returns beta on oil daily returns (simpler, stable)
+    oil_dret = oil.pct_change()
+    beta = _rolling_beta(rets, oil_dret, window=1260, min_periods=252)
+    signals["oil_beta_signal"] = _cs_rank(beta)
+
+    regime = np.sign(oil_mret).fillna(0.0)
+    interaction = beta.mul(regime, axis=0)
+    signals["oil_beta_x_oil_momentum"] = _cs_rank(interaction)
+    return signals
+
+
+def build_vvix_features(
+    vvix_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """VVIX/VIX ratio and 5-day change, broadcast as globals."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if vvix_df is None or vvix_df.empty:
+        return signals
+    vvix = vvix_df["vvix"].reindex(date_index).ffill() if "vvix" in vvix_df.columns else None
+    # pull VIX from vix_df (CBOE term structure)
+    vix = None
+    if vix_df is not None and not vix_df.empty and "VIX" in vix_df.columns:
+        vix = vix_df["VIX"].reindex(date_index).ffill()
+    if vvix is None or vix is None:
+        return signals
+    ratio = (vvix / vix.replace(0, np.nan))
+    chg_5d = ratio.diff(5)
+    signals["vvix_vix_ratio"] = _broadcast(ratio, tickers)
+    signals["vvix_vix_ratio_chg5d"] = _broadcast(chg_5d, tickers)
+    return signals
+
+
+def build_sector_oas_momentum_signal(
+    sector_oas_df: pd.DataFrame,
+    sector_map: Dict[str, str],
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """Map tickers to sectors, then to rating-bucket OAS changes.
+    The standard GICS sectors don't directly map to rating buckets, so we
+    heuristically assign: Financials/Utilities→BBB, Cons Disc/Industrials/
+    Materials/Energy→BB, Cons Staples/Health Care→B, Tech/Comms/Real
+    Estate→CCC as a credit-risk proxy. If no map, broadcast mean OAS change."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if sector_oas_df is None or sector_oas_df.empty:
+        return signals
+    panel = sector_oas_df.reindex(date_index).ffill()
+    # Negative of 21d OAS change: tightening (falling OAS) → positive signal
+    d_oas = -panel.diff(21)
+
+    _GICS_TO_BUCKET = {
+        "Financials": "BBB", "Utilities": "BBB",
+        "Consumer Discretionary": "BB", "Industrials": "BB",
+        "Materials": "BB", "Energy": "BB",
+        "Consumer Staples": "B", "Health Care": "B", "Healthcare": "B",
+        "Information Technology": "CCC", "Technology": "CCC",
+        "Communication Services": "CCC", "Real Estate": "CCC",
+    }
+
+    if not sector_map:
+        # broadcast mean signal
+        avg = d_oas.mean(axis=1)
+        signals["sector_oas_momentum_signal"] = _broadcast(avg, tickers)
+        return signals
+
+    out = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+    for ticker in tickers:
+        sec = sector_map.get(ticker)
+        if sec is None:
+            continue
+        bucket = _GICS_TO_BUCKET.get(sec, "BBB")
+        if bucket in d_oas.columns:
+            out[ticker] = d_oas[bucket]
+    signals["sector_oas_momentum_signal"] = _cs_rank(out)
+    return signals
+
+
+def build_ebp_beta_signal(
+    returns: pd.DataFrame,
+    ebp_df: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+) -> Dict[str, pd.DataFrame]:
+    """36m rolling beta to Excess Bond Premium changes."""
+    signals: Dict[str, pd.DataFrame] = {}
+    if returns is None or ebp_df is None or ebp_df.empty or "ebp" not in ebp_df.columns:
+        return signals
+    ebp = ebp_df["ebp"].reindex(date_index).ffill()
+    debp = ebp.diff()
+    rets = returns.reindex(index=date_index, columns=tickers)
+    beta = _rolling_beta(rets, debp, window=756, min_periods=252)
+    signals["ebp_beta_signal"] = _cs_rank(beta)
+    return signals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Master builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -889,6 +1361,23 @@ def build_alt_features(
     close: Optional[pd.DataFrame] = None,
     use_short_interest: bool = False,
     use_institutional_holdings: bool = False,
+    # ── Tier 6: macro / distress signal gates ────────────────────────────
+    use_chs: bool = True,
+    use_dtd: bool = True,
+    use_altman_z: bool = True,
+    use_macro_cross_section: bool = True,
+    use_sni_variants: bool = True,
+    dxy_df: Optional[pd.DataFrame] = None,
+    breakeven_df: Optional[pd.DataFrame] = None,
+    vvix_df: Optional[pd.DataFrame] = None,
+    oil_df: Optional[pd.DataFrame] = None,
+    copper_gold_df: Optional[pd.DataFrame] = None,
+    cross_asset_panel: Optional[pd.DataFrame] = None,
+    ig_oas_df: Optional[pd.DataFrame] = None,
+    sector_oas_df: Optional[pd.DataFrame] = None,
+    ebp_df: Optional[pd.DataFrame] = None,
+    treasury_yields_df: Optional[pd.DataFrame] = None,
+    market_returns: Optional[pd.Series] = None,
     **kwargs,
 ) -> Dict[str, pd.DataFrame]:
     """
@@ -948,5 +1437,86 @@ def build_alt_features(
     # correctness. Opt-in via use_institutional_holdings=True.
     if use_institutional_holdings and kwargs.get("institutional_df") is not None:
         _merge(build_institutional_signals(kwargs["institutional_df"], tickers, date_index))
+
+    # ────────────────────────────────────────────────────────────────────
+    # Tier 6: distress & macro cross-sectional signals
+    # ────────────────────────────────────────────────────────────────────
+    # Build per-stock returns panel from close (needed by macro-beta signals)
+    returns_panel = None
+    if close is not None and not close.empty:
+        close_a = close.reindex(index=date_index, columns=tickers, method="ffill")
+        returns_panel = close_a.pct_change()
+
+    mkt_rets = market_returns
+    if mkt_rets is None and returns_panel is not None:
+        mkt_rets = returns_panel.mean(axis=1)
+
+    if use_chs and edgar_df is not None and close is not None:
+        _merge(build_chs_distress_signal(edgar_df, close, mkt_rets, tickers, date_index))
+    if use_dtd and edgar_df is not None and close is not None:
+        _merge(build_naive_dtd_signal(edgar_df, close, tickers, date_index))
+    if use_altman_z and edgar_df is not None and close is not None:
+        _merge(build_altman_z_signal(edgar_df, close, tickers, date_index))
+
+    if use_macro_cross_section:
+        if dxy_df is not None and returns_panel is not None:
+            _merge(build_dxy_beta_signal(returns_panel, dxy_df, tickers, date_index))
+        if treasury_yields_df is not None and returns_panel is not None:
+            _merge(build_yield_curve_pca_betas(
+                returns_panel, treasury_yields_df, tickers, date_index))
+        if copper_gold_df is not None:
+            _merge(build_copper_gold_regime_features(
+                returns_panel, copper_gold_df, tickers, date_index))
+        if ig_oas_df is not None and fred_df is not None and returns_panel is not None:
+            hy_series = None
+            if "BAMLH0A0HYM2" in fred_df.columns:
+                hy_series = fred_df["BAMLH0A0HYM2"]
+            ig_series = ig_oas_df["ig_oas"] if "ig_oas" in ig_oas_df.columns else None
+            if hy_series is not None and ig_series is not None:
+                _merge(build_credit_beta_signal(
+                    returns_panel, hy_series, ig_series, tickers, date_index))
+        if cross_asset_panel is not None:
+            _merge(build_cross_asset_momentum_features(
+                cross_asset_panel, tickers, date_index))
+        if breakeven_df is not None and returns_panel is not None:
+            _merge(build_breakeven_inflation_beta_signal(
+                returns_panel, breakeven_df, tickers, date_index))
+        if oil_df is not None and returns_panel is not None:
+            _merge(build_oil_beta_signal(returns_panel, oil_df, tickers, date_index))
+        if vvix_df is not None:
+            _merge(build_vvix_features(vvix_df, vix_df, tickers, date_index))
+        if sector_oas_df is not None:
+            _merge(build_sector_oas_momentum_signal(
+                sector_oas_df, sector_map, tickers, date_index))
+        if ebp_df is not None and returns_panel is not None:
+            _merge(build_ebp_beta_signal(returns_panel, ebp_df, tickers, date_index))
+
+    # ────────────────────────────────────────────────────────────────────
+    # Sector-neutralized variants for new cross-sectional signals
+    # ────────────────────────────────────────────────────────────────────
+    if use_sni_variants and sector_map:
+        try:
+            _sn = _get_sector_neutralize()
+            _sni_candidates = [
+                "chs_distress_signal",
+                "naive_dtd_signal",
+                "altman_z_signal",
+                "dxy_beta_signal",
+                "pc2_slope_beta_signal",
+                "cyclicality_cu_au_signal",
+                "credit_beta_signal",
+                "inflation_sensitivity_signal",
+                "oil_beta_signal",
+                "ebp_beta_signal",
+                "sector_oas_momentum_signal",
+            ]
+            for base in _sni_candidates:
+                if base in all_signals:
+                    try:
+                        all_signals[f"{base}_sni"] = _sn(all_signals[base], sector_map)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     return all_signals

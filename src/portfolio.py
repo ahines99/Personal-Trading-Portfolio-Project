@@ -20,6 +20,88 @@ import numpy as np
 import pandas as pd
 
 
+# ---------------------------------------------------------------------------
+# Signal post-processing utilities
+# ---------------------------------------------------------------------------
+
+def ema_smooth_signals(signal_df: pd.DataFrame, halflife: float = 5.0) -> pd.DataFrame:
+    """Apply per-stock EWMA with given halflife (in trading days) to reduce signal
+    jitter and turnover.
+
+    Reference: Garleanu-Pedersen 2013 "Dynamic Trading with Predictable Returns".
+    """
+    # Per-ticker (column) EWMA along the date axis
+    return signal_df.ewm(halflife=halflife, min_periods=1).mean()
+
+
+def cs_rank_normal(signal_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-date cross-sectional rank-normalization: rank -> uniform -> inverse-normal CDF.
+
+    Stabilizes signal distribution across dates and regimes.
+    """
+    from scipy.stats import norm
+    ranks = signal_df.rank(axis=1, pct=True)
+    # Clip to avoid infinite values from ppf at 0/1
+    ranks = ranks.clip(lower=1e-4, upper=1 - 1e-4)
+    return pd.DataFrame(
+        norm.ppf(ranks.values),
+        index=signal_df.index,
+        columns=signal_df.columns,
+    )
+
+
+def factor_neutralize_signal(
+    signal_df: pd.DataFrame,
+    factor_panel: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Residualize the signal cross-sectionally per date vs supplied factor exposures.
+
+    factor_panel: dict of factor_name -> DataFrame(index=dates, columns=tickers).
+
+    Reference: Asness-Porter-Stevens (2000) 'Predicting Stock Returns Using
+    Industry-Relative Firm Characteristics'.
+    """
+    if not factor_panel:
+        return signal_df.copy()
+
+    out = signal_df.copy() * np.nan
+    factor_names = list(factor_panel.keys())
+
+    for date in signal_df.index:
+        y = signal_df.loc[date]
+        # Assemble factor exposures for this date
+        cols = []
+        for fname in factor_names:
+            fdf = factor_panel[fname]
+            if date in fdf.index:
+                cols.append(fdf.loc[date].reindex(signal_df.columns))
+            else:
+                cols.append(pd.Series(np.nan, index=signal_df.columns))
+        X_df = pd.concat(cols, axis=1)
+        X_df.columns = factor_names
+
+        # Keep only tickers with no NaNs across y and all factors
+        valid_mask = y.notna() & X_df.notna().all(axis=1)
+        if valid_mask.sum() < max(10, len(factor_names) + 2):
+            out.loc[date] = y
+            continue
+
+        y_v = y[valid_mask].values.astype(float)
+        X_v = X_df[valid_mask].values.astype(float)
+        # Add intercept
+        X_full = np.column_stack([np.ones(len(y_v)), X_v])
+        try:
+            beta, *_ = np.linalg.lstsq(X_full, y_v, rcond=None)
+            resid = y_v - X_full @ beta
+            row = pd.Series(np.nan, index=signal_df.columns)
+            row.loc[y[valid_mask].index] = resid
+            out.loc[date] = row
+        except np.linalg.LinAlgError:
+            out.loc[date] = y
+
+    return out
+
+
 # Hardcoded top-10 SPY mega caps (yfinance ticker format: BRK-B not BRK.B).
 # Used when force_mega_caps=True to prevent breadth collapse from pushing
 # model-liked mega-caps out via vol-bucket/sector-cap constraints.
@@ -109,6 +191,10 @@ def build_monthly_portfolio(
     spy_core_weight:  float = 0.0,
     spy_ticker:       str   = "SPY",
     force_mega_caps:  bool  = False,
+    signal_smooth_halflife: float = 0.0,
+    apply_rank_normal: bool = True,
+    neutralize_factors: Optional[List[str]] = None,
+    factor_panel:     Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """
     Build a long-only concentrated portfolio with monthly rebalancing.
@@ -129,6 +215,22 @@ def build_monthly_portfolio(
             "bear_calm":     max(12, n_positions - 5),
             "bear_volatile": max(10, n_positions - 8),
         }
+
+    # ── Signal post-processing transforms ────────────────────────────────
+    # Applied in order: EMA smoothing -> factor neutralization -> rank-normal.
+    # The factor_panel (dict of factor_name -> DataFrame[date, ticker]) must
+    # be supplied by the caller; e.g. load size/value/momentum exposures from
+    # alt_features_dict and pass them in via `factor_panel=...`.
+    if signal_smooth_halflife and signal_smooth_halflife > 0:
+        signal = ema_smooth_signals(signal, halflife=signal_smooth_halflife)
+
+    if neutralize_factors and factor_panel:
+        sub_panel = {k: factor_panel[k] for k in neutralize_factors if k in factor_panel}
+        if sub_panel:
+            signal = factor_neutralize_signal(signal, sub_panel)
+
+    if apply_rank_normal:
+        signal = cs_rank_normal(signal)
 
     all_dates = signal.index
     # Optimal rebalance day: 3rd trading day of each month instead of 1st.

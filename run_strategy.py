@@ -48,7 +48,12 @@ from alt_data_loader import (load_edgar_fundamentals, load_fred_macro,
                               load_vix_term_structure, load_short_interest,
                               load_earnings_calendar, load_insider_transactions,
                               load_analyst_actions, load_earnings_estimates,
-                              load_institutional_holders)
+                              load_institutional_holders,
+                              load_dxy, load_breakeven_inflation, load_vvix,
+                              load_oil_wti, load_copper_gold,
+                              load_cross_asset_etf_panel, load_ig_oas,
+                              load_sector_oas, load_excess_bond_premium,
+                              load_treasury_yield_curve)
 from alt_features    import build_alt_features
 from api_data        import load_all_api_data
 
@@ -111,11 +116,174 @@ def parse_args():
                    help="SPY ticker symbol in the price panel (default 'SPY')")
     p.add_argument("--force-mega-caps", action="store_true",
                    help="Force-include top-10 mega-caps at min 3%% when model ranks them in top 40%%")
+    # ── Optuna pruner / warm-start / search controls ─────────────────────
+    p.add_argument("--prune-threshold-sharpe", default=0.0, type=float,
+                   help="ThresholdPruner: prune trials with intermediate Sharpe below this "
+                        "(default 0.0)")
+    p.add_argument("--prune-threshold-ic", default=0.2, type=float,
+                   help="ThresholdPruner: prune trials with intermediate IC-IR below this "
+                        "(default 0.2)")
+    p.add_argument("--optuna-warm-start", action=argparse.BooleanOptionalAction, default=True,
+                   help="Warm-start Optuna from prior best trials in "
+                        "data/cache/optuna_best_params.pkl (default ON)")
     return p.parse_args()
 
 
 def section(title: str):
     print(f"\n{'='*60}\n  {title}\n{'='*60}")
+
+
+# ---------------------------------------------------------------------------
+# Optuna wrapper with HyperbandPruner + Threshold pruning + warm-start
+# ---------------------------------------------------------------------------
+def optimize_hyperparameters_pruned(
+    panel, labels,
+    n_trials: int = 40,
+    n_eval_folds: int = 5,
+    prune_threshold_sharpe: float = 0.0,
+    prune_threshold_ic: float = 0.2,
+    warm_start: bool = True,
+    warm_start_path: Path = Path("data/cache/optuna_best_params.pkl"),
+) -> dict:
+    """
+    Bayesian hyperparameter optimization with HyperbandPruner, per-fold
+    ThresholdPruner, and warm-start from prior best trials.
+
+    Uses a mini walk-forward over `n_eval_folds` folds; reports intermediate
+    per-fold rank-IC to Optuna so it can prune unpromising trials early.
+    """
+    try:
+        import optuna
+        import pickle
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        print("  [optuna] Not installed (pip install optuna). Using defaults.")
+        return {}
+
+    from model import WalkForwardModel
+
+    all_dates = panel.index.get_level_values("date").unique().sort_values()
+    eval_start = max(0, len(all_dates) - 504)
+    eval_dates = all_dates[eval_start:]
+    # Split eval dates into folds for walk-forward IC reporting
+    fold_size = max(20, len(eval_dates) // max(1, n_eval_folds))
+    folds = [eval_dates[i * fold_size:(i + 1) * fold_size]
+             for i in range(n_eval_folds)]
+    folds = [f for f in folds if len(f) > 0]
+
+    def objective(trial):
+        num_leaves = trial.suggest_int("num_leaves", 10, 63)
+        lr = trial.suggest_float("learning_rate", 0.01, 0.1, log=True)
+        feat_frac = trial.suggest_float("feature_fraction", 0.4, 0.9)
+        bag_frac = trial.suggest_float("bagging_fraction", 0.5, 0.9)
+        n_est = trial.suggest_int("n_estimators", 100, 500, step=50)
+        ridge_alpha = trial.suggest_float("ridge_alpha", 5.0, 200.0, log=True)
+        lambda_l1 = trial.suggest_float("lambda_l1", 0.1, 50.0, log=True)
+        lambda_l2 = trial.suggest_float("lambda_l2", 0.1, 100.0, log=True)
+        min_child = trial.suggest_int("min_child_samples", 10, 50)
+        max_depth = trial.suggest_int("max_depth", 4, 10)
+        lgbm_w = trial.suggest_float("lgbm_weight", 0.1, 0.6)
+        xgb_w = trial.suggest_float("xgb_weight", 0.0, 0.5)
+        ridge_w = trial.suggest_float("ridge_weight", 0.1, 0.5)
+        mlp_w = trial.suggest_float("mlp_weight", 0.0, 0.4)
+        total_w = lgbm_w + xgb_w + ridge_w + mlp_w
+        lgbm_w, xgb_w, ridge_w, mlp_w = [
+            w / total_w for w in (lgbm_w, xgb_w, ridge_w, mlp_w)
+        ]
+
+        wf = WalkForwardModel(
+            min_train_days=252, retrain_freq=63,
+            num_leaves=num_leaves, learning_rate=lr,
+            feature_fraction=feat_frac, bagging_fraction=bag_frac,
+            n_estimators=n_est, min_child_samples=min_child,
+            max_depth=max_depth, lambda_l1=lambda_l1, lambda_l2=lambda_l2,
+            ridge_alpha=ridge_alpha,
+            lgbm_weight=lgbm_w, xgb_weight=xgb_w,
+            ridge_weight=ridge_w, mlp_weight=mlp_w,
+            prune_features=False,
+        )
+        try:
+            pred = wf.fit_predict(panel, labels)
+        except Exception:
+            return 0.0
+
+        fold_ics = []
+        for fold_idx, fold_dates in enumerate(folds):
+            ics = []
+            for date in fold_dates[:50]:
+                if date not in pred.index:
+                    continue
+                p = pred.loc[date].dropna()
+                if date in labels.index.get_level_values("date"):
+                    l = labels.xs(date, level="date").reindex(p.index)
+                    common = p.index.intersection(l.dropna().index)
+                    if len(common) > 20:
+                        ic = p[common].corr(l[common], method="spearman")
+                        if np.isfinite(ic):
+                            ics.append(ic)
+            if not ics:
+                continue
+            fold_ic = float(np.mean(ics))
+            fold_ics.append(fold_ic)
+
+            # Running mean IC, IC-IR, and proxy "Sharpe" (IC * sqrt(252))
+            running_mean = float(np.mean(fold_ics))
+            running_std = float(np.std(fold_ics)) if len(fold_ics) > 1 else 1.0
+            ic_ir = running_mean / (running_std + 1e-8) \
+                if len(fold_ics) > 1 else running_mean
+            proxy_sharpe = running_mean * np.sqrt(252.0)
+
+            # Manual ThresholdPruner
+            if (proxy_sharpe < prune_threshold_sharpe
+                    or ic_ir < prune_threshold_ic):
+                raise optuna.TrialPruned()
+
+            # HyperbandPruner decision
+            trial.report(running_mean, step=fold_idx)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return float(np.mean(fold_ics)) if fold_ics else 0.0
+
+    study = optuna.create_study(
+        direction="maximize",
+        pruner=optuna.pruners.HyperbandPruner(
+            min_resource=1, max_resource="auto", reduction_factor=3,
+        ),
+    )
+
+    # ── Warm-start: load prior top-5 configs ────────────────────────────
+    if warm_start and warm_start_path.exists():
+        try:
+            with open(warm_start_path, "rb") as f:
+                prior = pickle.load(f)
+            for params in (prior or [])[:5]:
+                try:
+                    study.enqueue_trial(params)
+                except Exception:
+                    pass
+            print(f"  [optuna] Warm-started with {len(prior)} prior configs")
+        except Exception as e:
+            print(f"  [optuna] Warm-start load failed: {e}")
+
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    # ── Save top-5 best params for future warm-starts ───────────────────
+    try:
+        warm_start_path.parent.mkdir(parents=True, exist_ok=True)
+        completed = [t for t in study.trials
+                     if t.state.name == "COMPLETE" and t.value is not None]
+        completed.sort(key=lambda t: t.value, reverse=True)
+        top5 = [t.params for t in completed[:5]]
+        with open(warm_start_path, "wb") as f:
+            pickle.dump(top5, f)
+    except Exception as e:
+        print(f"  [optuna] Failed to save warm-start cache: {e}")
+
+    best = study.best_params if study.best_trial is not None else {}
+    if best:
+        print(f"  [optuna] Best params (IC={study.best_value:.4f}): {best}")
+    return best
 
 
 def run(args):
@@ -173,6 +341,18 @@ def run(args):
         estimates_df  = load_earnings_estimates(tickers_list)
         inst_df       = load_institutional_holders(tickers_list)
 
+        # Tier 6: macro / cross-asset / distress auxiliary data
+        dxy_df_           = load_dxy(start=args.start, end=args.end)
+        breakeven_df_     = load_breakeven_inflation(start=args.start, end=args.end)
+        vvix_df_          = load_vvix(start=args.start, end=args.end)
+        oil_df_           = load_oil_wti(start=args.start, end=args.end)
+        copper_gold_df_   = load_copper_gold(start=args.start, end=args.end)
+        cross_asset_df_   = load_cross_asset_etf_panel(start=args.start, end=args.end)
+        ig_oas_df_        = load_ig_oas(start=args.start, end=args.end)
+        sector_oas_df_    = load_sector_oas(start=args.start, end=args.end)
+        ebp_df_           = load_excess_bond_premium(start=args.start, end=args.end)
+        treasury_df_      = load_treasury_yield_curve(start=args.start, end=args.end)
+
         alt_features_dict = build_alt_features(
             tickers    = close.columns,
             date_index = close.index,
@@ -193,6 +373,17 @@ def run(args):
             # across the full backtest, which is a lookahead bias.
             use_short_interest         = False,
             use_institutional_holdings = False,
+            # Tier 6 macro / distress auxiliary panels
+            dxy_df            = dxy_df_,
+            breakeven_df      = breakeven_df_,
+            vvix_df           = vvix_df_,
+            oil_df            = oil_df_,
+            copper_gold_df    = copper_gold_df_,
+            cross_asset_panel = cross_asset_df_,
+            ig_oas_df         = ig_oas_df_,
+            sector_oas_df     = sector_oas_df_,
+            ebp_df            = ebp_df_,
+            treasury_yields_df = treasury_df_,
         )
         n_alt = len(alt_features_dict)
         print(f"      {n_alt} alt feature panels loaded")
@@ -277,8 +468,14 @@ def run(args):
         )
         if args.optimize_ml:
             print(f"[3a/6] Optuna hyperparameter search ({args.optuna_trials} trials)...")
-            from model import optimize_hyperparameters
-            best = optimize_hyperparameters(panel, labels, n_trials=args.optuna_trials)
+            best = optimize_hyperparameters_pruned(
+                panel, labels,
+                n_trials=args.optuna_trials,
+                prune_threshold_sharpe=args.prune_threshold_sharpe,
+                prune_threshold_ic=args.prune_threshold_ic,
+                warm_start=args.optuna_warm_start,
+                warm_start_path=Path(__file__).parent / "data" / "cache" / "optuna_best_params.pkl",
+            )
             if best:
                 # Override tunable params (keep min_train_days/retrain_freq/forward_window)
                 for k in ("num_leaves", "learning_rate", "feature_fraction",
@@ -480,7 +677,9 @@ def run(args):
         spy_series = pd.Series(0.0, index=result.daily_returns.index)
         spy_equity = pd.Series(args.capital, index=result.daily_returns.index)
 
-    tearsheet = compute_full_tearsheet(result, benchmark_returns=spy_series)
+    dsr_n_trials = args.optuna_trials if args.optimize_ml else 1
+    tearsheet = compute_full_tearsheet(result, benchmark_returns=spy_series,
+                                       n_trials=dsr_n_trials)
     print("\n  Performance Tearsheet:")
     print(tearsheet.to_string())
     tearsheet.to_csv(results_dir / "tearsheet.csv")

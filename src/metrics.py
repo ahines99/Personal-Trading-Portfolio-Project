@@ -195,10 +195,114 @@ def beta_to_market(
     return cov[0, 1] / mkt_var
 
 
+def probabilistic_sharpe_ratio(
+    sharpe_ratio: float,
+    n_obs: int,
+    returns: np.ndarray,
+    benchmark_sharpe: float = 0.0,
+) -> float:
+    """
+    Probabilistic Sharpe Ratio: P(true_SR > benchmark_SR) with skew/kurtosis adjustment.
+
+    Reference: Bailey & Lopez de Prado 2012, "The Sharpe Ratio Efficient Frontier".
+
+    Returns probability in [0, 1] that the true (non-annualized) Sharpe exceeds
+    the benchmark, given the observed sample Sharpe and the return distribution's
+    higher moments.
+    """
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < 3 or n_obs < 3:
+        return float("nan")
+
+    # Non-annualized Sharpe (per-period). Caller may pass annualized; convert.
+    # We compute PSR on the per-period Sharpe; expected input is annualized,
+    # so de-annualize by sqrt(TRADING_DAYS).
+    sr = sharpe_ratio / np.sqrt(TRADING_DAYS)
+    sr_bench = benchmark_sharpe / np.sqrt(TRADING_DAYS)
+
+    skew = float(stats.skew(arr, bias=False)) if len(arr) > 2 else 0.0
+    kurt = float(stats.kurtosis(arr, bias=False, fisher=True)) if len(arr) > 3 else 0.0
+
+    # Bailey-Lopez de Prado PSR formula
+    denom = np.sqrt(max(1e-12, 1 - skew * sr + ((kurt) / 4.0) * sr ** 2))
+    z = (sr - sr_bench) * np.sqrt(n_obs - 1) / denom
+    return float(stats.norm.cdf(z))
+
+
+def deflated_sharpe_ratio(
+    sharpe_ratio: float,
+    n_trials: int,
+    returns: np.ndarray,
+    benchmark_sharpe: float = 0.0,
+) -> dict:
+    """
+    Deflated Sharpe Ratio: correct observed Sharpe for multiple-testing bias and
+    non-normality of returns.
+
+    Reference: Bailey & Lopez de Prado 2014, Journal of Portfolio Management.
+
+    Args:
+        sharpe_ratio: observed (annualized) Sharpe
+        n_trials: number of strategies/hyperparameter configs tested
+        returns: return series used to compute Sharpe
+        benchmark_sharpe: threshold to test against (annualized)
+
+    Returns:
+        dict with keys: 'sharpe', 'deflated_sharpe', 'expected_max_sharpe',
+        'probability'
+    """
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n_obs = len(arr)
+
+    if n_obs < 3 or n_trials < 1:
+        return {
+            "sharpe": sharpe_ratio,
+            "deflated_sharpe": float("nan"),
+            "expected_max_sharpe": float("nan"),
+            "probability": float("nan"),
+        }
+
+    # Expected maximum Sharpe under the null (per-period units)
+    # E[max SR] ≈ sqrt(2 ln N) - (euler + ln(ln N)) / sqrt(2 ln N)
+    # multiplied by the std of the sample-SR estimator (assumed ≈ 1 in
+    # standardized units; Bailey-Lopez de Prado use this approximation).
+    euler = 0.5772156649015329
+    N = max(2, int(n_trials))
+    sqrt_2lnN = np.sqrt(2.0 * np.log(N))
+    expected_max_sr_per_period = sqrt_2lnN - (euler + np.log(np.log(N))) / sqrt_2lnN
+
+    # Annualize the expected max for reporting
+    expected_max_sr_annual = expected_max_sr_per_period * np.sqrt(TRADING_DAYS) \
+        if n_obs > 1 else expected_max_sr_per_period
+    # Actually, the expected max under H0 is in units of per-period SR with
+    # unit variance. We report it re-annualized as a reference benchmark.
+    # A more precise formulation uses std(SR_hat); we use the standard
+    # simplification that the test statistic is already standardized.
+
+    # DSR = PSR against benchmark = expected_max_sharpe (annualized)
+    prob = probabilistic_sharpe_ratio(
+        sharpe_ratio=sharpe_ratio,
+        n_obs=n_obs,
+        returns=arr,
+        benchmark_sharpe=expected_max_sr_annual if benchmark_sharpe == 0.0
+                         else max(benchmark_sharpe, expected_max_sr_annual),
+    )
+
+    return {
+        "sharpe": float(sharpe_ratio),
+        "deflated_sharpe": float(prob),  # probability that SR > expected max null
+        "expected_max_sharpe": float(expected_max_sr_annual),
+        "probability": float(prob),
+    }
+
+
 def compute_full_tearsheet(
     result,
     benchmark_returns: Optional[pd.Series] = None,
     risk_free_rate: float = 0.02,
+    n_trials: int = 1,
 ) -> pd.DataFrame:
     """
     Generate a performance tearsheet for a long-only personal portfolio.
@@ -253,6 +357,30 @@ def compute_full_tearsheet(
         # Market exposure
         "Beta to Market":            f"{beta_to_market(r, bench):.3f}",
     }
+
+    # Deflated Sharpe Ratio (Bailey-Lopez de Prado 2014) — corrects for
+    # multiple-testing bias and non-normality. Passed n_trials from caller
+    # (typically args.optuna_trials if hyperparameter search was run).
+    try:
+        sr_val = sharpe_ratio(r, risk_free_rate)
+        dsr_info = deflated_sharpe_ratio(
+            sharpe_ratio=sr_val,
+            n_trials=max(1, int(n_trials)),
+            returns=r.values,
+            benchmark_sharpe=0.0,
+        )
+        psr_val = probabilistic_sharpe_ratio(
+            sharpe_ratio=sr_val,
+            n_obs=len(r),
+            returns=r.values,
+            benchmark_sharpe=0.0,
+        )
+        metrics["Probabilistic Sharpe (PSR)"] = f"{psr_val:.3f}"
+        metrics["Deflated Sharpe (DSR)"] = f"{dsr_info['deflated_sharpe']:.3f}"
+        metrics["Expected Max SR (null)"] = f"{dsr_info['expected_max_sharpe']:.3f}"
+        metrics["DSR n_trials"] = f"{int(n_trials)}"
+    except Exception:
+        pass
 
     tearsheet = pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"])
     tearsheet.index.name = "Metric"

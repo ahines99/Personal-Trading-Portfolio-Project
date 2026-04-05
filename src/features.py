@@ -952,6 +952,438 @@ def sector_neutralize(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Higher-moment and breadth signals (OHLCV-only)
+# ---------------------------------------------------------------------------
+
+def realized_skewness(returns: pd.DataFrame, window: int = 21) -> pd.DataFrame:
+    """
+    Per-stock rolling realized skewness of daily returns.
+
+        skew = (1/N) * Σ r_t^3 / ((1/N) * Σ r_t^2)^1.5
+
+    Amaya, Christoffersen, Jacobs & Vasquez (2015, JFE):
+    "Does realized skewness predict the cross-section of equity returns?"
+    NEGATIVE premium — high realized skew earns lower returns. Negate before
+    using as a buy signal.
+    """
+    min_p = max(5, window // 2)
+    m2 = (returns ** 2).rolling(window, min_periods=min_p).mean()
+    m3 = (returns ** 3).rolling(window, min_periods=min_p).mean()
+    denom = np.power(m2.clip(lower=1e-20), 1.5)
+    skew = m3 / denom
+    # Negate: negative premium → low skew = buy signal
+    return -skew
+
+
+def co_skewness(
+    returns: pd.DataFrame,
+    market_returns: pd.Series,
+    window: int = 252,
+) -> pd.DataFrame:
+    """
+    Harvey-Siddique (2000, JF) conditional co-skewness, using 12-month
+    daily rolling window:
+
+        coskew = E[ε_i · ε_m^2] / ( sqrt(E[ε_i^2]) · E[ε_m^2] )
+
+    where ε_i and ε_m are demeaned stock / market returns.
+
+    Negative premium: high co-skewness earns lower returns. Negated.
+    """
+    min_p = max(63, window // 2)
+    r_mean = returns.rolling(window, min_periods=min_p).mean()
+    m_mean = market_returns.rolling(window, min_periods=min_p).mean()
+
+    eps_i = returns.sub(r_mean)
+    eps_m = market_returns.sub(m_mean)
+
+    eps_m2 = eps_m ** 2
+    # E[ε_i · ε_m^2]
+    num = eps_i.mul(eps_m2, axis=0).rolling(window, min_periods=min_p).mean()
+    # sqrt(E[ε_i^2])
+    var_i = (eps_i ** 2).rolling(window, min_periods=min_p).mean()
+    sd_i = np.sqrt(var_i.clip(lower=1e-20))
+    # E[ε_m^2]
+    var_m = eps_m2.rolling(window, min_periods=min_p).mean().replace(0, np.nan)
+
+    coskew = num.div(sd_i).div(var_m, axis=0)
+    return -coskew
+
+
+def semi_beta_decomposition(
+    returns: pd.DataFrame,
+    market_returns: pd.Series,
+    window: int = 252,
+):
+    """
+    Bollerslev, Patton & Quaedvlieg (2022, RFS) four semi-beta decomposition:
+
+        β^N   = Σ r_i^- · r_m^- / Σ r_m^2   (concordant negative)
+        β^P   = Σ r_i^+ · r_m^+ / Σ r_m^2   (concordant positive)
+        β^M+  = Σ r_i^+ · r_m^- / Σ r_m^2   (mixed: stock up, market down)
+        β^M-  = Σ r_i^- · r_m^+ / Σ r_m^2   (mixed: stock down, market up)
+
+    β^N has the strongest (positive) risk premium in the cross-section.
+
+    Returns
+    -------
+    (beta_N, beta_P, beta_Mplus, beta_Mminus) tuple of DataFrames
+    """
+    min_p = max(63, window // 2)
+
+    r_plus = returns.clip(lower=0)
+    r_minus = returns.clip(upper=0)
+    m_plus = market_returns.clip(lower=0)
+    m_minus = market_returns.clip(upper=0)
+
+    m2 = (market_returns ** 2).rolling(window, min_periods=min_p).sum().replace(0, np.nan)
+
+    sum_NN = r_minus.mul(m_minus, axis=0).rolling(window, min_periods=min_p).sum()
+    sum_PP = r_plus.mul(m_plus, axis=0).rolling(window, min_periods=min_p).sum()
+    sum_PN = r_plus.mul(m_minus, axis=0).rolling(window, min_periods=min_p).sum()
+    sum_NP = r_minus.mul(m_plus, axis=0).rolling(window, min_periods=min_p).sum()
+
+    beta_N = sum_NN.div(m2, axis=0)
+    beta_P = sum_PP.div(m2, axis=0)
+    beta_Mplus = sum_PN.div(m2, axis=0)
+    beta_Mminus = sum_NP.div(m2, axis=0)
+
+    return beta_N, beta_P, beta_Mplus, beta_Mminus
+
+
+def tail_dependence(
+    returns: pd.DataFrame,
+    market_returns: pd.Series,
+    window: int = 252,
+    q: float = 0.1,
+) -> pd.DataFrame:
+    """
+    Nonparametric lower-tail dependence (Chabi-Yo, Ruenzi & Weigert 2018, JFQA):
+
+        λ_L = #( r_i in bottom q-th AND r_m in bottom q-th ) / (q * window)
+
+    Stocks with high lower-tail dependence earn a premium (crash-risk pricing).
+    """
+    min_p = max(63, window // 2)
+
+    # Per-date rolling q-th quantile (left tail)
+    i_qtile = returns.rolling(window, min_periods=min_p).quantile(q)
+    m_qtile = market_returns.rolling(window, min_periods=min_p).quantile(q)
+
+    i_tail = returns.le(i_qtile)
+    m_tail = pd.Series(market_returns.le(m_qtile), index=market_returns.index)
+
+    joint = i_tail.mul(m_tail.astype(float), axis=0)
+    joint_count = joint.rolling(window, min_periods=min_p).sum()
+    denom = q * window
+    return joint_count / denom
+
+
+def signed_jump_intensity(
+    returns: pd.DataFrame,
+    window: int = 21,
+    threshold: float = 4.0,
+) -> pd.DataFrame:
+    """
+    Jiang-Yao (2013) signed jump intensity.
+
+    A daily return is flagged as a jump when |r_t| > threshold × rolling σ.
+    Signal is the signed contribution to squared return:
+
+        Σ r_t^2 · sign(r_t) · 1{|r_t| > threshold · σ_t}
+
+    Captures asymmetric jump risk; negative signed jumps carry a premium.
+    """
+    min_p = max(5, window // 2)
+    sigma = returns.rolling(window, min_periods=min_p).std()
+    abs_r = returns.abs()
+    jump_mask = (abs_r > threshold * sigma).astype(float)
+    signed_r2 = (returns ** 2) * np.sign(returns) * jump_mask
+    return signed_r2.rolling(window, min_periods=min_p).sum()
+
+
+def downside_upside_vol_ratio(
+    returns: pd.DataFrame,
+    window: int = 63,
+) -> pd.DataFrame:
+    """
+    Feunou, Jahan-Parvar & Okou (2016) downside/upside vol ratio:
+
+        sqrt( Σ r_t^2 · 1{r_t<0} ) / sqrt( Σ r_t^2 · 1{r_t>0} )
+
+    High ratio indicates left-skewed realized distribution.
+    """
+    min_p = max(10, window // 2)
+    r2 = returns ** 2
+    down = (r2 * (returns < 0).astype(float)).rolling(window, min_periods=min_p).sum()
+    up = (r2 * (returns > 0).astype(float)).rolling(window, min_periods=min_p).sum()
+    ratio = np.sqrt(down) / np.sqrt(up.replace(0, np.nan))
+    return ratio
+
+
+def downside_beta_spread(
+    returns: pd.DataFrame,
+    market_returns: pd.Series,
+    window: int = 252,
+) -> pd.DataFrame:
+    """
+    Ang, Chen & Xing (2006, RFS) downside-minus-upside beta:
+
+        β^- = Cov(r_i, r_m | r_m < μ_m) / Var(r_m | r_m < μ_m)
+        β^+ = Cov(r_i, r_m | r_m > μ_m) / Var(r_m | r_m > μ_m)
+        signal = β^- − β^+
+
+    High downside beta (relative to upside) earns a premium.
+    """
+    min_p = max(63, window // 2)
+    mu_m = market_returns.rolling(window, min_periods=min_p).mean()
+
+    down_mask = (market_returns < mu_m).astype(float)
+    up_mask = (market_returns > mu_m).astype(float)
+
+    def _cond_beta(mask: pd.Series) -> pd.DataFrame:
+        mask_arr = mask.astype(float)
+        m_masked = market_returns * mask_arr
+        # Conditional means over rolling window
+        n = mask_arr.rolling(window, min_periods=min_p).sum().replace(0, np.nan)
+        m_bar = m_masked.rolling(window, min_periods=min_p).sum() / n
+
+        # Conditional variance of market
+        m_dev2 = ((market_returns - m_bar) ** 2) * mask_arr
+        var_m = m_dev2.rolling(window, min_periods=min_p).sum() / n
+
+        # Conditional covariance per stock
+        r_masked = returns.mul(mask_arr, axis=0)
+        r_bar = r_masked.rolling(window, min_periods=min_p).sum().div(n, axis=0)
+
+        r_dev = returns.sub(r_bar)
+        m_dev = (market_returns - m_bar)
+        cov_im = (r_dev.mul(m_dev, axis=0).mul(mask_arr, axis=0)
+                  .rolling(window, min_periods=min_p).sum()
+                  .div(n, axis=0))
+        return cov_im.div(var_m.replace(0, np.nan), axis=0)
+
+    beta_down = _cond_beta(down_mask)
+    beta_up = _cond_beta(up_mask)
+    return beta_down - beta_up
+
+
+def kumar_lottery_composite(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    window: int = 21,
+) -> pd.DataFrame:
+    """
+    Kumar (2009, JF) lottery-stock composite.
+
+    Combine three cross-sectional tercile flags on each date:
+        (i)  top-tercile idiosyncratic volatility
+        (ii) top-tercile idiosyncratic skewness
+        (iii) bottom-tercile nominal price
+
+    Binary lottery indicator = all three conditions met.
+    We return a continuous cross-sectional z-score composite of the three
+    underlying z-scored measures (negated so LOW lottery-ness = high score,
+    since lottery stocks underperform).
+    """
+    min_p = max(5, window // 2)
+    # idio vol: residuals vs equal-weighted market
+    mkt = returns.mean(axis=1)
+    resid = returns.sub(mkt, axis=0)
+    ivol = resid.rolling(window, min_periods=min_p).std()
+    # idio skew
+    m2 = (resid ** 2).rolling(window, min_periods=min_p).mean()
+    m3 = (resid ** 3).rolling(window, min_periods=min_p).mean()
+    iskew = m3 / np.power(m2.clip(lower=1e-20), 1.5)
+    # nominal price (low price → lottery)
+    price = prices
+
+    def _cs_z(df: pd.DataFrame) -> pd.DataFrame:
+        mu = df.mean(axis=1)
+        sd = df.std(axis=1).replace(0, np.nan)
+        return df.sub(mu, axis=0).div(sd, axis=0)
+
+    z_ivol = _cs_z(ivol)
+    z_iskew = _cs_z(iskew)
+    z_price = _cs_z(price)
+
+    # Lottery-ness: high ivol, high iskew, LOW price → sum(z_ivol + z_iskew - z_price)
+    lottery = z_ivol + z_iskew - z_price
+    # Negate: lottery stocks underperform → low lottery score = buy
+    return -lottery
+
+
+def pct_above_200ma(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Breadth indicator: fraction of stocks whose close exceeds their own 200d
+    rolling mean, on each date. Broadcast to every column so it can serve as
+    a global feature in the stock-level matrix.
+    """
+    ma200 = prices.rolling(200, min_periods=100).mean()
+    above = (prices > ma200).astype(float)
+    pct = above.mean(axis=1, skipna=True)
+    return pd.DataFrame(
+        np.broadcast_to(pct.values[:, None], (len(pct), prices.shape[1])).copy(),
+        index=prices.index,
+        columns=prices.columns,
+    )
+
+
+def new_highs_minus_lows(
+    prices: pd.DataFrame,
+    window: int = 252,
+) -> pd.DataFrame:
+    """
+    Breadth indicator: (# 52-week highs − # 52-week lows) / total stocks.
+    Broadcast to every column.
+    """
+    min_p = max(63, window // 2)
+    roll_max = prices.rolling(window, min_periods=min_p).max()
+    roll_min = prices.rolling(window, min_periods=min_p).min()
+    is_high = (prices >= roll_max).astype(float)
+    is_low = (prices <= roll_min).astype(float)
+    n = prices.notna().sum(axis=1).replace(0, np.nan)
+    breadth = (is_high.sum(axis=1) - is_low.sum(axis=1)) / n
+    return pd.DataFrame(
+        np.broadcast_to(breadth.values[:, None], (len(breadth), prices.shape[1])).copy(),
+        index=prices.index,
+        columns=prices.columns,
+    )
+
+
+def advance_decline_ratio(returns: pd.DataFrame) -> pd.DataFrame:
+    """
+    Breadth indicator: #(r>0) / #(r<0) on each date. Broadcast to all columns.
+    """
+    adv = (returns > 0).sum(axis=1).astype(float)
+    dec = (returns < 0).sum(axis=1).astype(float).replace(0, np.nan)
+    ratio = adv / dec
+    return pd.DataFrame(
+        np.broadcast_to(ratio.values[:, None], (len(ratio), returns.shape[1])).copy(),
+        index=returns.index,
+        columns=returns.columns,
+    )
+
+
+def breadth_z(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    window: int = 252,
+) -> pd.DataFrame:
+    """
+    Composite breadth z-score: time-series z-score of the three breadth
+    measures (pct_above_200ma, new_highs_minus_lows, advance_decline_ratio),
+    averaged, then broadcast to every column.
+    """
+    min_p = max(63, window // 2)
+    # Reduce to time-series
+    b1 = pct_above_200ma(prices).iloc[:, 0]
+    b2 = new_highs_minus_lows(prices, window=window).iloc[:, 0]
+    b3 = advance_decline_ratio(returns).iloc[:, 0]
+
+    def _ts_z(s: pd.Series) -> pd.Series:
+        mu = s.rolling(window, min_periods=min_p).mean()
+        sd = s.rolling(window, min_periods=min_p).std().replace(0, np.nan)
+        return (s - mu) / sd
+
+    composite = (_ts_z(b1) + _ts_z(b2) + _ts_z(b3)) / 3.0
+    return pd.DataFrame(
+        np.broadcast_to(composite.values[:, None], (len(composite), prices.shape[1])).copy(),
+        index=prices.index,
+        columns=prices.columns,
+    )
+
+
+def wavelet_band_energy(
+    returns: pd.DataFrame,
+    window: int = 256,
+) -> dict:
+    """
+    Frequency-band energy decomposition via rolling FFT.
+
+    For each stock, on each date with sufficient history, compute the FFT of
+    the past `window` returns and emit:
+        - intra_week_energy    (periods < 5 days)
+        - weekly_energy        (periods 5-21 days)
+        - monthly_energy       (periods 21-63 days)
+        - quarterly_energy     (periods 63-256 days)
+        - dominant_frequency   (frequency bin with max power)
+        - spectral_entropy     (Shannon entropy of normalized power spectrum)
+
+    Uses numpy.fft only (no extra dependencies).
+
+    Returns
+    -------
+    dict of 6 DataFrames, keyed by band name.
+    """
+    min_p = max(64, window // 2)
+    n_rows, n_cols = returns.shape
+    idx = returns.index
+    cols = returns.columns
+
+    intra = np.full((n_rows, n_cols), np.nan)
+    weekly = np.full((n_rows, n_cols), np.nan)
+    monthly = np.full((n_rows, n_cols), np.nan)
+    quarterly = np.full((n_rows, n_cols), np.nan)
+    dom_freq = np.full((n_rows, n_cols), np.nan)
+    spec_ent = np.full((n_rows, n_cols), np.nan)
+
+    arr = returns.values  # (n_rows, n_cols)
+
+    # Precompute FFT frequencies and band masks
+    freqs = np.fft.rfftfreq(window, d=1.0)  # cycles per day
+    # Convert to periods (days); freq=0 handled separately
+    with np.errstate(divide="ignore"):
+        periods = np.where(freqs > 0, 1.0 / np.where(freqs > 0, freqs, 1.0), np.inf)
+    mask_intra = (periods > 0) & (periods < 5)
+    mask_weekly = (periods >= 5) & (periods < 21)
+    mask_monthly = (periods >= 21) & (periods < 63)
+    mask_quarterly = (periods >= 63) & (periods <= window)
+
+    for t in range(min_p, n_rows):
+        start = t - window + 1
+        if start < 0:
+            continue
+        block = arr[start : t + 1, :]  # (window, n_cols)
+        if block.shape[0] < window:
+            continue
+        # Fill NaN columnwise with column mean (stable FFT)
+        col_mean = np.nanmean(block, axis=0)
+        block = np.where(np.isnan(block), col_mean, block)
+        # Demean
+        block = block - np.nanmean(block, axis=0, keepdims=True)
+        # FFT
+        fft_vals = np.fft.rfft(block, axis=0)
+        power = (np.abs(fft_vals) ** 2)  # (n_bins, n_cols)
+        total = power.sum(axis=0)
+        total_safe = np.where(total > 0, total, np.nan)
+
+        intra[t, :] = power[mask_intra, :].sum(axis=0) / total_safe
+        weekly[t, :] = power[mask_weekly, :].sum(axis=0) / total_safe
+        monthly[t, :] = power[mask_monthly, :].sum(axis=0) / total_safe
+        quarterly[t, :] = power[mask_quarterly, :].sum(axis=0) / total_safe
+
+        # Dominant frequency (skip DC bin 0)
+        if power.shape[0] > 1:
+            dom_bin = np.argmax(power[1:, :], axis=0) + 1
+            dom_freq[t, :] = freqs[dom_bin]
+
+        # Spectral entropy (normalized)
+        p_norm = power / total_safe
+        p_norm = np.where(p_norm > 0, p_norm, 1e-20)
+        spec_ent[t, :] = -np.sum(p_norm * np.log(p_norm), axis=0)
+
+    return {
+        "intra_week_energy": pd.DataFrame(intra, index=idx, columns=cols),
+        "weekly_energy": pd.DataFrame(weekly, index=idx, columns=cols),
+        "monthly_energy": pd.DataFrame(monthly, index=idx, columns=cols),
+        "quarterly_energy": pd.DataFrame(quarterly, index=idx, columns=cols),
+        "dominant_frequency": pd.DataFrame(dom_freq, index=idx, columns=cols),
+        "spectral_entropy": pd.DataFrame(spec_ent, index=idx, columns=cols),
+    }
+
+
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
