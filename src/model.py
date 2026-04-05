@@ -15,6 +15,7 @@ Feature set covers all OHLCV-derived signals:
 
 import hashlib
 import pickle
+import random
 import warnings
 from pathlib import Path
 
@@ -24,6 +25,33 @@ from typing import Dict, List, Optional
 
 _CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _impute_for_ridge(X: np.ndarray) -> np.ndarray:
+    """Per-column median imputation for Ridge/MLP fitting.
+
+    LightGBM and XGBoost handle NaN natively and MUST receive raw NaN
+    (0 != missing for momentum / amihud / etc.). Ridge and MLP cannot
+    handle NaN, so we fill with the per-column median computed from the
+    finite values in that column. Inf values are first replaced with NaN.
+    Columns that are entirely NaN are filled with 0.
+    """
+    if X.size == 0:
+        return X
+    X = np.asarray(X, dtype=float).copy()
+    # Treat inf as missing
+    X[~np.isfinite(X)] = np.nan
+    # Per-column median (nan-ignoring)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        col_median = np.nanmedian(X, axis=0)
+    # Columns entirely NaN → median becomes nan; fill with 0
+    col_median = np.where(np.isfinite(col_median), col_median, 0.0)
+    # Fill NaN entries with the column median
+    idx = np.where(np.isnan(X))
+    if len(idx[0]):
+        X[idx] = np.take(col_median, idx[1])
+    return X
 
 
 def _cs_winsorize(df: pd.DataFrame, pct_low: float = 0.01, pct_high: float = 0.99) -> pd.DataFrame:
@@ -223,6 +251,12 @@ def build_feature_matrix(
     for w in [5, 10, 21, 63, 126]:
         features[f"mom_{w}d"] = momentum(close, w)
 
+    # Classic Jegadeesh-Titman 12-1 momentum: skip most-recent month (21d)
+    # to avoid short-term reversal, measure return over the prior 11 months
+    # (252 - 21 = 231 trading days). Well-documented anomaly (JT 1993,
+    # Carhart 1997, Fama-French 2012). Kept alongside mom_63d/mom_126d.
+    features["mom_12_1"] = close.shift(21).pct_change(252 - 21)
+
     # Momentum quality
     features["price_accel_21d"]  = price_acceleration(close, window=21)
     features["residual_mom_21d"] = residual_momentum(returns, window=21)
@@ -401,6 +435,9 @@ def build_feature_matrix(
         key = f"mom_{mom_w}d"
         if key in features:
             features[f"z_{key}"] = _cs_zscore(features[key])
+    # z-score for classic 12-1 momentum
+    if "mom_12_1" in features:
+        features["z_mom_12_1"] = _cs_zscore(features["mom_12_1"])
 
     # ── Size feature: log market cap (cross-sectionally z-scored) ────────────
     # Market cap = Close * SharesOutstanding (ffilled within each ticker,
@@ -421,18 +458,33 @@ def build_feature_matrix(
         except Exception:
             log_mcap_raw = None
 
-    if log_mcap_raw is None:
-        # Fallback: 21-day rolling dollar volume
-        dollar_vol = (close * volume).rolling(21, min_periods=5).mean()
-        dollar_vol = dollar_vol.where(dollar_vol > 0)
-        log_mcap_raw = np.log(dollar_vol)
+    # ── Separate liquidity proxy (NOT a size proxy) ─────────────────────────
+    # 21-day rolling dollar volume is a liquidity measure. It correlates with
+    # size but is contaminated by turnover, so we expose it as its OWN
+    # feature (log_liquidity_z) rather than labeling it log_mcap_z.
+    _dollar_vol = (close * volume).rolling(21, min_periods=5).mean()
+    _dollar_vol = _dollar_vol.where(_dollar_vol > 0)
+    log_liquidity_z = _cs_zscore(np.log(_dollar_vol))
+    features["log_liquidity_z"] = log_liquidity_z
 
-    log_mcap_z = _cs_zscore(log_mcap_raw)
-    features["log_mcap_z"] = log_mcap_z
-    print(
-        f"      [size] log_mcap_z built from "
-        f"{'shares outstanding' if _used_shares else 'dollar-volume proxy'}"
-    )
+    # Log price: weak size-ish proxy (price-level anomaly). Kept distinct
+    # from market-cap so it does not contaminate `_sn` residuals.
+    log_price_z = _cs_zscore(np.log(close.where(close > 0)))
+    features["log_price_z"] = log_price_z
+
+    if log_mcap_raw is None:
+        # No usable shares coverage → use liquidity z as the size-neutralize
+        # basis. We do NOT publish log_mcap_z in this case (feature is absent)
+        # so the model can learn from log_liquidity_z / log_price_z instead.
+        log_mcap_z = log_liquidity_z
+        print(
+            "      [size] log_mcap unavailable (shares coverage <20%); "
+            "size-neutralization uses log_liquidity_z proxy, no log_mcap_z feature emitted"
+        )
+    else:
+        log_mcap_z = _cs_zscore(log_mcap_raw)
+        features["log_mcap_z"] = log_mcap_z
+        print("      [size] log_mcap_z built from shares outstanding")
 
     # ── Size-neutralized variants of size-contaminated features ─────────────
     # Regress each feature cross-sectionally on log_mcap_z per date and keep
@@ -440,8 +492,8 @@ def build_feature_matrix(
     # shrinking the training universe.
     if _do_size_neutralize:
         _sn_targets = [
-            "mom_21d", "mom_63d", "mom_126d",
-            "z_mom_63d", "z_mom_126d",
+            "mom_21d", "mom_63d", "mom_126d", "mom_12_1",
+            "z_mom_63d", "z_mom_126d", "z_mom_12_1",
             "rvol_21d", "idiovol_21d",
             "z_rvol_21d", "z_idiovol_21d",
             "mkt_beta_63d", "z_mkt_beta_63d",
@@ -466,8 +518,8 @@ def build_feature_matrix(
     # within-industry stock-picking (JKP 2023, AQR best practice).
     if sector_neutralize_features and sector_map:
         _sni_targets = [
-            "mom_63d", "mom_126d",
-            "z_mom_63d", "z_mom_126d",
+            "mom_63d", "mom_126d", "mom_12_1",
+            "z_mom_63d", "z_mom_126d", "z_mom_12_1",
             "idiovol_21d", "z_idiovol_21d",
             "mkt_beta_63d", "z_mkt_beta_63d",
             "rvol_21d", "z_rvol_21d",
@@ -1039,6 +1091,8 @@ class WalkForwardModel:
         use_per_date_weights: bool = True,
         # ── LGBM seed bagging (item 15) ───────────────────────────────────
         lgbm_num_seeds: int = 1,
+        # ── Global random seed for all stochastic components ──────────────
+        random_state: int = 42,
     ):
         self.min_train_days    = min_train_days
         self.retrain_freq      = retrain_freq
@@ -1081,6 +1135,7 @@ class WalkForwardModel:
         self.use_uniqueness_weights = use_uniqueness_weights
         self.use_per_date_weights = use_per_date_weights
         self.lgbm_num_seeds    = max(1, int(lgbm_num_seeds))
+        self.random_state      = int(random_state)
 
         # If MLP disabled, zero its weight and renormalize the other model
         # weights so the ensemble still sums to 1.0. User-configured
@@ -1180,6 +1235,11 @@ class WalkForwardModel:
             "num_threads":       -1,
             "verbose":           -1,
             "device":            "gpu" if TORCH_AVAILABLE else "cpu",
+            # Deterministic seeding across all stochastic LGBM components
+            "seed":                     self.random_state,
+            "bagging_seed":             self.random_state,
+            "feature_fraction_seed":    self.random_state,
+            "data_random_seed":         self.random_state,
         }
         # Item 11: monotonicity constraints on signed factors
         mc_list = self._build_monotone_list(feature_names)
@@ -1198,6 +1258,7 @@ class WalkForwardModel:
             p["seed"] = seed
             p["bagging_seed"] = seed
             p["feature_fraction_seed"] = seed
+            p["data_random_seed"] = seed
             return lgb.train(
                 p, dtrain,
                 num_boost_round=self.n_estimators,
@@ -1208,9 +1269,12 @@ class WalkForwardModel:
 
         # Item 15: seed-bagged LGBM ensemble
         if self.lgbm_num_seeds > 1:
-            booster_list = [_train_one(42 + k) for k in range(self.lgbm_num_seeds)]
+            booster_list = [
+                _train_one(self.random_state + k)
+                for k in range(self.lgbm_num_seeds)
+            ]
             return booster_list
-        return _train_one(42)
+        return _train_one(self.random_state)
 
     def _fit_lgbm_huber(self, X: np.ndarray, y: np.ndarray,
                         feature_names: List[str],
@@ -1229,6 +1293,10 @@ class WalkForwardModel:
                 "objective": "huber",
                 "alpha": float(self.huber_alpha),
                 "metric": "huber",
+                "seed": self.random_state,
+                "bagging_seed": self.random_state,
+                "feature_fraction_seed": self.random_state,
+                "data_random_seed": self.random_state,
                 "num_leaves": self.num_leaves,
                 "learning_rate": self.learning_rate,
                 "feature_fraction": self.feature_fraction,
@@ -1273,6 +1341,10 @@ class WalkForwardModel:
                 "objective": "quantile",
                 "alpha": float(alpha),
                 "metric": "quantile",
+                "seed": self.random_state,
+                "bagging_seed": self.random_state,
+                "feature_fraction_seed": self.random_state,
+                "data_random_seed": self.random_state,
                 "num_leaves": self.num_leaves,
                 "learning_rate": self.learning_rate,
                 "feature_fraction": self.feature_fraction,
@@ -1339,6 +1411,7 @@ class WalkForwardModel:
                 "lambdarank_num_pair_per_sample": int(self.lambdarank_truncation),
                 "lambdarank_pair_method": "topk",
                 "verbosity": 0,
+                "seed": self.random_state,
             }
 
             model = xgb.train(
@@ -1367,6 +1440,11 @@ class WalkForwardModel:
 
         try:
             from sklearn.preprocessing import StandardScaler
+
+            # Deterministic torch RNG for reproducible MLP training
+            torch.manual_seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.random_state)
 
             # Scale features — fit ONLY on train split to avoid leaking
             # val statistics into training (scaler sees mean/std of val data).
@@ -1518,7 +1596,7 @@ class WalkForwardModel:
 
         # Subsample for speed: IC converges well at 200K rows
         if len(X) > max_samples:
-            idx = np.random.default_rng(42).choice(len(X), max_samples, replace=False)
+            idx = np.random.default_rng(self.random_state).choice(len(X), max_samples, replace=False)
             X_sample = X.iloc[idx]
             y_sample = y.iloc[idx]
         else:
@@ -1610,7 +1688,10 @@ class WalkForwardModel:
 
     def _train_ensemble(self, X_train: pd.DataFrame, y_train: pd.Series,
                         max_train_samples: int = 500_000) -> Optional[dict]:
-        mask = y_train.notna() & X_train.notna().all(axis=1)
+        # Only require a valid label — LGBM/XGB natively handle NaN features,
+        # Ridge/MLP are median-imputed below. Dropping rows with any NaN
+        # feature would discard most warmup-period samples.
+        mask = y_train.notna()
         X_ = X_train[mask]
         y_ = y_train[mask].astype(int)
 
@@ -1702,6 +1783,10 @@ class WalkForwardModel:
             y_lgbm = y_.values.astype(int)
 
         X_vals, y_vals = X_.values, y_.values
+        # Ridge / MLP / StandardScaler cannot handle NaN. Impute per-column
+        # median once, reuse for all non-tree heads. LGBM/XGB receive raw
+        # X_vals with NaN preserved (tree-native handling).
+        X_imputed = _impute_for_ridge(X_vals)
 
         groups = dates.value_counts().sort_index().values
 
@@ -1716,7 +1801,7 @@ class WalkForwardModel:
             if xgb_model is not None:
                 ensemble["xgboost"] = xgb_model
 
-        ensemble["ridge"] = self._fit_ridge(X_vals, y_vals,
+        ensemble["ridge"] = self._fit_ridge(X_imputed, y_vals,
                                             sample_weight=sample_weight)
 
         # ── Huber head (item 4) ─────────────────────────────────────────────
@@ -1736,7 +1821,7 @@ class WalkForwardModel:
                 ensemble["quantile"] = qmod
 
         if self.use_mlp and TORCH_AVAILABLE:
-            mlp = self._fit_mlp(X_vals, y_vals)
+            mlp = self._fit_mlp(X_imputed, y_vals)
             if mlp is not None:
                 ensemble["mlp"] = mlp
             # Free GPU memory after MLP training
@@ -1822,6 +1907,10 @@ class WalkForwardModel:
             params = {
                 "objective": "binary",
                 "metric": "binary_logloss",
+                "seed": self.random_state,
+                "bagging_seed": self.random_state,
+                "feature_fraction_seed": self.random_state,
+                "data_random_seed": self.random_state,
                 "num_leaves": self.num_leaves,
                 "learning_rate": self.learning_rate,
                 "feature_fraction": self.feature_fraction,
@@ -1854,11 +1943,12 @@ class WalkForwardModel:
         try:
             from sklearn.metrics import roc_auc_score
             common_cols = [c for c in train_X.columns if c in test_X.columns]
-            Xtr = train_X[common_cols].replace([np.inf, -np.inf], np.nan).fillna(0).values
-            Xte = test_X[common_cols].replace([np.inf, -np.inf], np.nan).fillna(0).values
+            # LGBM handles NaN natively — pass inf→NaN only, no fillna
+            Xtr = train_X[common_cols].replace([np.inf, -np.inf], np.nan).values
+            Xte = test_X[common_cols].replace([np.inf, -np.inf], np.nan).values
             X = np.vstack([Xtr, Xte])
             y = np.concatenate([np.zeros(len(Xtr)), np.ones(len(Xte))])
-            perm = np.random.default_rng(42).permutation(len(X))
+            perm = np.random.default_rng(self.random_state).permutation(len(X))
             X = X[perm]; y = y[perm]
             split = int(0.8 * len(X))
             dtrain = lgb.Dataset(X[:split], label=y[:split], feature_name=common_cols)
@@ -1869,6 +1959,10 @@ class WalkForwardModel:
                 "num_leaves": 31, "learning_rate": 0.05,
                 "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 1,
                 "verbose": -1, "num_threads": -1,
+                "seed": self.random_state,
+                "bagging_seed": self.random_state,
+                "feature_fraction_seed": self.random_state,
+                "data_random_seed": self.random_state,
             }
             booster = lgb.train(
                 params, dtrain, num_boost_round=200,
@@ -1887,10 +1981,20 @@ class WalkForwardModel:
         Uses feature subset from training for prediction alignment.
         Confidence is average pairwise agreement across all models.
         """
-        # Use only the features this ensemble was trained on
+        # Use only the features this ensemble was trained on.
+        # fill_value=0 applies ONLY to columns that are entirely missing
+        # from X_pred (shouldn't happen if feature matrix is stable).
+        # Actual NaN values in present columns are preserved → LGBM/XGB
+        # handle them natively; Ridge/MLP get a median-imputed copy below.
         feature_subset = ensemble.get("feature_subset", list(X_pred.columns))
         X_aligned = X_pred.reindex(columns=feature_subset, fill_value=0)
         X_vals = X_aligned.values
+        _X_imputed_cache = {"arr": None}
+
+        def _get_imputed() -> np.ndarray:
+            if _X_imputed_cache["arr"] is None:
+                _X_imputed_cache["arr"] = _impute_for_ridge(X_vals)
+            return _X_imputed_cache["arr"]
 
         def ranked(raw: np.ndarray) -> np.ndarray:
             return pd.Series(raw).rank(pct=True).values
@@ -1937,7 +2041,7 @@ class WalkForwardModel:
             try:
                 mlp_model = ensemble["mlp"]["model"]
                 mlp_scaler = ensemble["mlp"]["scaler"]
-                X_scaled = mlp_scaler.transform(X_vals)
+                X_scaled = mlp_scaler.transform(_get_imputed())
                 with torch.no_grad():
                     mlp_model.cuda()  # move to GPU for inference
                     X_tensor = torch.FloatTensor(X_scaled).cuda()
@@ -1954,7 +2058,7 @@ class WalkForwardModel:
         ridge_w = self.ridge_weight
         if total_w < 0.01:
             ridge_w = 1.0  # only Ridge available
-        ridge_ranks = ranked(ensemble["ridge"].predict(X_vals))
+        ridge_ranks = ranked(ensemble["ridge"].predict(_get_imputed()))
         scores  += ridge_ranks * ridge_w
         total_w += ridge_w
         model_ranks.append(ridge_ranks)
@@ -1994,6 +2098,17 @@ class WalkForwardModel:
         Cache key includes: panel shape, date range, number of features,
         model hyperparams. If any change, cache is invalidated.
         """
+        # ── Seed all stochastic subsystems for reproducibility ───────────
+        np.random.seed(self.random_state)
+        random.seed(self.random_state)
+        if TORCH_AVAILABLE:
+            try:
+                torch.manual_seed(self.random_state)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.random_state)
+            except Exception:
+                pass
+
         # ── Check cache ──────────────────────────────────────────────────
         _cache_key = hashlib.md5(
             f"{panel.shape}_{panel.index.get_level_values('date').min()}_"
@@ -2011,7 +2126,7 @@ class WalkForwardModel:
             f"{self.use_meta_labeling}_{self.early_stop_on_ic}_"
             f"{self.min_data_in_leaf}_{sorted((self.monotone_constraints or {}).items())}_"
             f"{self.use_uniqueness_weights}_{self.use_per_date_weights}_"
-            f"{self.lgbm_num_seeds}".encode()
+            f"{self.lgbm_num_seeds}_{self.random_state}".encode()
         ).hexdigest()[:12]
         _cache_file = _CACHE_DIR / f"ml_predictions_{_cache_key}.pkl"
 
@@ -2051,7 +2166,10 @@ class WalkForwardModel:
             gap_dates   = set(all_dates[safe_label_end:i])
 
             train_idx   = panel.index.get_level_values("date").isin(train_dates)
-            X_train     = panel[train_idx].replace([np.inf, -np.inf], np.nan).fillna(0)
+            # NaN passthrough: LGBM/XGB handle NaN natively; Ridge/MLP are
+            # median-imputed inside _train_ensemble. Filling with 0 would
+            # bias tree splits for momentum/amihud/etc (0 != missing).
+            X_train     = panel[train_idx].replace([np.inf, -np.inf], np.nan)
             y_train     = labels.reindex(X_train.index).copy()
 
             # NaN out labels in the gap zone (forward returns not yet realized)
@@ -2080,7 +2198,7 @@ class WalkForwardModel:
                 try:
                     if len(pred_dates) > 0:
                         pred_idx = panel.index.get_level_values("date").isin(pred_dates)
-                        X_pred_chunk = panel[pred_idx].replace([np.inf, -np.inf], np.nan).fillna(0)
+                        X_pred_chunk = panel[pred_idx].replace([np.inf, -np.inf], np.nan)
                         if len(X_pred_chunk) > 100:
                             adv_auc = self.adversarial_validation(X_train, X_pred_chunk)
                             if np.isfinite(adv_auc) and adv_auc > 0.75:
@@ -2100,7 +2218,7 @@ class WalkForwardModel:
             for pred_date in pred_dates:
                 if pred_date not in panel.index.get_level_values("date"):
                     continue
-                X_pred = panel.xs(pred_date, level="date").reindex(tickers).replace([np.inf, -np.inf], np.nan).fillna(0)
+                X_pred = panel.xs(pred_date, level="date").reindex(tickers).replace([np.inf, -np.inf], np.nan)
                 scores, conf = self._predict_ensemble(X_pred, current_ensemble)
                 # Penalize low-confidence predictions: multiply score by confidence.
                 # When LGBM and Ridge disagree (conf ~0.3), the score gets dampened.

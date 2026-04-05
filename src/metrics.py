@@ -209,6 +209,11 @@ def probabilistic_sharpe_ratio(
     Returns probability in [0, 1] that the true (non-annualized) Sharpe exceeds
     the benchmark, given the observed sample Sharpe and the return distribution's
     higher moments.
+
+    Kurtosis convention: `scipy.stats.kurtosis(..., fisher=True)` returns EXCESS
+    (Fisher) kurtosis. The Bailey-Lopez de Prado PSR formula is written in
+    terms of RAW kurtosis K_raw. Since K_raw = K_fisher + 3, the denominator
+    term ((K_raw - 1)/4) * SR^2 becomes ((K_fisher + 2)/4) * SR^2.
     """
     arr = np.asarray(returns, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -222,10 +227,12 @@ def probabilistic_sharpe_ratio(
     sr_bench = benchmark_sharpe / np.sqrt(TRADING_DAYS)
 
     skew = float(stats.skew(arr, bias=False)) if len(arr) > 2 else 0.0
+    # Fisher (excess) kurtosis — see docstring for conversion to raw.
     kurt = float(stats.kurtosis(arr, bias=False, fisher=True)) if len(arr) > 3 else 0.0
 
-    # Bailey-Lopez de Prado PSR formula
-    denom = np.sqrt(max(1e-12, 1 - skew * sr + ((kurt) / 4.0) * sr ** 2))
+    # Bailey-Lopez de Prado PSR formula. Raw kurtosis K_raw = kurt + 3, so
+    # (K_raw - 1)/4 = (kurt + 2)/4.
+    denom = np.sqrt(max(1e-12, 1 - skew * sr + ((kurt + 2.0) / 4.0) * sr ** 2))
     z = (sr - sr_bench) * np.sqrt(n_obs - 1) / denom
     return float(stats.norm.cdf(z))
 
@@ -250,7 +257,28 @@ def deflated_sharpe_ratio(
 
     Returns:
         dict with keys: 'sharpe', 'deflated_sharpe', 'expected_max_sharpe',
-        'probability'
+        'probability'. 'expected_max_sharpe' is reported in the same
+        (annualized) units as 'sharpe'.
+
+    Units note (Bailey-Lopez de Prado 2014):
+        The order-statistic formula
+            E[max Z] ≈ sqrt(2 ln N) - (euler + ln(ln N))/sqrt(2 ln N)
+        returns a value in STANDARDIZED units — i.e. multiples of the
+        sampling std of the per-period Sharpe estimator, std(SR_hat) ≈
+        1/sqrt(n_obs - 1). The PSR test statistic
+            z = (SR - SR*) * sqrt(n_obs - 1) / denom
+        is itself standardized by the same sqrt(n_obs - 1) factor, so the
+        hurdle E[max Z] must be passed to PSR in the SAME per-period units
+        the PSR function uses INTERNALLY. Since our `probabilistic_sharpe_ratio`
+        wrapper expects ANNUALIZED inputs (it de-annualizes by sqrt(252)),
+        the correct conversion from the standardized expected-max to the
+        annualized input expected by PSR is:
+
+            SR*_per_period = E[max Z] / sqrt(n_obs - 1)
+            SR*_annual     = SR*_per_period * sqrt(TRADING_DAYS)
+
+        The OLD code multiplied E[max Z] directly by sqrt(TRADING_DAYS),
+        producing hurdles of ~30+ for small n_obs, which is nonsensical.
     """
     arr = np.asarray(returns, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -264,30 +292,31 @@ def deflated_sharpe_ratio(
             "probability": float("nan"),
         }
 
-    # Expected maximum Sharpe under the null (per-period units)
-    # E[max SR] ≈ sqrt(2 ln N) - (euler + ln(ln N)) / sqrt(2 ln N)
-    # multiplied by the std of the sample-SR estimator (assumed ≈ 1 in
-    # standardized units; Bailey-Lopez de Prado use this approximation).
+    # Expected maximum standardized Sharpe under the null across N trials.
+    # E[max Z] ≈ sqrt(2 ln N) - (euler + ln(ln N)) / sqrt(2 ln N)
+    # Units: multiples of std(SR_hat) — i.e. STANDARDIZED, dimensionless.
     euler = 0.5772156649015329
     N = max(2, int(n_trials))
     sqrt_2lnN = np.sqrt(2.0 * np.log(N))
-    expected_max_sr_per_period = sqrt_2lnN - (euler + np.log(np.log(N))) / sqrt_2lnN
+    expected_max_z = sqrt_2lnN - (euler + np.log(np.log(N))) / sqrt_2lnN
 
-    # Annualize the expected max for reporting
-    expected_max_sr_annual = expected_max_sr_per_period * np.sqrt(TRADING_DAYS) \
-        if n_obs > 1 else expected_max_sr_per_period
-    # Actually, the expected max under H0 is in units of per-period SR with
-    # unit variance. We report it re-annualized as a reference benchmark.
-    # A more precise formulation uses std(SR_hat); we use the standard
-    # simplification that the test statistic is already standardized.
+    # Convert standardized expected-max to per-period SR units by dividing
+    # by sqrt(n_obs - 1) (the sampling std of SR_hat under the null), then
+    # annualize for the PSR wrapper and user-facing reporting.
+    expected_max_sr_per_period = expected_max_z / np.sqrt(max(1, n_obs - 1))
+    expected_max_sr_annual = expected_max_sr_per_period * np.sqrt(TRADING_DAYS)
 
-    # DSR = PSR against benchmark = expected_max_sharpe (annualized)
+    # DSR = PSR tested against the (annualized) expected-max hurdle.
+    hurdle_annual = (
+        expected_max_sr_annual
+        if benchmark_sharpe == 0.0
+        else max(benchmark_sharpe, expected_max_sr_annual)
+    )
     prob = probabilistic_sharpe_ratio(
         sharpe_ratio=sharpe_ratio,
         n_obs=n_obs,
         returns=arr,
-        benchmark_sharpe=expected_max_sr_annual if benchmark_sharpe == 0.0
-                         else max(benchmark_sharpe, expected_max_sr_annual),
+        benchmark_sharpe=hurdle_annual,
     )
 
     return {

@@ -662,15 +662,20 @@ def build_ic_weighted_composite(
 
     IC(signal_i, T) = Spearman rank correlation of signal_i[T] with return[T+1]
     rolling_IC_i    = rolling mean of IC over the past ic_window days
-    weight_i        = |rolling_IC_i| / Σ|rolling_IC_j|
+    weight_i        = max(rolling_IC_i, 0) / Σ max(rolling_IC_j, 0)
 
     Rolling IC is shifted by 1 day before use to eliminate any lookahead.
-    Falls back to equal-weighting when insufficient IC history exists.
+    Signals with persistently NEGATIVE IC receive ZERO weight (effectively
+    dropped) rather than being upweighted with a wrong sign (which happens
+    with |IC| weighting). If all signals have non-positive IC on a given
+    date, we fall back to the prior day's weights, and ultimately to equal
+    weights.
 
     WHY: Fixed composite weights assume each signal contributes equally at
     all times. In reality, some factors work better in certain regimes.
-    IC-weighting dynamically upweights what is currently predictive and
-    down-weights what is not — without ever looking at future data.
+    Positive-IC weighting dynamically upweights what is currently predictive
+    and drops what is not — without ever looking at future data, and
+    without the sign-flip bug that |IC| weighting suffers from.
     """
     fwd_ret = returns.shift(-1)     # 1-day forward return (IC target)
 
@@ -685,11 +690,16 @@ def build_ic_weighted_composite(
             .shift(1)           # no lookahead: use yesterday's IC to weight today
         )
 
-    # |IC| weights, normalised each day; equal-weight fallback
-    ic_df      = pd.DataFrame(rolling_ics).abs()
+    # Positive-IC weights: clip negatives to zero so wrong-sign signals get
+    # dropped rather than upweighted. Normalise each day; fall back to the
+    # prior window's weights, and ultimately to equal weights.
+    ic_df      = pd.DataFrame(rolling_ics).clip(lower=0.0)
     row_sum    = ic_df.sum(axis=1).replace(0, np.nan)
     n_signals  = len(ranked_signals)
-    ic_norm    = ic_df.div(row_sum, axis=0).fillna(1.0 / n_signals)
+    ic_norm    = ic_df.div(row_sum, axis=0)
+    # Forward-fill prior-window weights when all ICs are <= 0 on a date,
+    # then fall back to equal weights if no prior exists.
+    ic_norm    = ic_norm.ffill().fillna(1.0 / n_signals)
 
     first = next(iter(ranked_signals.values()))
     composite = pd.DataFrame(0.0, index=first.index, columns=first.columns)

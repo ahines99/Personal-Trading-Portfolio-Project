@@ -88,6 +88,10 @@ def parse_args():
     p.add_argument("--sector-rank-weight", default=0.0, type=float,
                    help="Weight on within-sector rank in label construction "
                         "(0.0 = pure universe rank, default; 0.5 = legacy 50/50 blend)")
+    p.add_argument("--beta-neutral-labels", action="store_true",
+                   help="Residualize forward-return labels vs SPY beta (Tier 1 fix for "
+                        "beta drag at the LABEL layer; OFF by default). When ON, passes "
+                        "market_returns to build_labels and WalkForwardModel.")
     p.add_argument("--stop-loss",       default=0.15, type=float,
                    help="Stop-loss threshold (default 15%%)")
     p.add_argument("--cash-in-bear",    default=0.15, type=float,
@@ -453,10 +457,14 @@ def run(args):
             use_higher_moment=True,
             use_breadth_wavelet=True,
         )
+        # Equal-weighted market-return proxy for beta-neutral labels
+        mkt_return = returns.mean(axis=1) if args.beta_neutral_labels else None
         labels = build_labels(returns, forward_window=args.forward_window,
                               risk_adjust=args.risk_adjust_labels,
                               sector_map=sector_map,
-                              sector_rank_weight=args.sector_rank_weight)
+                              sector_rank_weight=args.sector_rank_weight,
+                              beta_neutral=args.beta_neutral_labels,
+                              market_returns=mkt_return)
         print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
 
         # Optional: Bayesian hyperparameter search via Optuna
@@ -466,6 +474,7 @@ def run(args):
             forward_window=args.forward_window,
             risk_adjust=args.risk_adjust_labels,
             sector_rank_weight=args.sector_rank_weight,
+            beta_neutral=args.beta_neutral_labels,
             num_leaves=31,
             learning_rate=0.05,
             lgbm_weight=0.60,

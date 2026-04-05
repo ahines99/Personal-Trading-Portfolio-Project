@@ -1291,10 +1291,18 @@ def build_sector_oas_momentum_signal(
     date_index: pd.DatetimeIndex,
 ) -> Dict[str, pd.DataFrame]:
     """Map tickers to sectors, then to rating-bucket OAS changes.
-    The standard GICS sectors don't directly map to rating buckets, so we
-    heuristically assign: Financials/Utilities→BBB, Cons Disc/Industrials/
-    Materials/Energy→BB, Cons Staples/Health Care→B, Tech/Comms/Real
-    Estate→CCC as a credit-risk proxy. If no map, broadcast mean OAS change."""
+    Rationale: map sectors to a representative credit-rating bucket based on
+    sector-average issuer quality. High-quality / defensive sectors
+    (Financials, Utilities, Consumer Defensive/Staples, Healthcare,
+    Technology, Communication Services) sit in IG territory → BBB bucket.
+    Cyclical / commodity-sensitive sectors (Industrials, Consumer
+    Cyclical/Discretionary, Basic Materials/Materials, Energy, Real Estate)
+    have more crossover exposure → BB bucket. We deliberately do NOT use
+    the CCC (distress) bucket — no broad GICS sector averages CCC. Callers
+    who disagree with this assignment should override via a parameter or
+    pre-remap their sector_map before calling. If no map, broadcast mean
+    OAS change. Bucket series names (BBB/BB/B/CCC) are preserved in the
+    input sector_oas_df; we simply don't reference B/CCC here."""
     signals: Dict[str, pd.DataFrame] = {}
     if sector_oas_df is None or sector_oas_df.empty:
         return signals
@@ -1302,13 +1310,24 @@ def build_sector_oas_momentum_signal(
     # Negative of 21d OAS change: tightening (falling OAS) → positive signal
     d_oas = -panel.diff(21)
 
+    # Corrected mapping (2026-04-05): previous version inverted quality,
+    # mapping Tech/Comms/Real Estate to CCC (distress) and Staples/Health
+    # Care to B, which contaminated the signal. High-quality sectors → BBB,
+    # cyclicals → BB. Both GICS and Yahoo/EODHD sector names are included.
     _GICS_TO_BUCKET = {
-        "Financials": "BBB", "Utilities": "BBB",
-        "Consumer Discretionary": "BB", "Industrials": "BB",
-        "Materials": "BB", "Energy": "BB",
-        "Consumer Staples": "B", "Health Care": "B", "Healthcare": "B",
-        "Information Technology": "CCC", "Technology": "CCC",
-        "Communication Services": "CCC", "Real Estate": "CCC",
+        # IG (BBB) — high-quality / defensive
+        "Financials": "BBB", "Financial Services": "BBB",
+        "Utilities": "BBB",
+        "Consumer Staples": "BBB", "Consumer Defensive": "BBB",
+        "Health Care": "BBB", "Healthcare": "BBB",
+        "Information Technology": "BBB", "Technology": "BBB",
+        "Communication Services": "BBB",
+        # Crossover (BB) — cyclical / commodity-sensitive
+        "Industrials": "BB",
+        "Consumer Discretionary": "BB", "Consumer Cyclical": "BB",
+        "Materials": "BB", "Basic Materials": "BB",
+        "Energy": "BB",
+        "Real Estate": "BB",
     }
 
     if not sector_map:

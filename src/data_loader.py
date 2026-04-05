@@ -596,11 +596,39 @@ def load_prices(
     zero_tickers = sub_penny_frac[sub_penny_frac > 0.05].index.tolist()
     bad = list(set(bad + zero_tickers))
 
+    # 3. Drop tickers with sentinel / corrupted ultra-high prices.
+    #    EODHD occasionally emits $999,999.99 sentinels on micro-caps with
+    #    corrupted split adjustment. These pass sub-penny/coverage/days-active
+    #    filters but contaminate returns and features. Also guard against
+    #    split-adjustment errors that create >500% single-day jumps (pre-clip).
+    #    Allowlist: BRK-A legitimately trades above $10K (~$700K).
+    _MAX_PRICE_ALLOWLIST = {"BRK-A", "BRK.A", "BRK-A.US", "BRK.A.US"}
+    _MAX_PRICE_LIMIT = 10_000.0
+    _MAX_ABS_RETURN = 5.0  # 500% single-day move = split error
+    sentinel_tickers: list[str] = []
+    _raw_ret = close_df.pct_change()
+    for ticker in close_df.columns:
+        if ticker in _MAX_PRICE_ALLOWLIST:
+            continue
+        col = close_df[ticker]
+        cmax = col.max(skipna=True)
+        if pd.notna(cmax) and cmax > _MAX_PRICE_LIMIT:
+            sentinel_tickers.append(ticker)
+            continue
+        rmax = _raw_ret[ticker].abs().max(skipna=True)
+        if pd.notna(rmax) and rmax > _MAX_ABS_RETURN:
+            sentinel_tickers.append(ticker)
+    sentinel_tickers = list(set(sentinel_tickers))
+    bad = list(set(bad + sentinel_tickers))
+
     if bad:
-        n_missing = len([t for t in bad if t not in zero_tickers])
+        n_missing = len([t for t in bad if t not in zero_tickers and t not in sentinel_tickers])
         print(f"[data_loader] Dropping {len(bad)} tickers "
               f"({len(zero_tickers)} with >5% sub-penny prices, "
               f"{n_missing} with >30% missing within active period or <60 days)")
+        if sentinel_tickers:
+            print(f"[data_loader] Dropped {len(sentinel_tickers)} tickers with sentinel/corrupted prices "
+                  f"(close >${_MAX_PRICE_LIMIT:,.0f} or |ret|>{_MAX_ABS_RETURN:.0%})")
         valid_tickers = [t for t in valid_tickers if t not in bad]
         close_df = close_df[valid_tickers]
         open_df = open_df[valid_tickers]
