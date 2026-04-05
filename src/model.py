@@ -122,6 +122,8 @@ def build_feature_matrix(
     sector_neutralize_features: bool = True,
     winsorize: bool = True,
     cs_zscore_all: bool = True,
+    use_higher_moment: bool = True,
+    use_breadth_wavelet: bool = True,
 ) -> pd.DataFrame:
     """
     Build long-format feature matrix for the ML model.
@@ -149,6 +151,16 @@ def build_feature_matrix(
         shares outstanding. Used to compute market cap = close * shares. If
         None or sparse, falls back to log(21d rolling dollar volume) as a
         size proxy.
+    use_higher_moment : if True, add higher-moment signals (realized skew,
+        co-skew, semi-beta decomposition, tail dependence, signed jumps,
+        downside/upside vol ratio, downside-beta spread, Kumar lottery
+        composite). Market returns proxy is computed on-the-fly as the
+        equal-weighted universe cross-sectional mean.
+    use_breadth_wavelet : if True, add market-breadth features (%>200MA,
+        new-highs-minus-lows, advance-decline ratio, breadth composite z)
+        broadcast across tickers, plus per-ticker wavelet/FFT band energy
+        decomposition (intra-week, weekly, monthly, quarterly, dominant
+        frequency, spectral entropy).
     """
     # Local alias for the module-level helper (parameter of the same name
     # shadows it inside this function).
@@ -162,7 +174,8 @@ def build_feature_matrix(
         f"_sector={bool(sector_map)}"
         f"_sn={bool(size_neutralize)}_shr={shares_outstanding is not None}"
         f"_sni={bool(sector_neutralize_features)}"
-        f"_wz={bool(winsorize)}_csz={bool(cs_zscore_all)}".encode()
+        f"_wz={bool(winsorize)}_csz={bool(cs_zscore_all)}"
+        f"_hm={bool(use_higher_moment)}_bw={bool(use_breadth_wavelet)}".encode()
     ).hexdigest()[:12]
     _cache_file = _CACHE_DIR / f"feature_panel_{_cache_key}.pkl"
 
@@ -270,6 +283,108 @@ def build_feature_matrix(
 
     # Hurst exponent (trending vs mean-reverting)
     features["hurst_63d"] = hurst_exponent(close, window=63)
+
+    # ── Tier 6: Higher-moment / co-moment / tail signals ────────────────────
+    # Realized skew, co-skew, semi-beta decomposition, tail dependence,
+    # signed jumps, downside/upside vol ratio, downside-beta spread,
+    # Kumar lottery composite. Market returns proxy = equal-weighted
+    # cross-sectional mean of the universe (on-the-fly).
+    if use_higher_moment:
+        from features import (
+            realized_skewness,
+            co_skewness,
+            semi_beta_decomposition,
+            tail_dependence,
+            signed_jump_intensity,
+            downside_upside_vol_ratio,
+            downside_beta_spread,
+            kumar_lottery_composite,
+        )
+        market_returns = returns.mean(axis=1)
+
+        try:
+            features["realized_skew_21"] = -realized_skewness(returns, window=21)
+            features["realized_skew_63"] = -realized_skewness(returns, window=63)
+            features["co_skew_252"] = -co_skewness(returns, market_returns, window=252)
+            sb_N, sb_P, sb_Mplus, sb_Mminus = semi_beta_decomposition(
+                returns, market_returns, window=252
+            )
+            features["semi_beta_N"] = sb_N
+            features["semi_beta_P"] = sb_P
+            features["semi_beta_Mplus"] = sb_Mplus
+            features["semi_beta_Mminus"] = sb_Mminus
+            features["tail_dep_lower"] = tail_dependence(
+                returns, market_returns, window=252, q=0.1
+            )
+            features["signed_jump_21"] = -signed_jump_intensity(
+                returns, window=21, threshold=4.0
+            )
+            features["down_up_vol_ratio_63"] = downside_upside_vol_ratio(
+                returns, window=63
+            )
+            features["downside_beta_spread_252"] = downside_beta_spread(
+                returns, market_returns, window=252
+            )
+            features["kumar_lottery_21"] = kumar_lottery_composite(
+                close, returns, window=21
+            )
+            print("      [tier6] added 11 higher-moment signals")
+        except Exception as _e:
+            warnings.warn(f"higher-moment signal computation failed: {_e}")
+
+    # ── Tier 6: Market-breadth + wavelet/FFT band energy ────────────────────
+    if use_breadth_wavelet:
+        from features import (
+            pct_above_200ma,
+            new_highs_minus_lows,
+            advance_decline_ratio,
+            breadth_z,
+            wavelet_band_energy,
+        )
+        # Breadth signals are per-date scalars — broadcast across tickers.
+        try:
+            bp = pct_above_200ma(close)
+            nhnl = new_highs_minus_lows(close, window=252)
+            adr = advance_decline_ratio(returns)
+            bz = breadth_z(close, returns, window=252)
+
+            def _broadcast_breadth(series_like):
+                # signal functions return DataFrames with one column per
+                # ticker already tiled, OR a Series. Normalize to a
+                # (dates x tickers) DataFrame aligned to close.
+                if isinstance(series_like, pd.DataFrame):
+                    if series_like.shape[1] == len(close.columns):
+                        return series_like.reindex(
+                            index=close.index, columns=close.columns
+                        )
+                    # Single column → tile
+                    col = series_like.iloc[:, 0]
+                else:
+                    col = series_like
+                col = col.reindex(close.index)
+                vals = col.to_numpy().reshape(-1, 1)
+                return pd.DataFrame(
+                    np.tile(vals, (1, len(close.columns))),
+                    index=close.index,
+                    columns=close.columns,
+                )
+
+            features["breadth_pct_200ma"] = _broadcast_breadth(bp)
+            features["breadth_nh_nl"] = _broadcast_breadth(nhnl)
+            features["breadth_adv_dec"] = _broadcast_breadth(adr)
+            features["breadth_composite_z"] = _broadcast_breadth(bz)
+            print("      [tier6] added 4 breadth signals")
+        except Exception as _e:
+            warnings.warn(f"breadth signal computation failed: {_e}")
+
+        # Wavelet / FFT band-energy decomposition
+        try:
+            wbe = wavelet_band_energy(returns, window=256)
+            for band_name, band_df in wbe.items():
+                features[f"wavelet_band_{band_name}"] = band_df
+            print(f"      [tier6] added {len(wbe)} wavelet band-energy signals")
+        except Exception as _e:
+            warnings.warn(f"wavelet band energy failed: {_e}")
 
     # ── Cross-sectional z-scores of key raw features ─────────────────────────
     # Ridge regression benefits from features that preserve distance information.

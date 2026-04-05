@@ -70,6 +70,7 @@ def build_fundamental_signals(
     sector_map: Optional[Dict[str, str]] = None,
     sector_neutralize_signals: bool = True,
     close: Optional[pd.DataFrame] = None,
+    use_tier3_academic: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
     Parameters
@@ -177,7 +178,7 @@ def build_fundamental_signals(
     # Asness-Frazzini "Devil in HML's Details" (2013); Loughran-Wellman (2011)
     new_signals: Dict[str, pd.DataFrame] = {}
 
-    if market_cap is not None:
+    if use_tier3_academic and market_cap is not None:
         mc_safe = market_cap.replace(0, np.nan)
 
         # earnings_yield = Net Income / Market Cap
@@ -221,7 +222,7 @@ def build_fundamental_signals(
     # Ball, Gerakos, Linnainmaa, Nikolaev (2016)
     # = (Revenue - COGS - SGA - ΔWC) / Total Assets
     # where COGS = Revenue - GrossProfit, WC = CurrentAssets - CurrentLiabilities
-    if (revenue_p is not None and gprofit_p is not None and assets_p is not None):
+    if use_tier3_academic and (revenue_p is not None and gprofit_p is not None and assets_p is not None):
         cogs_p = revenue_p - gprofit_p
         sga_term = sga_p.fillna(0) if sga_p is not None else 0
         if ca_p is not None and cl_p is not None:
@@ -235,7 +236,7 @@ def build_fundamental_signals(
 
     # ── Tier 3B Feature 3: Piotroski F-Score (9-signal composite) ──────────
     # Piotroski (2000)
-    if assets_p is not None and netinc_p is not None:
+    if use_tier3_academic and assets_p is not None and netinc_p is not None:
         assets_safe = assets_p.replace(0, np.nan)
         roa = netinc_p / assets_safe
 
@@ -461,6 +462,7 @@ def build_earnings_signals(
     close: Optional[pd.DataFrame] = None,
     sector_map: Optional[Dict[str, str]] = None,
     sector_neutralize_signals: bool = True,
+    use_tier3_academic: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
     Parameters
@@ -537,7 +539,7 @@ def build_earnings_signals(
     # Brandt-Kishore-Santa-Clara-Venkatachalam (2008) — orthogonal to PEAD.
     # For each earnings date t, compute (close[t+1] - close[t-1]) / close[t-1]
     # and carry forward for `surprise_carry_days` business days.
-    if close is not None:
+    if use_tier3_academic and close is not None:
         close_aligned = close.reindex(index=date_index, columns=tickers, method="ffill")
         ear_panel = pd.DataFrame(np.nan, index=date_index, columns=tickers)
 
@@ -1367,6 +1369,13 @@ def build_alt_features(
     use_altman_z: bool = True,
     use_macro_cross_section: bool = True,
     use_sni_variants: bool = True,
+    # ── Tier 3 academic fundamentals / earnings gate ─────────────────────
+    use_tier3_academic: bool = True,
+    # ── Passthrough alias controlling sector-neutralization of fundamentals
+    # Forwarded to build_fundamental_signals' sector_neutralize_signals param.
+    # ONLY gates fundamental signal _sni variants (NOT Tier 6 distress/macro
+    # _sni variants, which remain under `use_sni_variants`).
+    sector_neutralize_fundamentals: bool = True,
     dxy_df: Optional[pd.DataFrame] = None,
     breakeven_df: Optional[pd.DataFrame] = None,
     vvix_df: Optional[pd.DataFrame] = None,
@@ -1397,6 +1406,26 @@ def build_alt_features(
         DISABLED until time-series 13F data is integrated (e.g., via SEC EDGAR
         13F-HR filings). Current snapshot-broadcast breaks point-in-time
         correctness.
+    use_tier3_academic : bool, default True
+        Gate for Tier 3 academic value/quality signals built from raw EDGAR
+        fundamentals + market cap, plus the earnings-announcement-return (EAR)
+        signal. When False, the following are skipped (and their _sni variants
+        are never produced):
+            value_composite_signal, earnings_yield_signal, sales_yield_signal,
+            fcf_yield_signal, ebit_ev_signal, cash_based_op_prof_signal,
+            piotroski_f_score_signal, earnings_ann_return_signal
+        Core Tier 1-2 fundamental signals (book_to_market, roe, gross_margin,
+        gross_profitability, accruals, NOA, issuance, op_prof, current_ratio_chg)
+        are NOT affected by this flag.
+    sector_neutralize_fundamentals : bool, default True
+        PASSTHROUGH alias from the top-level build_alt_features API to
+        build_fundamental_signals' `sector_neutralize_signals` parameter.
+        When True (default), sector-neutralize fundamental signals and emit
+        `_sni` variants. When False, skip sector-neutralization of
+        fundamentals entirely — no `_sni` variants for fundamentals.
+        Interaction: this ONLY controls fundamental signal `_sni` variants.
+        The existing `use_sni_variants` flag is separate and gates Tier 6
+        distress / macro `_sni` variants only.
     """
     all_signals: Dict[str, pd.DataFrame] = {}
 
@@ -1407,6 +1436,8 @@ def build_alt_features(
 
     _merge(build_fundamental_signals(
         edgar_df, tickers, date_index, sector_map=sector_map, close=close,
+        sector_neutralize_signals=sector_neutralize_fundamentals,
+        use_tier3_academic=use_tier3_academic,
     ))
     _merge(build_macro_features(fred_df, tickers, date_index))
     _merge(build_vix_features(vix_df, tickers, date_index))
@@ -1421,6 +1452,7 @@ def build_alt_features(
         _merge(build_earnings_signals(
             earnings_dict, tickers, date_index,
             close=close, sector_map=sector_map,
+            use_tier3_academic=use_tier3_academic,
         ))
 
     if kwargs.get("insider_dict"):

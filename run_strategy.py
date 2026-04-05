@@ -373,6 +373,9 @@ def run(args):
             # across the full backtest, which is a lookahead bias.
             use_short_interest         = False,
             use_institutional_holdings = False,
+            # Tier 3 academic value/quality + EAR gate (fundamentals)
+            use_tier3_academic             = True,
+            sector_neutralize_fundamentals = True,
             # Tier 6 macro / distress auxiliary panels
             dxy_df            = dxy_df_,
             breakeven_df      = breakeven_df_,
@@ -447,6 +450,8 @@ def run(args):
             close, returns, volume, ranked_signals,
             alt_features=alt_features_dict,
             sector_map=sector_map,
+            use_higher_moment=True,
+            use_breadth_wavelet=True,
         )
         labels = build_labels(returns, forward_window=args.forward_window,
                               risk_adjust=args.risk_adjust_labels,
