@@ -38,7 +38,7 @@ from portfolio       import (build_monthly_portfolio, compute_portfolio_stats,
 from backtest        import run_backtest, TransactionCostModel
 from metrics         import (compute_full_tearsheet, monte_carlo_sharpe,
                               monthly_returns_table, annual_returns, wealth_growth,
-                              after_tax_returns)
+                              after_tax_estimate)
 from model           import build_feature_matrix, build_labels, WalkForwardModel
 from regime          import (detect_combined_regime, build_market_series,
                               performance_by_regime, stress_test)
@@ -854,10 +854,17 @@ def run(args):
     print(f"  Excess wealth:    ${wealth['Excess'].iloc[-1]:>+12,.0f}")
 
     # After-tax estimate
-    tax_info = after_tax_returns(result.daily_returns)
+    pretax_cagr = tearsheet.loc["CAGR", "Value"] if "CAGR" in tearsheet.index else 0.0
+    if isinstance(pretax_cagr, str):
+        pretax_cagr = float(pretax_cagr.replace("%", "")) / 100
+    avg_monthly_turnover = result.turnover.mean() / 12 if hasattr(result, 'turnover') and len(result.turnover) > 0 else 0.50
+    tax_info = after_tax_estimate(pretax_cagr, monthly_turnover_oneway=min(avg_monthly_turnover, 1.0))
     print("\n  After-Tax Estimate:")
     for k, v in tax_info.items():
-        print(f"    {k:25s}: {v}")
+        if isinstance(v, float):
+            print(f"    {k:30s}: {v:>8.2%}" if abs(v) < 10 else f"    {k:30s}: ${v:>12,.0f}")
+        else:
+            print(f"    {k:30s}: {v}")
 
     # ------------------------------------------------------------------
     # PHASE 5 — Robustness + Dashboard
