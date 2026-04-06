@@ -23,22 +23,41 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# Transaction Cost Assumptions (2024-2026 retail, $100K-$500K account):
+#
+# Commission: $0 at Schwab/Fidelity/IBKR Lite (zero-commission era since 2019)
+# Spread: 1-3 bps half-spread for large/mid-cap US equities after price improvement
+#   (SEC Rule 606 data shows retail gets 1-2 bps price improvement from wholesalers)
+# Slippage: <1 bps at $5K-$25K trade sizes (square-root model: sigma*sqrt(Q/V) ~ 0.2 bps
+#   for $5K trade vs $10M ADV; Frazzini-Israel-Moskowitz 2018 confirms)
+#
+# Total: ~3 bps/side (6 bps round-trip) for large/mid-cap
+# Conservative stress test: 5-10 bps/side for small-cap or illiquid names
+#
+# References:
+#   Schwarz et al. (2025) "The Actual Retail Price of Equity Trades" JF
+#   Frazzini, Israel & Moskowitz (2018) "Trading Costs" SSRN
+#   Novy-Marx & Velikov (2016) "A Taxonomy of Anomalies and Their Trading Costs"
+
+
 @dataclass
 class TransactionCostModel:
     """
     Realistic all-in transaction cost model for US equities.
-    Defaults are conservative estimates for liquid large-cap stocks.
+    Defaults calibrated to 2024-2026 retail execution quality.
     """
-    spread_bps:     float = 3.0   # half spread, paid on each side
-    commission_bps: float = 1.0   # broker commission
-    slippage_bps:   float = 5.0   # market impact / slippage
+    spread_bps:     float = 2.0   # was 3.0 -- half-spread for large/mid-cap after price improvement
+    commission_bps: float = 0.0   # was 1.0 -- $0 commission era (Schwab/Fidelity/IBKR Lite)
+    slippage_bps:   float = 1.0   # was 5.0 -- negligible impact at $5K-$25K retail trades
+    # Total: 3 bps per side (was 9). Based on Schwarz et al. (2025 JF)
+    # and Frazzini-Israel-Moskowitz (2018) empirical retail cost estimates.
 
     @property
     def total_bps(self) -> float:
         return self.spread_bps + self.commission_bps + self.slippage_bps
 
     def compute_cost(self, trade_notional: float) -> float:
-        """Cost in dollars for a trade of given notional value."""
+        """Cost in dollars for a trade of given notional value (flat model)."""
         return abs(trade_notional) * self.total_bps / 10_000
 
     def compute_cost_with_liquidity(self, trade_notional: float, adv: float) -> float:
@@ -57,6 +76,32 @@ class TransactionCostModel:
             scaled_spread = self.spread_bps
         total = scaled_spread + self.commission_bps + self.slippage_bps
         return abs(trade_notional) * total / 10_000
+
+    def compute_tiered_cost(self, trade_notional: float, adv: float) -> float:
+        """Compute transaction cost with ADV-based tiering.
+
+        Tiers based on empirical bid-ask spreads by liquidity (Novy-Marx & Velikov 2016,
+        Frazzini-Israel-Moskowitz 2018, Schwarz et al. 2025):
+
+            ADV > $20M:   2 bps/side  (mega/large-cap, tight spreads)
+            ADV $5-20M:   5 bps/side  (mid-cap)
+            ADV $1-5M:   10 bps/side  (small-cap, wider spreads)
+            ADV < $1M:   25 bps/side  (micro-cap, should generally be excluded)
+
+        Returns dollar cost for one side of the trade.
+        """
+        if adv <= 0 or pd.isna(adv):
+            bps = 10.0  # conservative fallback
+        elif adv >= 20_000_000:
+            bps = 2.0
+        elif adv >= 5_000_000:
+            bps = 5.0
+        elif adv >= 1_000_000:
+            bps = 10.0
+        else:
+            bps = 25.0
+
+        return abs(trade_notional) * bps / 10_000
 
 
 @dataclass
@@ -80,6 +125,7 @@ def run_backtest(
     cost_model:      Optional[TransactionCostModel] = None,
     rebalance_dates: Optional[set] = None,
     adv:             Optional[pd.DataFrame] = None,
+    use_tiered_costs: bool = True,
     stop_loss_pct:   float = 0.0,
     drawdown_halt_pct: float = 0.0,  # disabled by default — whipsaws in practice
     monthly_loss_limit: float = 0.0,
@@ -103,6 +149,9 @@ def run_backtest(
                       If None, rebalances every day (original behavior).
     adv             : (date x ticker) rolling average daily dollar volume.
                       If provided, uses liquidity-scaled transaction costs.
+    use_tiered_costs : if True (default), use ADV-tiered cost model per trade.
+                      Computes ADV from prices if adv DataFrame not provided.
+                      If False, uses flat cost model (backward compatible).
     stop_loss_pct   : if > 0, sell positions that drop this much from their
                       entry price. E.g. 0.15 = sell if down 15% from purchase.
                       Only active between rebalance dates.
@@ -130,6 +179,10 @@ def run_backtest(
 
     close  = prices["Close"]
     open_  = prices["Open"]
+
+    # Compute ADV from prices if tiered costs are requested but no ADV provided
+    if use_tiered_costs and adv is None:
+        adv = (prices["Close"] * prices["Volume"]).rolling(21).mean()
 
     # Align weights to dates available in price data.
     # IMPORTANT: weights must be daily-broadcast (forward-filled across all
@@ -243,7 +296,13 @@ def run_backtest(
                         sell_price = today_open_ml.get(ticker, 0)
                         if pd.notna(sell_price) and sell_price > 0:
                             trade_val = -positions[ticker] * sell_price
-                            tc = cost_model.compute_cost(trade_val)
+                            if use_tiered_costs and adv is not None and ticker in adv.columns and date in adv.index:
+                                ticker_adv = adv.loc[date, ticker]
+                                tc = cost_model.compute_tiered_cost(
+                                    trade_val, ticker_adv if pd.notna(ticker_adv) else 0
+                                )
+                            else:
+                                tc = cost_model.compute_cost(trade_val)
                             cash -= (trade_val + tc)
                         positions[ticker] = 0.0
                 entry_prices.clear()
@@ -279,7 +338,13 @@ def run_backtest(
                 if exit_price > 0 and shares > 0:
                     # Credit cash at last known price (as if sold before delisting)
                     trade_value = -shares * exit_price
-                    tc = cost_model.compute_cost(trade_value)
+                    if use_tiered_costs and adv is not None and ticker in adv.columns and date in adv.index:
+                        ticker_adv = adv.loc[date, ticker]
+                        tc = cost_model.compute_tiered_cost(
+                            trade_value, ticker_adv if pd.notna(ticker_adv) else 0
+                        )
+                    else:
+                        tc = cost_model.compute_cost(trade_value)
                     cash -= (trade_value + tc)
                 positions[ticker] = 0.0
                 if ticker in entry_prices:
@@ -292,7 +357,12 @@ def run_backtest(
                 entry_px = entry_prices[ticker]
                 if entry_px > 0 and (current_price / entry_px - 1) <= -stop_loss_pct:
                     trade_value = -shares * current_price
-                    if adv is not None and ticker in adv.columns and date in adv.index:
+                    if use_tiered_costs and adv is not None and ticker in adv.columns and date in adv.index:
+                        ticker_adv = adv.loc[date, ticker]
+                        tc = cost_model.compute_tiered_cost(
+                            trade_value, ticker_adv if pd.notna(ticker_adv) else 0
+                        )
+                    elif adv is not None and ticker in adv.columns and date in adv.index:
                         ticker_adv = adv.loc[date, ticker]
                         tc = cost_model.compute_cost_with_liquidity(
                             trade_value, ticker_adv if pd.notna(ticker_adv) else 0
@@ -323,7 +393,12 @@ def run_backtest(
                     continue
 
                 trade_value = trade_shares * today_open.get(ticker, 0)
-                if adv is not None and ticker in adv.columns and date in adv.index:
+                if use_tiered_costs and adv is not None and ticker in adv.columns and date in adv.index:
+                    ticker_adv = adv.loc[date, ticker]
+                    tc = cost_model.compute_tiered_cost(
+                        trade_value, ticker_adv if pd.notna(ticker_adv) else 0
+                    )
+                elif adv is not None and ticker in adv.columns and date in adv.index:
                     ticker_adv = adv.loc[date, ticker]
                     tc = cost_model.compute_cost_with_liquidity(
                         trade_value, ticker_adv if pd.notna(ticker_adv) else 0
@@ -386,7 +461,13 @@ def run_backtest(
                     sell_price = close.loc[date, ticker] if ticker in close.columns else 0
                     if pd.notna(sell_price) and sell_price > 0:
                         trade_value = -sell_shares * sell_price
-                        tc = cost_model.compute_cost(trade_value)
+                        if use_tiered_costs and adv is not None and ticker in adv.columns and date in adv.index:
+                            ticker_adv = adv.loc[date, ticker]
+                            tc = cost_model.compute_tiered_cost(
+                                trade_value, ticker_adv if pd.notna(ticker_adv) else 0
+                            )
+                        else:
+                            tc = cost_model.compute_cost(trade_value)
                         gross_cost += tc
                         cash -= (trade_value + tc)
                         positions[ticker] -= sell_shares

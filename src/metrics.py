@@ -411,6 +411,32 @@ def compute_full_tearsheet(
     except Exception:
         pass
 
+    # After-tax estimate
+    try:
+        # Derive monthly turnover from backtest result's turnover series
+        if hasattr(result, 'turnover') and len(result.turnover) > 0:
+            # turnover series has daily one-way turnover; sum to annualized,
+            # then divide by 12 to get monthly
+            n_years_ts = max(1, len(result.turnover) / 252)
+            annual_turnover = result.turnover.sum() / n_years_ts
+            monthly_to = annual_turnover / 12.0
+        else:
+            monthly_to = 0.50  # default assumption
+
+        tax_info = after_tax_estimate(
+            pretax_cagr=ann_ret,
+            monthly_turnover_oneway=min(monthly_to, 1.0),
+        )
+        metrics["After-Tax CAGR (est.)"] = f"{tax_info['after_tax_cagr']*100:.2f}%"
+        metrics["Effective Tax Rate"] = f"{tax_info['effective_tax_rate']*100:.1f}%"
+        metrics["ST/LT Fraction"] = f"{tax_info['st_fraction']*100:.0f}% ST / {tax_info['lt_fraction']*100:.0f}% LT"
+        metrics["Tax Drag"] = f"{tax_info['tax_drag']*100:.2f}%"
+        metrics["TLH Benefit"] = f"{tax_info['tlh_benefit']*100:.2f}%"
+        metrics["After-Tax Alpha Hurdle vs SPY"] = f"{tax_info['hurdle_vs_spy_buyhold']*100:.2f}%"
+        metrics["Account Recommendation"] = tax_info["account_recommendation"]
+    except Exception:
+        pass
+
     tearsheet = pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"])
     tearsheet.index.name = "Metric"
     return tearsheet
@@ -795,53 +821,74 @@ def annual_returns(
 # After-Tax Return Estimate
 # ---------------------------------------------------------------------------
 
-def after_tax_returns(
-    daily_returns: pd.Series,
-    st_tax_rate: float = 0.37,
-    lt_tax_rate: float = 0.20,
-    avg_holding_months: float = 1.0,
+def after_tax_estimate(
+    pretax_cagr: float,
+    monthly_turnover_oneway: float = 0.50,
+    federal_bracket_st: float = 0.24,    # marginal ordinary income rate
+    federal_bracket_lt: float = 0.15,    # long-term CG rate
+    niit: float = 0.038,                 # Net Investment Income Tax
+    state_rate: float = 0.05,            # state income tax (0 for TX/FL)
+    tlh_annual_benefit: float = 0.01,    # tax-loss harvesting offset (~1%/yr)
 ) -> dict:
+    """Estimate after-tax CAGR for a systematic equity strategy.
+
+    Based on Israel-Moskowitz-Pettenuzzo (2023) methodology and
+    AQR tax-management research (Israelov & Katz 2017).
+
+    At monthly rebalancing with 50% turnover, virtually 100% of gains
+    are short-term (holding period < 12 months).
+
+    Args:
+        pretax_cagr: pre-tax annualized return
+        monthly_turnover_oneway: fraction of portfolio replaced per month (0-1)
+        federal_bracket_st: marginal federal rate for short-term gains
+        federal_bracket_lt: marginal federal rate for long-term gains
+        niit: Net Investment Income Tax (3.8% for AGI > $200K/$250K)
+        state_rate: state income tax rate (0 for no-income-tax states)
+        tlh_annual_benefit: estimated tax-loss harvesting benefit
+
+    Returns:
+        dict with: after_tax_cagr, effective_tax_rate, lt_fraction,
+                   st_fraction, tax_drag, tlh_benefit,
+                   hurdle_vs_spy_buyhold, account_recommendation
     """
-    Estimate after-tax performance for a personal portfolio.
+    # Fraction surviving 12+ months (geometric decay)
+    monthly_survival = 1.0 - monthly_turnover_oneway
+    lt_fraction = monthly_survival ** 12  # P(hold >= 12 months)
+    st_fraction = 1.0 - lt_fraction
 
-    Since monthly rebalancing produces mostly short-term gains (held < 12 months),
-    the majority of gains are taxed at the higher short-term rate. Some positions
-    held across multiple rebalances may qualify for long-term treatment.
+    # Blended effective tax rate on realized gains
+    st_rate = federal_bracket_st + niit + state_rate
+    lt_rate = federal_bracket_lt + niit + state_rate
+    effective_rate = st_fraction * st_rate + lt_fraction * lt_rate
 
-    Parameters
-    ----------
-    st_tax_rate         : short-term capital gains rate (default 37% top bracket)
-    lt_tax_rate         : long-term capital gains rate (default 20%)
-    avg_holding_months  : average holding period in months.
-                          1 = all short-term, 12+ = all long-term.
+    # After-tax return
+    tax_drag = pretax_cagr * effective_rate
+    after_tax_cagr = pretax_cagr * (1.0 - effective_rate) + tlh_annual_benefit
 
-    Returns
-    -------
-    dict with pre-tax and after-tax metrics
-    """
-    # Estimate fraction of gains that are long-term
-    lt_fraction = min(1.0, max(0.0, (avg_holding_months - 1) / 11.0))
-    effective_tax_rate = lt_fraction * lt_tax_rate + (1 - lt_fraction) * st_tax_rate
+    # SPY buy-and-hold comparison (assume 14% CAGR, 100% deferred LT gains)
+    spy_cagr = 0.14
+    spy_effective_rate = 0.005  # ~0.5%/yr effective rate on deferred unrealized LT gains
+    spy_after_tax = spy_cagr * (1.0 - spy_effective_rate)
 
-    # Separate gains and losses
-    gains = daily_returns[daily_returns > 0]
-    losses = daily_returns[daily_returns <= 0]
-
-    # Tax only applies to gains; losses reduce taxable income
-    after_tax_daily = daily_returns.copy()
-    after_tax_daily[daily_returns > 0] = gains * (1 - effective_tax_rate)
-    # Losses are kept as-is (they offset gains)
-
-    pre_tax_cagr = annualized_return(daily_returns)
-    after_tax_cagr = annualized_return(after_tax_daily)
-    tax_drag = pre_tax_cagr - after_tax_cagr
+    # Account recommendation
+    if effective_rate > 0.25:
+        recommendation = "Roth IRA strongly recommended (0% tax drag vs {:.1f}% in taxable)".format(effective_rate * 100)
+    elif effective_rate > 0.15:
+        recommendation = "Tax-advantaged account recommended (IRA/Roth)"
+    else:
+        recommendation = "Taxable account viable (low effective rate)"
 
     return {
-        "Pre-Tax CAGR": f"{pre_tax_cagr*100:.2f}%",
-        "Effective Tax Rate": f"{effective_tax_rate*100:.1f}%",
-        "After-Tax CAGR": f"{after_tax_cagr*100:.2f}%",
-        "Tax Drag": f"{tax_drag*100:.2f}%",
-        "LT Fraction": f"{lt_fraction*100:.0f}%",
+        "after_tax_cagr": after_tax_cagr,
+        "effective_tax_rate": effective_rate,
+        "lt_fraction": lt_fraction,
+        "st_fraction": st_fraction,
+        "tax_drag": tax_drag,
+        "tlh_benefit": tlh_annual_benefit,
+        "hurdle_vs_spy_buyhold": max(0, spy_after_tax - after_tax_cagr),
+        "account_recommendation": recommendation,
+        "spy_after_tax_cagr": spy_after_tax,
     }
 
 
