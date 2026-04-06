@@ -556,7 +556,7 @@ def run(args):
             use_higher_moment=args.use_higher_moment,
             use_breadth_wavelet=args.use_breadth_wavelet,
             size_neutralize=args.size_neutralize,
-            sector_neutralize=args.sector_neutralize_features,
+            sector_neutralize_features=args.sector_neutralize_features,
             winsorize=args.winsorize,
             cs_zscore_all=args.cs_zscore_all,
         )
