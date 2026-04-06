@@ -16,8 +16,8 @@ Universe construction:
   2. Bulk screen by price and ADV (1 API call)
   3. Download daily OHLCV for screened tickers (1 call each, 16/sec)
 
-yfinance is kept ONLY for: sector mapping, insider transactions, analyst data
-(endpoints EODHD doesn't provide on the $20 plan).
+yfinance is kept ONLY for: benchmark price loading (SPY, small ticker lists).
+Sector mapping uses EDGAR SIC + EODHD name-based heuristic (no yfinance).
 
 API budget: ~3,000 calls per full run (3% of 100K daily limit).
 """
@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-# yfinance kept only for sector fetching
+# yfinance kept only for benchmark price loading (SPY, small ticker lists)
 try:
     import yfinance as yf
     YF_AVAILABLE = True
@@ -48,7 +48,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Cache version suffix — bump whenever universe-filter logic changes so that
 # stale pickles (built before the filter was added) are invalidated.
-_UNIVERSE_CACHE_VERSION = "v2_common_only"
+_UNIVERSE_CACHE_VERSION = "v3_us_only"
 
 # EODHD Type values we keep. The bulk EOD endpoint returns all instruments
 # (ETFs, Funds, Notes, Warrants, etc.); we intersect against this whitelist
@@ -66,6 +66,95 @@ _ETF_BLOCKLIST = {
     "SPY", "QQQ", "IWM", "IWB", "DIA", "GLD", "SLV", "TLT", "HYG", "LQD",
     "VOO", "VTI", "IVV", "EEM", "EFA", "VEA", "VWO", "BND", "AGG",
     "XLF", "XLK", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC", "XLRE",
+}
+
+# Foreign tickers that EODHD assigns to legitimate US exchanges (NYSE/NASDAQ)
+# but are actually European, Asian, or Middle Eastern equities. These have
+# null ISINs and sneak past the Exchange filter because EODHD labels them
+# as NYSE/NASDAQ. Identified by manual inspection of the top-liquidity
+# universe; extend as more contaminants surface.
+_FOREIGN_TICKER_BLOCKLIST = {
+    # European
+    "EOAN",     # E.ON SE (German utility)
+    "KNEBV",    # KONE Oyj B (Finnish elevators)
+    "NLMK",     # NLMK (Russian steel)
+    "AKSO",     # Aker Solutions ASA (Norwegian oil services)
+    "FME",      # Fresenius Medical Care AG (German)
+    "FRE",      # Fresenius SE (German)
+    "MHG",      # Marine Harvest ASA (Norwegian salmon)
+    "NEL",      # Nel ASA (Norwegian hydrogen)
+    "NHY",      # Norsk Hydro ASA (Norwegian aluminium)
+    "NRW",      # NCL Holding ASA (Norwegian cruise)
+    "ORK",      # Orkla ASA (Norwegian consumer goods)
+    "PGS",      # Petroleum Geo-Services ASA (Norwegian)
+    "TOM",      # Tomra Systems ASA (Norwegian recycling)
+    "SMVB",     # Smedvig ASA (Norwegian)
+    "BOUBYAN",  # Boubyan Bank KSC (Kuwaiti)
+    "LNZ",      # Lenzing AG (Austrian)
+    "WIE",      # Wienerberger AG (Austrian)
+    "SIK",      # Sika AG (Swiss)
+    "GXI",      # Gerresheimer AG (German)
+    "FNTN",     # freenet AG (German)
+    "DWS",      # DWS Group GmbH (German)
+    "WLN",      # Worldline SA (French)
+    "KCR",      # Konecranes Oyj (Finnish)
+    "UPM",      # UPM-Kymmene Oyj (Finnish)
+    "YAR",      # Yara International ASA (Norwegian)
+    "HBMN",     # HBM Healthcare Investments (Swiss)
+    "SQN",      # Swissquote Group (Swiss)
+    "SRCG",     # Sunrise Communications (Swiss)
+    "SFSN",     # SFS Group AG (Swiss)
+    "PWTN",     # Panalpina (Swiss)
+    "KVW",      # Koninklijke VolkerWessels (Dutch)
+    "WHA",      # Wereldhave NV (Dutch)
+    "ERG",      # ERG SPA (Italian)
+    "SL",       # Sanlorenzo SpA (Italian)
+    "LXS",      # LXS (Lanxess, German)
+    "KCO",      # Klockner & Co (German)
+    "KTY",      # Grupa Kety SA (Polish)
+    "KGH",      # KGHM Polska Miedz (Polish)
+    "OPL",      # OPL (Orange Polska)
+    "VTY",      # Vistry Group PLC (UK)
+    "HIK",      # Hikma Pharmaceuticals PLC (UK)
+    "HOC",      # Hochschild Mining PLC (UK)
+    "PHP",      # Primary Health Properties PLC (UK)
+    "WEIR",     # Weir Group PLC (UK)
+    "NRS",      # Norway Royal Salmon ASA (Norwegian)
+    "OCY",      # Ocean Yield ASA (Norwegian)
+    "NOBINA",   # Nobina AB (Swedish)
+    # Asian / Middle East
+    "KTC",      # Krungthai Card PCL (Thai)
+    "MFEC",     # MFEC PCL (Thai)
+    "KSL",      # Khon Kaen Sugar Industry PCL (Thai)
+    "PTT",      # PTT PCL (Thai)
+    "SCB",      # Siam Commercial Bank PCL (Thai)
+    "TKN",      # Taokaenoi Food PCL (Thai)
+    "AOT",      # Airports of Thailand PCL (Thai)
+    "MGROS",    # Migros Turk TAS (Turkish)
+    "ENJSA",    # Enerjisa Enerji AS (Turkish)
+    "ISDMR",    # Iskenderun Demir ve Celik (Turkish)
+    "TENERGY",  # Terna Energy SA (Greek)
+    "EFGD",     # Eurobank Ergasias (Greek)
+    "OGKB",     # OGK-2 JSC (Russian)
+    "QFLS",     # Qatar Fuel QSC (Qatari)
+    "GBK",      # Gulf Bank KSC (Kuwaiti)
+    "KIB",      # Kuwait International Bank (Kuwaiti)
+    "KDB",      # Korea Development Bank (Korean)
+    "RDSB",     # Royal Dutch Shell PLC B (UK/Netherlands)
+    "CYPC",     # China Yangtze Power GDR (Chinese)
+}
+
+# EODHD Exchange values for legitimate US venues. The "US" generic exchange
+# label is used for foreign stocks, currency pairs, futures, and other
+# non-US instruments that EODHD incorrectly buckets under the US exchange.
+# Filtering these out removes ~170 foreign contaminants (Turkish, European,
+# Asian, Russian equities, FX pairs, commodity futures) while losing only
+# a handful of already-delisted US tickers whose data exists under their
+# proper exchange codes.
+_VALID_US_EXCHANGES = {
+    "NYSE", "NASDAQ", "AMEX", "NYSE ARCA", "NYSE MKT", "BATS",
+    "OTC", "OTCBB", "OTCCE", "OTCGREY", "OTCMKTS", "OTCQB", "OTCQX",
+    "PINK", "NMFQS",
 }
 
 # EODHD API
@@ -126,6 +215,7 @@ def _filter_common_stock(symbols: list, source_label: str = "") -> List[str]:
     kept = []
     dropped_by_type = 0
     dropped_by_blocklist = 0
+    dropped_by_exchange = 0
     for s in symbols:
         code_raw = s.get("Code", "")
         if not code_raw or len(code_raw) > 6:
@@ -140,11 +230,24 @@ def _filter_common_stock(symbols: list, source_label: str = "") -> List[str]:
         if code in _ETF_BLOCKLIST:
             dropped_by_blocklist += 1
             continue
+        # Foreign-ticker filter layer 1: EODHD labels non-US instruments
+        # (European equities, FX pairs, futures) with Exchange="US"
+        # instead of a real venue like NYSE/NASDAQ.
+        exchange = s.get("Exchange", "")
+        if exchange and exchange not in _VALID_US_EXCHANGES:
+            dropped_by_exchange += 1
+            continue
+        # Foreign-ticker filter layer 2: known foreign tickers that EODHD
+        # incorrectly assigns to NYSE/NASDAQ with null ISINs.
+        if code in _FOREIGN_TICKER_BLOCKLIST:
+            dropped_by_exchange += 1
+            continue
         kept.append(code)
-    if dropped_by_type or dropped_by_blocklist:
-        print(f"[data_loader] {source_label} ETF filter: dropped "
-              f"{dropped_by_type} non-common-stock instruments "
-              f"(+ {dropped_by_blocklist} blocklisted tickers)")
+    if dropped_by_type or dropped_by_blocklist or dropped_by_exchange:
+        print(f"[data_loader] {source_label} filter: dropped "
+              f"{dropped_by_type} non-common-stock, "
+              f"{dropped_by_blocklist} blocklisted, "
+              f"{dropped_by_exchange} foreign-exchange tickers")
     return kept
 
 
@@ -180,6 +283,7 @@ def build_eodhd_universe(
 
     # Delisted common stocks
     delisted_tickers = []
+    delisted_raw = []
     if include_delisted:
         try:
             delisted_raw = _eodhd_get("exchange-symbol-list/US", {
@@ -196,6 +300,25 @@ def build_eodhd_universe(
 
     with open(cache_file, "wb") as f:
         pickle.dump(all_tickers, f)
+
+    # Side-effect: cache ticker→Name map for name-based sector guessing.
+    # The raw EODHD data has Name fields for ALL tickers (active + delisted).
+    name_map = {}
+    for item in active_raw:
+        code = _clean_ticker(item.get("Code", ""))
+        name = item.get("Name", "")
+        if code and name:
+            name_map[code] = name
+    if include_delisted:
+        for item in delisted_raw:
+            code = _clean_ticker(item.get("Code", ""))
+            name = item.get("Name", "")
+            if code and name and code not in name_map:
+                name_map[code] = name
+    name_cache = CACHE_DIR / "eodhd_name_map.pkl"
+    with open(name_cache, "wb") as f:
+        pickle.dump(name_map, f)
+    print(f"  Cached {len(name_map)} ticker→Name mappings")
 
     return all_tickers
 
@@ -734,74 +857,244 @@ def _load_prices_yfinance(
 
 
 # ---------------------------------------------------------------------------
-# Sector Mapping (yfinance — EODHD doesn't provide on $20 plan)
+# Sector Mapping — EDGAR SIC + EODHD name-based heuristic
 # ---------------------------------------------------------------------------
+# Priority order:
+#   1. EDGAR SIC codes (covers ~50% of top universe via SEC submissions)
+#   2. EODHD name-based keyword guesser (covers ~30% more from company names)
+#   3. "Unknown" default (remaining ~20% — micro-caps with opaque names)
+#
+# yfinance fallback REMOVED: it was 5000+ individual HTTP requests, 40-50%
+# 404 errors on delisted/foreign tickers, 15+ minutes per run, and
+# contributed <5% incremental coverage over EDGAR SIC.
+# ---------------------------------------------------------------------------
+
+# Keyword patterns for name-based sector guessing.
+# Order matters: first match wins. More specific patterns go first.
+_NAME_SECTOR_PATTERNS = [
+    # Healthcare / Biotech / Pharma
+    # No trailing \b — prefix matching so "pharma" matches "pharmaceuticals", etc.
+    (r"(?i)\b(pharma|biotech|bioscience|therapeut|oncolog|oncogen|genomic|"
+     r"medic|health|hospit|biopharma|diagnos|surgical|dental|"
+     r"neuroscien|immun|bioressource|wellness|cannabis|hemp|"
+     r"biolabs?|biosys|biovent|biolog|biomed|clinical|"
+     r"life\s*sci|drug|vaccine|stem\s*cell|peptid|"
+     r"patholog|cardio|ortho|vascular|regen|"
+     r"laborator|nutraceu|cbd|marijuana)", "Healthcare"),
+
+    # Technology / Software / IT / Semiconductor
+    (r"(?i)\b(software|technolog|digital|cyber|internet|cloud|semicon|"
+     r"chip|comput|microelectron|nanotech|"
+     r"artificial\s+intellig|machine\s+learn|blockchain|"
+     r"fintech|infotech|e-?commerce|wireless|"
+     r"microsys|infosys|datasci|"
+     r"robot|automat|sensor|"
+     r"platform|saas|"
+     r"photon|electro(?:nic|optic))", "Technology"),
+
+    # Financial Services / Banks / Insurance
+    (r"(?i)\b(bank|bancorp|bancshare|financ|"
+     r"asset\s*manag|invest(?:ment|or|ing)|insur|underwriter|credit|"
+     r"mortgage|lending|loan|securit(?:ies|y)|brokerage|"
+     r"trust\s+co|savings|private\s+equity|"
+     r"capital\s+(?:group|corp|inc|mgmt|ltd|plc)|"
+     r"venture|fund\s+(?:inc|corp|ltd)|"
+     r"payment|merchant|escrow)", "Financial Services"),
+
+    # Energy / Oil & Gas / Renewable / Midstream
+    (r"(?i)\b(energy|oil\b|petrol|drilling|midstream|"
+     r"natural\s+gas|pipeline|refin(?:ery|ing)|"
+     r"solar|wind\s+(?:power|energy)|"
+     r"fuel\s*cell|lithium|uranium|coal|geotherm|"
+     r"exploration\b|resources?\s+(?:inc|corp|ltd|co))", "Energy"),
+
+    # Real Estate / REITs
+    (r"(?i)\b(real\s+estate|realt|REIT|propert(?:y|ies)|housing|"
+     r"mortgage\s+trust|land\s+(?:co|corp|inc))", "Real Estate"),
+
+    # Utilities
+    (r"(?i)\b(utilit|electric\s+(?:co|power|corp|inc)|"
+     r"water\s+(?:co|corp|utilit|inc)|"
+     r"power\s+(?:co|corp|holding))", "Utilities"),
+
+    # Consumer Cyclical / Retail / Hospitality / Education
+    (r"(?i)\b(retail|restaurant|hotel|resort|casino|gaming|entertainment|"
+     r"apparel|fashion|auto(?:motive|mobil)|motor|toy|leisure|"
+     r"furniture|home\s+(?:depot|goods|furnish)|e-?tailer|"
+     r"consumer\s+(?:product|good|brand)|"
+     r"educat|academ|learning|tutoring|"
+     r"travel|cruise|airline|"
+     r"cloth|shoe|luxury|brand|"
+     r"store|shop|mart|outlet)", "Consumer Cyclical"),
+
+    # Consumer Defensive / Food / Staples
+    (r"(?i)\b(food|beverage|grocer|tobacco|household|cleaning|"
+     r"personal\s+care|cosmetic|nutrition|cereal|dairy|bakery|"
+     r"meat|agricult|livestock|farm|"
+     r"wine|beer|spirits|distill|brewery)", "Consumer Defensive"),
+
+    # Industrials / Manufacturing / Defense / Engineering
+    (r"(?i)\b(industrial|manufactur|aerospace|defen[sc]e|engineer|"
+     r"construct|machin|equipment|transport|logistic|freight|"
+     r"trucking|railroad|shipbuild|packag|"
+     r"container|staffing|consult|"
+     r"aviation|marine|shipping|"
+     r"infrastruct|contract|"
+     r"valve|pump|turbine|generator|"
+     r"recycl|waste\s+(?:manag|service))", "Industrials"),
+
+    # Basic Materials / Chemicals / Mining / Metals
+    (r"(?i)\b(mining|mineral|gold|silver|copper|platinum|nickel|zinc|"
+     r"chemical|paper|lumber|forest|cement|glass|rubber|plastic|"
+     r"fertili|aluminum|aluminium|"
+     r"steel|iron|metal|alloy|"
+     r"rare\s+earth|cobalt|"
+     r"granite|marble|stone|clay|ceramic)", "Basic Materials"),
+
+    # Communication Services / Media / Telecom
+    (r"(?i)\b(media|broadcast|publish|newspaper|magazine|stream|"
+     r"television|radio|film|movie|studio|social\s+media|"
+     r"advertis|marketing|telecom|communicat|"
+     r"music|licens|"
+     r"network|cable|satellite)", "Communication Services"),
+]
+
+# Pre-compile patterns for speed
+import re as _re
+_COMPILED_NAME_PATTERNS = [
+    (_re.compile(pat), sector)
+    for pat, sector in _NAME_SECTOR_PATTERNS
+]
+
+
+def _load_eodhd_name_map() -> Dict[str, str]:
+    """
+    Load the EODHD ticker→Name map from cache.
+
+    Built as a side-effect of build_eodhd_universe(). If cache doesn't
+    exist, fetches fresh from EODHD (2 API calls: active + delisted).
+    """
+    cache_file = CACHE_DIR / "eodhd_name_map.pkl"
+    if cache_file.exists():
+        with open(cache_file, "rb") as f:
+            name_map = pickle.load(f)
+        if isinstance(name_map, dict) and len(name_map) > 1000:
+            return name_map
+
+    # Cache doesn't exist — build it fresh from EODHD API
+    print("[sectors] Building EODHD name map (2 API calls)...")
+    name_map = {}
+    try:
+        active_raw = _eodhd_get("exchange-symbol-list/US", {"type": "common_stock"})
+        for item in active_raw:
+            code = _clean_ticker(item.get("Code", ""))
+            name = item.get("Name", "")
+            if code and name:
+                name_map[code] = name
+
+        delisted_raw = _eodhd_get("exchange-symbol-list/US", {
+            "type": "common_stock", "delisted": "1"
+        })
+        for item in delisted_raw:
+            code = _clean_ticker(item.get("Code", ""))
+            name = item.get("Name", "")
+            if code and name and code not in name_map:
+                name_map[code] = name
+
+        with open(cache_file, "wb") as f:
+            pickle.dump(name_map, f)
+        print(f"[sectors] Cached {len(name_map)} ticker→Name mappings from EODHD")
+    except Exception as e:
+        print(f"[sectors] EODHD name map fetch failed: {e}")
+    return name_map
+
+
+def _guess_sector_from_name(name: str) -> Optional[str]:
+    """
+    Guess GICS sector from company name using keyword patterns.
+
+    Returns sector string or None if no pattern matched.
+    """
+    if not name:
+        return None
+    for pattern, sector in _COMPILED_NAME_PATTERNS:
+        if pattern.search(name):
+            return sector
+    return None
+
+
+_SECTOR_CACHE_VERSION = "v3"  # Bump: EDGAR + name-heuristic, no yfinance
+
 
 def get_sectors(tickers: List[str], use_cache: bool = True) -> Dict[str, str]:
     """
     Map tickers to GICS sectors.
 
-    Loads from combined cache first (EDGAR + yfinance merged).
-    Only rebuilds if cache is missing or has low coverage.
+    Pipeline:
+      1. Check versioned cache (fast path)
+      2. EDGAR SIC codes (official SEC data, ~50% coverage)
+      3. EODHD name-based keyword heuristic (~30% more coverage)
+      4. "Unknown" for remainder
+
+    yfinance fallback removed — it was 5000+ HTTP requests with 40-50%
+    404 errors, taking 15+ minutes for <5% incremental coverage.
     """
-    # Check combined cache FIRST — this has EDGAR + yfinance already merged
-    cache_file = CACHE_DIR / "sector_map.pkl"
+    cache_file = CACHE_DIR / f"sector_map_{_SECTOR_CACHE_VERSION}.pkl"
     if use_cache and cache_file.exists():
         with open(cache_file, "rb") as f:
             cached: Dict[str, str] = pickle.load(f)
         coverage = sum(1 for t in tickers if t in cached) / max(len(tickers), 1)
         if coverage > 0.80:
             unknown = sum(1 for t in tickers if cached.get(t) == "Unknown")
-            print(f"[data_loader] Sector map loaded from cache "
-                  f"({len(cached)} tickers, {coverage:.0%} coverage, {unknown} Unknown)")
+            known = sum(1 for t in tickers if t in cached and cached[t] != "Unknown")
+            print(f"[sectors] Sector map loaded from cache "
+                  f"({len(cached)} tickers, {coverage:.0%} coverage, "
+                  f"{known} known, {unknown} Unknown)")
             return cached
 
     from sector_mapper import get_sectors_from_edgar
 
-    # Build from EDGAR SIC codes (covers delisted, fast)
+    # Step 1: EDGAR SIC codes (covers ~50% of liquid universe)
     sector_map = get_sectors_from_edgar(tickers, use_cache=use_cache)
 
-    # Count unknowns — fill remaining from yfinance
-    unknowns = [t for t in tickers if sector_map.get(t) == "Unknown"]
+    unknowns_after_edgar = [t for t in tickers if sector_map.get(t) == "Unknown"]
+    n_edgar = len(tickers) - len(unknowns_after_edgar)
 
-    # yfinance .info is broken for batch calls (401 Invalid Crumb in 2025-2026).
-    # But we can try a small batch sequentially with fresh session per call.
-    # Only attempt tickers that are likely active (no _OLD, no warrants).
-    if unknowns and YF_AVAILABLE:
-        active_unknowns = [t for t in unknowns
-                           if "_" not in t and "-" not in t and len(t) <= 5]
-        if active_unknowns:
-            print(f"[data_loader] Trying yfinance for {len(active_unknowns)} active unknowns...")
-            filled = 0
-            for i, ticker in enumerate(active_unknowns):
-                try:
-                    # Fresh Ticker object each time to avoid crumb issues
-                    t = yf.Ticker(ticker)
-                    info = t.info
-                    sector = info.get("sector")
-                    if sector and sector != "Unknown":
-                        sector_map[ticker] = sector
-                        filled += 1
-                except Exception:
-                    pass
-                if (i + 1) % 100 == 0:
-                    print(f"        {i+1}/{len(active_unknowns)} ({filled} filled)")
-                time.sleep(0.3)
-            print(f"[data_loader] Filled {filled} sectors from yfinance")
+    # Step 2: Name-based keyword heuristic from EODHD company names
+    name_map = _load_eodhd_name_map()
+    filled_by_name = 0
+    for ticker in unknowns_after_edgar:
+        name = name_map.get(ticker, "")
+        if not name:
+            # Try base ticker for _OLD / hyphenated share classes
+            base = ticker.split("_")[0] if "_" in ticker else ticker.split("-")[0] if "-" in ticker else ""
+            name = name_map.get(base, "")
+        sector = _guess_sector_from_name(name)
+        if sector:
+            sector_map[ticker] = sector
+            filled_by_name += 1
 
     remaining = sum(1 for t in tickers if sector_map.get(t) == "Unknown")
-    print(f"[data_loader] {remaining} tickers with Unknown sector (exempt from cap)")
+    total = len(tickers)
+    known = total - remaining
 
-    # Save combined map
-    cache_file = CACHE_DIR / "sector_map.pkl"
+    print(f"[sectors] EDGAR SIC: {n_edgar}/{total} ({n_edgar/total*100:.1f}%); "
+          f"Name heuristic: +{filled_by_name}; "
+          f"Unknown: {remaining} ({remaining/total*100:.1f}%)")
+    print(f"[sectors] Total coverage: {known}/{total} ({known/total*100:.1f}%)")
+
+    # Save versioned cache
     with open(cache_file, "wb") as f:
         pickle.dump(sector_map, f)
 
-    unknown_final = sum(1 for v in sector_map.values() if v == "Unknown")
+    # Also save to legacy cache path for backward compat
+    legacy_cache = CACHE_DIR / "sector_map.pkl"
+    with open(legacy_cache, "wb") as f:
+        pickle.dump(sector_map, f)
+
     counts = pd.Series([v for v in sector_map.values() if v != "Unknown"]).value_counts()
-    print(f"[data_loader] Sectors: {len(tickers) - unknown_final} mapped, {unknown_final} Unknown")
     if len(counts) > 0:
-        print(counts.head(8).to_string())
+        print(f"[sectors] Distribution:\n{counts.to_string()}")
     return sector_map
 
 
