@@ -507,11 +507,22 @@ def run(args):
     # ------------------------------------------------------------------
     section("Phase 2 — Feature Engineering + ML Model")
 
+    # ── Fix 1: Compute investable mask (top 1500 by ADV per date) ──────
+    # Signal rankings should be computed WITHIN the investable universe so
+    # that IC predicts top-1500 returns, not all-stock returns. Without this,
+    # the signal's alpha concentrates in illiquid micro-caps that the ADV
+    # filter replaces at portfolio construction time (97% pick replacement).
+    adv_for_mask = (close * volume).rolling(21).mean()
+    n_investable = min(args.max_selection_pool, adv_for_mask.shape[1])
+    investable_mask = adv_for_mask.rank(axis=1, pct=True) >= (1 - n_investable / adv_for_mask.shape[1])
+    print(f"  [investable mask] top {n_investable} by ADV per date")
+
     print("[2/6] Computing alpha signals...")
     composite, ranked_signals = build_composite_signal(
         close, returns, volume,
         sector_map=sector_map,
         use_ic_weights=True,
+        investable_mask=investable_mask,
     )
     rvol = realized_volatility(returns, window=21)
 
@@ -557,6 +568,7 @@ def run(args):
             sector_rank_weight=args.sector_rank_weight,
             beta_neutral=args.beta_neutral_labels,
             market_returns=mkt_return,
+            investable_mask=investable_mask,  # Fix 1: rank labels within investable set
         )
         if args.forward_windows is not None:
             _label_kwargs["forward_windows"] = args.forward_windows

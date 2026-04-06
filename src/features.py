@@ -659,7 +659,11 @@ def build_ic_weighted_composite(
     and drops what is not — without ever looking at future data, and
     without the sign-flip bug that |IC| weighting suffers from.
     """
-    fwd_ret = returns.shift(-1)     # 1-day forward return (IC target)
+    # Fix 4: Align IC horizon with actual holding period (~21d monthly).
+    # 1d IC can be positive for signals that degrade or flip sign at 21d,
+    # causing negative-IC sub-signals to receive weight. Using 21d forward
+    # returns ensures IC-weighting reflects the actual rebalance horizon.
+    fwd_ret = returns.shift(-21).rolling(21).sum()  # 21-day forward return
 
     # Compute rolling IC for each signal (vectorised via corrwith)
     rolling_ics: dict = {}
@@ -722,6 +726,7 @@ def build_composite_signal(
     weights: dict = None,
     sector_map: dict = None,
     use_ic_weights: bool = False,
+    investable_mask: Optional[pd.DataFrame] = None,
 ):
     """
     Combines individual signals into a single composite alpha score.
@@ -832,6 +837,19 @@ def build_composite_signal(
     # Sector-relative momentum — only if sector_map is provided
     if has_sector:
         raw_signals["sector_rel_mom"] = sector_relative_momentum(returns, sector_map, window=63)
+
+    # ── Fix 1: Mask non-investable tickers BEFORE cross-sectional ranking ──
+    # When investable_mask is provided (boolean DataFrame, True=investable),
+    # set non-investable tickers to NaN so rankings are computed WITHIN the
+    # investable universe only. This aligns signal rankings with the portfolio's
+    # selection pool — without this, IC concentrates in illiquid micro-caps
+    # that can never be traded, and the ADV filter replaces 97% of picks.
+    if investable_mask is not None:
+        mask_aligned = investable_mask.reindex(
+            index=close.index, columns=close.columns
+        ).fillna(False)
+        for name in list(raw_signals.keys()):
+            raw_signals[name] = raw_signals[name].where(mask_aligned)
 
     ranked_signals = {
         name: cross_sectional_rank(sig)

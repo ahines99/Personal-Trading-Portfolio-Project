@@ -234,6 +234,8 @@ def build_monthly_portfolio(
     apply_rank_normal: bool = True,
     neutralize_factors: Optional[List[str]] = None,
     factor_panel:     Optional[Dict[str, pd.DataFrame]] = None,
+    min_holding_overlap: float = 0.5,
+    signal_filter_pct:   float = 0.20,
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """
     Build a long-only concentrated portfolio with monthly rebalancing.
@@ -282,6 +284,7 @@ def build_monthly_portfolio(
 
     weights = pd.DataFrame(0.0, index=all_dates, columns=signal.columns)
     current_weights = pd.Series(0.0, index=signal.columns)
+    prev_holdings = None  # Fix 2: track holdings for overlap constraint
 
     for date in all_dates:
         if date in rebalance_dates:
@@ -335,6 +338,9 @@ def build_monthly_portfolio(
                 use_vol_buckets=use_vol_buckets,
                 max_selection_pool=max_selection_pool,
                 force_mega_caps=force_mega_caps,
+                prev_holdings=prev_holdings,
+                min_holding_overlap=min_holding_overlap,
+                signal_filter_pct=signal_filter_pct,
             )
 
             if cash_frac > 0:
@@ -350,6 +356,8 @@ def build_monthly_portfolio(
                 new_weights[spy_ticker] = new_weights.get(spy_ticker, 0.0) + spy_core_weight
 
             current_weights = new_weights
+            # Fix 2: Track current holdings for next month's overlap constraint
+            prev_holdings = list(current_weights[current_weights > 0.005].index)
 
         # ── Mid-month signal refresh ─────────────────────────────────────
         # On ~15th of each month, check if any held stock's signal decayed
@@ -434,6 +442,9 @@ def _select_and_weight(
     use_vol_buckets: bool = False,
     max_selection_pool: int = 1500,
     force_mega_caps: bool = False,
+    prev_holdings:   Optional[List[str]] = None,
+    min_holding_overlap: float = 0.5,
+    signal_filter_pct:   float = 0.20,
 ) -> pd.Series:
     """
     Full selection pipeline for a single rebalance date:
@@ -451,16 +462,18 @@ def _select_and_weight(
     if len(scores) < n_positions * 2:
         return pd.Series(0.0, index=signal.columns)
 
-    # ── Pre-filter 1: Momentum ───────────────────────────────────────────
-    if momentum_filter is not None and date in momentum_filter.index:
-        mom = momentum_filter.loc[date].reindex(scores.index)
-        # Use percentile rank > 0.40 (top 60%) instead of raw return > 0.
-        # Raw return > 0 lets through stocks with +0.001% momentum (no filter).
-        mom_rank = mom.rank(pct=True)
-        positive_mom = mom_rank[mom_rank > 0.40].index
-        if len(positive_mom) >= n_positions * 3:
-            scores = scores.loc[positive_mom]
-    stage_counts["post_momentum"] = len(scores)
+    # ── Pre-filter 1: Signal-level filter (replaces momentum double-dip) ──
+    # Fix 3: The old momentum filter (top-60% by momentum rank) killed
+    # non-momentum alpha because the signal already contains 30% momentum
+    # via the ML blend. Instead, filter by the COMPOSITE signal score:
+    # keep top 80% (drop only the bottom 20% of signal scores). This
+    # naturally favors momentum without hard-killing value/reversal picks.
+    if signal_filter_pct > 0:
+        signal_rank = scores.rank(pct=True)
+        positive_signal = signal_rank[signal_rank > signal_filter_pct].index
+        if len(positive_signal) >= n_positions * 3:
+            scores = scores.loc[positive_signal]
+    stage_counts["post_signal_filter"] = len(scores)
 
     # ── Pre-filter 2: Quality (soft) ─────────────────────────────────────
     # Require above 15th percentile (very soft — only excludes the worst junk).
@@ -552,6 +565,33 @@ def _select_and_weight(
     else:
         selected = candidates[:n_positions]
     stage_counts["post_correlation"] = len(selected)
+
+    # ── Fix 2: Minimum holding overlap (turnover constraint) ────────────
+    # Ensure at least min_holding_overlap fraction of positions carry over
+    # from the prior month. This cuts monthly turnover from ~90% to ~50%,
+    # halving transaction costs from ~22%/yr to ~11%/yr.
+    if prev_holdings is not None and min_holding_overlap > 0 and len(selected) >= n_positions:
+        min_keep = int(n_positions * min_holding_overlap)
+        # Among prev holdings still in the post-filter universe, keep top by signal
+        prev_in_selected = [t for t in prev_holdings if t in scores.index]
+        if len(prev_in_selected) > 0:
+            prev_scores = scores.reindex(prev_in_selected).dropna()
+            keepers = prev_scores.nlargest(min(min_keep, len(prev_scores))).index.tolist()
+            # Fill remaining slots from new candidates (excluding keepers)
+            new_slots = n_positions - len(keepers)
+            if new_slots > 0:
+                # Prioritize candidates from the correlation-filtered selected list
+                new_from_selected = [t for t in selected if t not in keepers]
+                new_picks = new_from_selected[:new_slots]
+                # If still short, grab from broader scores pool
+                if len(new_picks) < new_slots:
+                    remaining = scores.drop(keepers + new_picks, errors='ignore')
+                    extra = remaining.nlargest(new_slots - len(new_picks)).index.tolist()
+                    new_picks.extend(extra)
+                selected = keepers + new_picks
+            else:
+                selected = keepers[:n_positions]
+    stage_counts["post_overlap"] = len(selected)
 
     # Diagnostic: if selection fell short of the target, log the funnel.
     if len(selected) < n_positions:

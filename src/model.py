@@ -758,6 +758,7 @@ def build_labels(
     beta_neutral: bool = False,
     market_returns: Optional[pd.Series] = None,
     forward_windows: Optional[List[int]] = None,
+    investable_mask: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
     """
     Build 6-grade relevance labels for LambdaRank.
@@ -800,6 +801,17 @@ def build_labels(
         r.iloc[-win:] = np.nan
         return r
 
+    # ── Fix 1 (ML path): Mask non-investable tickers before label ranking ──
+    # The ML model trains on ALL tickers' features (more data helps), but
+    # labels should rank WITHIN the investable set so the model learns which
+    # stocks are best among tradeable names. Without this, the model learns
+    # to predict micro-cap rankings that can never be traded.
+    _inv_mask = None
+    if investable_mask is not None:
+        _inv_mask = investable_mask.reindex(
+            index=returns.index, columns=returns.columns
+        ).fillna(False)
+
     # ── Multi-horizon rank averaging (item 7) ──────────────────────────────
     if forward_windows is not None and len(forward_windows) > 0:
         rank_stack = []
@@ -817,6 +829,9 @@ def build_labels(
                     fr = fr.sub(beta_df.mul(mkt_fwd, axis=0), fill_value=0)
                 except Exception:
                     pass
+            # Mask non-investable before ranking so labels rank within tradeable set
+            if _inv_mask is not None:
+                fr = fr.where(_inv_mask)
             rank_stack.append(fr.rank(axis=1, pct=True))
         fwd_signal = sum(rank_stack) / len(rank_stack)
         # fwd_signal is already a rank in [0,1] — skip additional rank below
@@ -849,7 +864,7 @@ def build_labels(
 
     fwd_return = _fwd_ret(forward_window)
 
-    # ── Beta-neutral labels (item 6) ────────────────────────────────────────
+    # ── Beta-neutral labels (item 6) ───────────────────────────────────────
     if beta_neutral and market_returns is not None:
         try:
             mkt_fwd = market_returns.reindex(returns.index).shift(-forward_window).rolling(forward_window).sum()
@@ -867,6 +882,10 @@ def build_labels(
         fwd_signal = fwd_return / trailing_vol.replace(0, np.nan)
     else:
         fwd_signal = fwd_return
+
+    # Mask non-investable tickers before ranking (Fix 1, single-horizon path)
+    if _inv_mask is not None:
+        fwd_signal = fwd_signal.where(_inv_mask)
 
     # Within-industry ranking: rank each stock vs its sector peers.
     # This forces the model to learn stock selection, not sector bets.
