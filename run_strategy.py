@@ -59,6 +59,12 @@ from api_data        import load_all_api_data
 
 
 def parse_args():
+    # Speed-optimized defaults (Tier 9):
+    # retrain_freq=63 (quarterly, per Gu-Kelly-Xiu 2020)
+    # num_leaves=20 (shallow, per Israel-Kelly-Moskowitz 2020)
+    # n_estimators=300 (early stopping catches most windows before 300)
+    # max_depth=5 (consistent with num_leaves=20)
+    # adversarial_validation=False (AUC=1.0 on temporal splits is uninformative)
     p = argparse.ArgumentParser(description="Personal Trading Portfolio")
     p.add_argument("--start",           default="2013-01-01")
     p.add_argument("--end",             default="2026-03-01")
@@ -82,9 +88,9 @@ def parse_args():
     p.add_argument("--forward-window",  default=5, type=int,
                    help="Forward return window for ML labels (default 5 = weekly; "
                         "aligns with where alpha decays to — 21d IC is negative, 5d IC_IR=0.062)")
-    p.add_argument("--retrain-freq", default=21, type=int,
-                   help="ML retraining frequency in trading days (default 21 = monthly; "
-                        "applies to BOTH Optuna search and final fit for consistency)")
+    p.add_argument("--retrain-freq", default=63, type=int,
+                   help="ML retraining frequency in trading days (default 63 = quarterly, "
+                        "per Gu-Kelly-Xiu 2020; applies to BOTH Optuna search and final fit)")
     p.add_argument("--min-train-days", default=252, type=int,
                    help="Minimum training window for walk-forward (default 252 = 1 year)")
     p.add_argument("--risk-adjust-labels", action="store_true",
@@ -135,6 +141,25 @@ def parse_args():
     p.add_argument("--optuna-warm-start", action=argparse.BooleanOptionalAction, default=True,
                    help="Warm-start Optuna from prior best trials in "
                         "data/cache/optuna_best_params.pkl (default ON)")
+
+    # ── Tier 9: Speed / LGBM tree-structure flags ─────────────────────────
+    p.add_argument("--num-leaves", default=20, type=int,
+                   help="LightGBM num_leaves (default 20, shallow per Israel-Kelly-Moskowitz 2020)")
+    p.add_argument("--n-estimators", default=300, type=int,
+                   help="LightGBM n_estimators (default 300; early stopping catches most windows)")
+    p.add_argument("--max-depth", default=5, type=int,
+                   help="LightGBM max_depth (default 5, consistent with num_leaves=20)")
+    p.add_argument("--warm-start-lgbm", action="store_true",
+                   help="Enable LGBM warm-starting from prior walk-forward window "
+                        "(3-5x faster per window)")
+    p.add_argument("--adversarial-validation", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Run adversarial validation diagnostic (default OFF — AUC=1.0 on "
+                        "temporal walk-forward splits is uninformative; saves ~25 min)")
+    p.add_argument("--interaction-constraints", default="none",
+                   choices=["none", "auto"],
+                   help="Feature interaction constraints for LGBM: 'auto' groups by feature "
+                        "family (Israel-Kelly-Moskowitz 2020)")
 
     # ── Tier 1-7: Label / ML objective flags ─────────────────────────────
     p.add_argument("--forward-windows", default=None,
@@ -584,7 +609,12 @@ def run(args):
             forward_window=args.forward_window,
             risk_adjust=args.risk_adjust_labels,
             sector_rank_weight=args.sector_rank_weight,
-            num_leaves=31,
+            num_leaves=args.num_leaves,
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            warm_start_lgbm=args.warm_start_lgbm,
+            run_adversarial_validation=args.adversarial_validation,
+            interaction_constraints=args.interaction_constraints if args.interaction_constraints != "none" else None,
             learning_rate=0.05,
             lgbm_weight=0.60,
             ridge_weight=0.40,
