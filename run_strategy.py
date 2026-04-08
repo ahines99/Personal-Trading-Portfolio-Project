@@ -584,7 +584,6 @@ def run(args):
             forward_window=args.forward_window,
             risk_adjust=args.risk_adjust_labels,
             sector_rank_weight=args.sector_rank_weight,
-            beta_neutral=args.beta_neutral_labels,
             num_leaves=31,
             learning_rate=0.05,
             lgbm_weight=0.60,
