@@ -60,6 +60,9 @@ from api_data        import load_all_api_data
 
 
 def parse_args():
+    # Baseline (2026-04-07): CAGR 12.43%, Sharpe 0.534, Max DD -52.86%, Turnover 967%
+    # Target: CAGR 12-15%, Sharpe 0.7+, Max DD <-30%, Turnover <200%
+
     # Speed-optimized defaults (Tier 9):
     # retrain_freq=63 (quarterly, per Gu-Kelly-Xiu 2020)
     # num_leaves=20 (shallow, per Israel-Kelly-Moskowitz 2020)
@@ -241,6 +244,24 @@ def parse_args():
     p.add_argument("--ml-blend", default=0.70, type=float,
                    help="ML weight in final signal blend; momentum weight = "
                         "1 - ml_blend (default 0.70 = 70%% ML / 30%% momentum)")
+
+    # ── Portfolio quality / risk filters (Tier 10: baseline diagnosis fixes) ──
+    p.add_argument("--min-adv-for-selection", default=5_000_000, type=float,
+                   help="Minimum 21d ADV ($) for stock selection. $5M ≈ $1B market cap. "
+                        "Eliminates micro-cap lottery tickets (AUMN, OMEX, PGEN).")
+    p.add_argument("--max-stock-vol", default=0.60, type=float,
+                   help="Maximum annualized 63d vol for stock selection (0.60 = 60%%). "
+                        "Kills high-vol speculative names that drove -52%% max DD.")
+    p.add_argument("--quality-percentile", default=0.50, type=float,
+                   help="Minimum quality (ROE/profitability) percentile for selection. "
+                        "0.50 = require top-50%% quality. Fixes RMW -0.35 anti-profitability "
+                        "loading from baseline.")
+    p.add_argument("--min-holding-overlap", default=0.70, type=float,
+                   help="Minimum fraction of positions retained between rebalances. "
+                        "0.70 = keep 15/21 positions. Reduces turnover from 967%% to ~300%%.")
+    p.add_argument("--mid-month-refresh", action="store_true",
+                   help="Enable mid-month position swap (adds ~170%% turnover for marginal "
+                        "signal improvement). OFF by default.")
 
     return p.parse_args()
 
@@ -745,6 +766,9 @@ def run(args):
               f"is not in the price/signal panel. SPY core allocation will be SKIPPED. "
               f"Add SPY to the universe (e.g. via load_prices) to enable this feature.")
 
+    # 63-day realized vol for stock-level vol filter (Tier 10)
+    rvol_63d = returns.rolling(63, min_periods=21).std() * np.sqrt(252)
+
     print("[4/6] Building monthly portfolio...")
     weights, rebalance_dates = build_monthly_portfolio(
         signal          = final_signal,
@@ -771,6 +795,13 @@ def run(args):
         force_mega_caps = args.force_mega_caps,
         signal_smooth_halflife = args.signal_smooth_halflife,
         apply_rank_normal = args.apply_rank_normal,
+        min_holding_overlap = args.min_holding_overlap,
+        mid_month_refresh = args.mid_month_refresh,
+        min_adv_for_selection = args.min_adv_for_selection,
+        max_stock_vol   = args.max_stock_vol,
+        quality_percentile = args.quality_percentile,
+        rvol            = rvol_63d,
+        quality_signal  = quality_signal,
     )
 
     # ── Volatility targeting overlay (ENABLED by default) ─────────────

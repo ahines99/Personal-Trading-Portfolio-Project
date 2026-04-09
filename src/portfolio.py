@@ -234,8 +234,13 @@ def build_monthly_portfolio(
     apply_rank_normal: bool = True,
     neutralize_factors: Optional[List[str]] = None,
     factor_panel:     Optional[Dict[str, pd.DataFrame]] = None,
-    min_holding_overlap: float = 0.5,
+    min_holding_overlap: float = 0.7,           # Fix 2: was 0.5 — forces 15/21 positions to carry over, ~6 new names/month
     signal_filter_pct:   float = 0.20,
+    mid_month_refresh:   bool  = False,         # Fix 1: was always-on — adds ~170% turnover for marginal signal improvement
+    min_adv_for_selection: float = 5_000_000,   # Fix 3: $5M ADV floor (~$1B mkt cap) — kills micro-cap noise
+    max_stock_vol:    float = 0.60,             # Fix 4: 60% annualized vol cap — excludes lottery tickets
+    quality_percentile: float = 0.50,           # Fix 5: was 0.15 — require top-50% quality to fix RMW -0.35
+    rvol:             Optional[pd.DataFrame] = None,  # Fix 4: realized vol DataFrame for per-stock vol filter
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """
     Build a long-only concentrated portfolio with monthly rebalancing.
@@ -341,6 +346,10 @@ def build_monthly_portfolio(
                 prev_holdings=prev_holdings,
                 min_holding_overlap=min_holding_overlap,
                 signal_filter_pct=signal_filter_pct,
+                min_adv_for_selection=min_adv_for_selection,
+                max_stock_vol=max_stock_vol,
+                quality_percentile=quality_percentile,
+                rvol=rvol,
             )
 
             if cash_frac > 0:
@@ -362,7 +371,11 @@ def build_monthly_portfolio(
         # ── Mid-month signal refresh ─────────────────────────────────────
         # On ~15th of each month, check if any held stock's signal decayed
         # badly. Swap at most 3 positions with much higher-ranked replacements.
-        elif date.day >= 14 and date.day <= 16 and current_weights.sum() > 0.1:
+        # Fix 1: Disabled by default (mid_month_refresh=False). This added
+        # ~170% annual turnover for marginal signal improvement. Baseline
+        # diagnosis showed 967% total turnover; this is the single largest
+        # contributor after the overlap constraint.
+        elif mid_month_refresh and date.day >= 14 and date.day <= 16 and current_weights.sum() > 0.1:
             held = current_weights[current_weights > 0.005].index.tolist()
             if len(held) > 0 and date in signal.index:
                 day_scores = signal.loc[date].dropna()
@@ -443,8 +456,12 @@ def _select_and_weight(
     max_selection_pool: int = 1500,
     force_mega_caps: bool = False,
     prev_holdings:   Optional[List[str]] = None,
-    min_holding_overlap: float = 0.5,
+    min_holding_overlap: float = 0.7,
     signal_filter_pct:   float = 0.20,
+    min_adv_for_selection: float = 5_000_000,   # Fix 3: minimum ADV filter
+    max_stock_vol:   float = 0.60,              # Fix 4: max annualized vol per stock
+    quality_percentile: float = 0.50,           # Fix 5: quality percentile threshold
+    rvol:            Optional[pd.DataFrame] = None,  # Fix 4: realized vol for vol filter
 ) -> pd.Series:
     """
     Full selection pipeline for a single rebalance date:
@@ -475,12 +492,15 @@ def _select_and_weight(
             scores = scores.loc[positive_signal]
     stage_counts["post_signal_filter"] = len(scores)
 
-    # ── Pre-filter 2: Quality (soft) ─────────────────────────────────────
-    # Require above 15th percentile (very soft — only excludes the worst junk).
-    # This still allows growth stocks without earnings but removes the bottom trash.
+    # ── Pre-filter 2: Quality filter (Fix 5) ──────────────────────────────
+    # Baseline diagnosis: RMW loading = -0.35 (anti-profitability). The old
+    # 15th percentile threshold was too soft — it only excluded the worst
+    # junk. Raising to 50th percentile (quality_percentile=0.50) requires
+    # stocks to be in the top half of quality (ROE, gross profitability),
+    # directly addressing the negative Fama-French profitability exposure.
     if quality_filter is not None and date in quality_filter.index:
         qual = quality_filter.loc[date].reindex(scores.index)
-        passing = qual[qual > 0.15].index
+        passing = qual[qual > quality_percentile].index
         if len(passing) >= n_positions * 3:
             scores = scores.loc[passing]
     stage_counts["post_quality"] = len(scores)
@@ -523,6 +543,31 @@ def _select_and_weight(
             if len(pooled) >= n_positions * 2:
                 scores = pooled
     stage_counts["post_liquidity"] = len(scores)
+
+    # ── Pre-filter 6: Minimum ADV for selection (Fix 3) ─────────────────
+    # Baseline diagnosis: micro-cap names with < $5M ADV add noise and
+    # transaction cost. ADV correlates strongly with market cap;
+    # $5M ADV ≈ $1B market cap. This kills the small-cap tilt that
+    # contributed to SPY underperformance and excessive drawdown.
+    if min_adv_for_selection > 0 and adv is not None and date in adv.index:
+        adv_today = adv.loc[date].reindex(scores.index).dropna()
+        above_min = adv_today[adv_today >= min_adv_for_selection].index
+        filtered = scores.reindex(above_min).dropna()
+        if len(filtered) >= n_positions * 2:
+            scores = filtered
+    stage_counts["post_adv_floor"] = len(scores)
+
+    # ── Pre-filter 7: Maximum single-stock volatility (Fix 4) ───────────
+    # Baseline diagnosis: -52.86% drawdown driven by lottery-ticket high-vol
+    # names. Exclude stocks with > 60% annualized vol (trailing 63d).
+    # This directly reduces portfolio tail risk and drawdown severity.
+    if max_stock_vol > 0 and rvol is not None and date in rvol.index:
+        rvol_today = rvol.loc[date].reindex(scores.index).dropna()
+        below_max = rvol_today[rvol_today <= max_stock_vol].index
+        filtered = scores.reindex(below_max).dropna()
+        if len(filtered) >= n_positions * 2:
+            scores = filtered
+    stage_counts["post_vol_cap"] = len(scores)
 
     # ── Step 1: Candidate pool (optionally vol-bucket-neutral) ───────────
     # Vol buckets force balanced picks across volatility terciles, which

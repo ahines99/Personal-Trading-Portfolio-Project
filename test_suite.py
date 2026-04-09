@@ -359,6 +359,8 @@ def run_single_test(test_name, data, signal, portfolio_kwargs, spy_series,
 def get_baseline_portfolio_kwargs(data):
     """Default portfolio parameters."""
     quality_signal = data["alt_features_dict"].get("roe_signal") if data["alt_features_dict"] else None
+    # 63-day realized vol for stock-level vol filter (Tier 10)
+    rvol_63d = data["returns"].rolling(63, min_periods=21).std() * np.sqrt(252)
     return {
         "n_positions": 20,
         "weighting": "signal",
@@ -374,6 +376,14 @@ def get_baseline_portfolio_kwargs(data):
         "adv": data["adv_30d"],
         "cash_in_bear": 0.15,
         "quality_filter": quality_signal,
+        # Tier 10: baseline diagnosis fixes
+        "min_holding_overlap": 0.70,
+        "mid_month_refresh": False,
+        "min_adv_for_selection": 5_000_000,
+        "max_stock_vol": 0.60,
+        "quality_percentile": 0.50,
+        "rvol": rvol_63d,
+        "quality_signal": quality_signal,
     }
 
 
