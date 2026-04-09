@@ -1451,7 +1451,7 @@ def build_alt_features(
     def _merge(d: dict):
         for k, v in d.items():
             if v is not None and not v.empty:
-                all_signals[k] = v.reindex(index=date_index, columns=tickers, method="ffill")
+                all_signals[k] = v.reindex(index=date_index, columns=tickers, method="ffill").astype(np.float32)
 
     _merge(build_fundamental_signals(
         edgar_df, tickers, date_index, sector_map=sector_map, close=close,

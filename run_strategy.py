@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
@@ -526,6 +527,15 @@ def run(args):
                 alt_features_dict = {}
             alt_features_dict.update(api_features)
             print(f"      Total features (free + paid): {len(alt_features_dict)}")
+
+    # Free raw alt-data DataFrames no longer needed (signals already built).
+    # Keeps alt_features_dict (the signal panels) but drops the heavy source data.
+    if not args.skip_alt_data:
+        del edgar_df, fred_df, vix_df, si_df
+        del earnings_dict, insider_dict, analyst_dict, estimates_df, inst_df
+        del dxy_df_, breakeven_df_, vvix_df_, oil_df_, copper_gold_df_
+        del cross_asset_df_, ig_oas_df_, sector_oas_df_, ebp_df_, treasury_df_
+        gc.collect()
 
     # ------------------------------------------------------------------
     # PHASE 2 — Feature Engineering + ML

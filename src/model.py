@@ -245,78 +245,82 @@ def build_feature_matrix(
         sector_neutralize as _sector_neutralize_fn,
     )
 
+    def _f32(df):
+        """Cast to float32 to halve memory. LGBM/XGB use float32 internally."""
+        return df.astype(np.float32) if isinstance(df, (pd.DataFrame, pd.Series)) else df
+
     features = {}
 
     # Momentum — short, medium, long horizon
     for w in [5, 10, 21, 63, 126]:
-        features[f"mom_{w}d"] = momentum(close, w)
+        features[f"mom_{w}d"] = _f32(momentum(close, w))
 
     # Classic Jegadeesh-Titman 12-1 momentum: skip most-recent month (21d)
     # to avoid short-term reversal, measure return over the prior 11 months
     # (252 - 21 = 231 trading days). Well-documented anomaly (JT 1993,
     # Carhart 1997, Fama-French 2012). Kept alongside mom_63d/mom_126d.
-    features["mom_12_1"] = close.shift(21).pct_change(252 - 21)
+    features["mom_12_1"] = _f32(close.shift(21).pct_change(252 - 21))
 
     # Momentum quality
-    features["price_accel_21d"]  = price_acceleration(close, window=21)
-    features["residual_mom_21d"] = residual_momentum(returns, window=21)
-    features["efficiency_21d"]   = efficiency_ratio(close, window=21)
+    features["price_accel_21d"]  = _f32(price_acceleration(close, window=21))
+    features["residual_mom_21d"] = _f32(residual_momentum(returns, window=21))
+    features["efficiency_21d"]   = _f32(efficiency_ratio(close, window=21))
 
     # Mean reversion
-    features["zscore_rev_20d"]   = zscore_reversion(close, window=20)
-    features["rsi_14d"]          = rsi(close, window=14)
-    features["bollinger_pct_b"]  = bollinger_pct_b(close)
-    features["ma50_distance"]    = ma_distance(close, window=50)
-    features["ma200_distance"]   = ma_distance(close, window=200)
+    features["zscore_rev_20d"]   = _f32(zscore_reversion(close, window=20))
+    features["rsi_14d"]          = _f32(rsi(close, window=14))
+    features["bollinger_pct_b"]  = _f32(bollinger_pct_b(close))
+    features["ma50_distance"]    = _f32(ma_distance(close, window=50))
+    features["ma200_distance"]   = _f32(ma_distance(close, window=200))
 
     # Trend / price structure
-    features["price_52w_high"]   = price_to_52w_high(close)
-    features["macd_hist"]        = macd_signal(close)
+    features["price_52w_high"]   = _f32(price_to_52w_high(close))
+    features["macd_hist"]        = _f32(macd_signal(close))
 
     # Lottery / tail risk
-    features["max_ret_21d"]      = max_return(close, window=21)
-    features["tail_risk_5pct"]   = tail_risk(returns, window=21, pct=0.05)
+    features["max_ret_21d"]      = _f32(max_return(close, window=21))
+    features["tail_risk_5pct"]   = _f32(tail_risk(returns, window=21, pct=0.05))
 
     # Volatility
     for w in [10, 21, 63]:
-        features[f"rvol_{w}d"]   = realized_volatility(returns, window=w)
-    features["vol_regime"]       = volatility_regime(returns, short=10, long=60)
-    features["idiovol_21d"]      = idiosyncratic_volatility(returns, window=21)
-    features["vol_of_vol"]       = vol_of_vol(returns)
+        features[f"rvol_{w}d"]   = _f32(realized_volatility(returns, window=w))
+    features["vol_regime"]       = _f32(volatility_regime(returns, short=10, long=60))
+    features["idiovol_21d"]      = _f32(idiosyncratic_volatility(returns, window=21))
+    features["vol_of_vol"]       = _f32(vol_of_vol(returns))
 
     # Beta / factor exposure
-    features["mkt_beta_63d"]     = market_beta(returns, window=63)
+    features["mkt_beta_63d"]     = _f32(market_beta(returns, window=63))
 
     # Liquidity
-    features["amihud_21d"]       = amihud_illiquidity(returns, volume, close, window=21)
+    features["amihud_21d"]       = _f32(amihud_illiquidity(returns, volume, close, window=21))
 
     # Volume
-    features["vol_spike_20d"]    = volume_spike(volume, window=20)
-    features["vpt_20d"]          = volume_price_trend(close, volume, window=20)
-    features["obv_zscore"]       = obv_signal(returns, volume)
-    features["vol_trend_21d"]    = volume_trend(volume, window=21)
+    features["vol_spike_20d"]    = _f32(volume_spike(volume, window=20))
+    features["vpt_20d"]          = _f32(volume_price_trend(close, volume, window=20))
+    features["obv_zscore"]       = _f32(obv_signal(returns, volume))
+    features["vol_trend_21d"]    = _f32(volume_trend(volume, window=21))
 
     # Ranked versions of all 20 composite signals
     for name, sig in ranked_signals.items():
-        features[f"rank_{name}"] = sig
+        features[f"rank_{name}"] = _f32(sig)
 
     # Cross-sectional rank of low volatility
-    features["rank_rvol_21d"] = cross_sectional_rank(-features["rvol_21d"])
+    features["rank_rvol_21d"] = _f32(cross_sectional_rank(-features["rvol_21d"]))
 
     # ── New reversal signals ─────────────────────────────────────────────────
     # 1-day and 2-day explicit reversal (Jegadeesh 1990) — orthogonal to
     # the 5-21d short_momentum feature already in ranked_signals.
-    features["ret_reversal_1d"] = short_term_reversal(returns, window=1)
-    features["ret_reversal_2d"] = short_term_reversal(returns, window=2)
+    features["ret_reversal_1d"] = _f32(short_term_reversal(returns, window=1))
+    features["ret_reversal_2d"] = _f32(short_term_reversal(returns, window=2))
     # Volume-confirmed reversal: stronger reversal signal when drop was on high volume
-    features["vol_reversal"]    = volume_confirmed_reversal(returns, volume)
+    features["vol_reversal"]    = _f32(volume_confirmed_reversal(returns, volume))
 
     # Sector-relative momentum — only when sector_map is available
     if sector_map is not None:
-        features["sector_rel_mom_63d"] = sector_relative_momentum(returns, sector_map, window=63)
+        features["sector_rel_mom_63d"] = _f32(sector_relative_momentum(returns, sector_map, window=63))
 
     # Hurst exponent (trending vs mean-reverting)
-    features["hurst_63d"] = hurst_exponent(close, window=63)
+    features["hurst_63d"] = _f32(hurst_exponent(close, window=63))
 
     # ── Tier 6: Higher-moment / co-moment / tail signals ────────────────────
     # Realized skew, co-skew, semi-beta decomposition, tail dependence,
@@ -337,9 +341,9 @@ def build_feature_matrix(
         market_returns = returns.mean(axis=1)
 
         try:
-            features["realized_skew_21"] = -realized_skewness(returns, window=21)
-            features["realized_skew_63"] = -realized_skewness(returns, window=63)
-            features["co_skew_252"] = -co_skewness(returns, market_returns, window=252)
+            features["realized_skew_21"] = _f32(-realized_skewness(returns, window=21))
+            features["realized_skew_63"] = _f32(-realized_skewness(returns, window=63))
+            features["co_skew_252"] = _f32(-co_skewness(returns, market_returns, window=252))
             sb_N, sb_P, sb_Mplus, sb_Mminus = semi_beta_decomposition(
                 returns, market_returns, window=252
             )
@@ -350,25 +354,25 @@ def build_feature_matrix(
             #   beta^M- (mixed: r_i<0, r_m>0)                   → NEGATIVE premium → negate
             # Negating aligns each signal so that higher score = higher expected return,
             # consistent with other Tier-6 signals.
-            features["semi_beta_N"] = sb_N
-            features["semi_beta_P"] = -sb_P
-            features["semi_beta_Mplus"] = -sb_Mplus
-            features["semi_beta_Mminus"] = -sb_Mminus
-            features["tail_dep_lower"] = tail_dependence(
+            features["semi_beta_N"] = _f32(sb_N)
+            features["semi_beta_P"] = _f32(-sb_P)
+            features["semi_beta_Mplus"] = _f32(-sb_Mplus)
+            features["semi_beta_Mminus"] = _f32(-sb_Mminus)
+            features["tail_dep_lower"] = _f32(tail_dependence(
                 returns, market_returns, window=252, q=0.1
-            )
-            features["signed_jump_21"] = -signed_jump_intensity(
+            ))
+            features["signed_jump_21"] = _f32(-signed_jump_intensity(
                 returns, window=21, threshold=4.0
-            )
-            features["down_up_vol_ratio_63"] = downside_upside_vol_ratio(
+            ))
+            features["down_up_vol_ratio_63"] = _f32(downside_upside_vol_ratio(
                 returns, window=63
-            )
-            features["downside_beta_spread_252"] = downside_beta_spread(
+            ))
+            features["downside_beta_spread_252"] = _f32(downside_beta_spread(
                 returns, market_returns, window=252
-            )
-            features["kumar_lottery_21"] = kumar_lottery_composite(
+            ))
+            features["kumar_lottery_21"] = _f32(kumar_lottery_composite(
                 close, returns, window=21
-            )
+            ))
             print("      [tier6] added 11 higher-moment signals")
         except Exception as _e:
             warnings.warn(f"higher-moment signal computation failed: {_e}")
@@ -410,10 +414,10 @@ def build_feature_matrix(
                     columns=close.columns,
                 )
 
-            features["breadth_pct_200ma"] = _broadcast_breadth(bp)
-            features["breadth_nh_nl"] = _broadcast_breadth(nhnl)
-            features["breadth_adv_dec"] = _broadcast_breadth(adr)
-            features["breadth_composite_z"] = _broadcast_breadth(bz)
+            features["breadth_pct_200ma"] = _f32(_broadcast_breadth(bp))
+            features["breadth_nh_nl"] = _f32(_broadcast_breadth(nhnl))
+            features["breadth_adv_dec"] = _f32(_broadcast_breadth(adr))
+            features["breadth_composite_z"] = _f32(_broadcast_breadth(bz))
             print("      [tier6] added 4 breadth signals")
         except Exception as _e:
             warnings.warn(f"breadth signal computation failed: {_e}")
@@ -422,7 +426,7 @@ def build_feature_matrix(
         try:
             wbe = wavelet_band_energy(returns, window=256)
             for band_name, band_df in wbe.items():
-                features[f"wavelet_band_{band_name}"] = band_df
+                features[f"wavelet_band_{band_name}"] = _f32(band_df)
             print(f"      [tier6] added {len(wbe)} wavelet band-energy signals")
         except Exception as _e:
             warnings.warn(f"wavelet band energy failed: {_e}")
@@ -437,14 +441,14 @@ def build_feature_matrix(
 
     for raw_feat in ["rvol_21d", "idiovol_21d", "amihud_21d", "mkt_beta_63d"]:
         if raw_feat in features:
-            features[f"z_{raw_feat}"] = _cs_zscore(features[raw_feat])
+            features[f"z_{raw_feat}"] = _f32(_cs_zscore(features[raw_feat]))
     for mom_w in [63, 126]:
         key = f"mom_{mom_w}d"
         if key in features:
-            features[f"z_{key}"] = _cs_zscore(features[key])
+            features[f"z_{key}"] = _f32(_cs_zscore(features[key]))
     # z-score for classic 12-1 momentum
     if "mom_12_1" in features:
-        features["z_mom_12_1"] = _cs_zscore(features["mom_12_1"])
+        features["z_mom_12_1"] = _f32(_cs_zscore(features["mom_12_1"]))
 
     # ── Size feature: log market cap (cross-sectionally z-scored) ────────────
     # Market cap = Close * SharesOutstanding (ffilled within each ticker,
@@ -471,12 +475,12 @@ def build_feature_matrix(
     # feature (log_liquidity_z) rather than labeling it log_mcap_z.
     _dollar_vol = (close * volume).rolling(21, min_periods=5).mean()
     _dollar_vol = _dollar_vol.where(_dollar_vol > 0)
-    log_liquidity_z = _cs_zscore(np.log(_dollar_vol))
+    log_liquidity_z = _f32(_cs_zscore(np.log(_dollar_vol)))
     features["log_liquidity_z"] = log_liquidity_z
 
     # Log price: weak size-ish proxy (price-level anomaly). Kept distinct
     # from market-cap so it does not contaminate `_sn` residuals.
-    log_price_z = _cs_zscore(np.log(close.where(close > 0)))
+    log_price_z = _f32(_cs_zscore(np.log(close.where(close > 0))))
     features["log_price_z"] = log_price_z
 
     if log_mcap_raw is None:
@@ -489,7 +493,7 @@ def build_feature_matrix(
             "size-neutralization uses log_liquidity_z proxy, no log_mcap_z feature emitted"
         )
     else:
-        log_mcap_z = _cs_zscore(log_mcap_raw)
+        log_mcap_z = _f32(_cs_zscore(log_mcap_raw))
         features["log_mcap_z"] = log_mcap_z
         print("      [size] log_mcap_z built from shares outstanding")
 
@@ -511,9 +515,9 @@ def build_feature_matrix(
             if feat_name not in features:
                 continue
             try:
-                features[f"{feat_name}_sn"] = _size_neutralize_fn(
+                features[f"{feat_name}_sn"] = _f32(_size_neutralize_fn(
                     features[feat_name], log_mcap_z
-                )
+                ))
                 _sn_added.append(feat_name)
             except Exception as _e:
                 warnings.warn(f"size_neutralize failed for {feat_name}: {_e}")
@@ -536,9 +540,9 @@ def build_feature_matrix(
             if feat_name not in features:
                 continue
             try:
-                features[f"{feat_name}_sni"] = _sector_neutralize_fn(
+                features[f"{feat_name}_sni"] = _f32(_sector_neutralize_fn(
                     features[feat_name], sector_map
-                )
+                ))
                 _sni_added.append(feat_name)
             except Exception as _e:
                 warnings.warn(f"sector_neutralize failed for {feat_name}: {_e}")
@@ -596,7 +600,7 @@ def build_feature_matrix(
             try:
                 aligned = df.reindex(index=close.index, columns=close.columns)
                 if aligned.notna().mean().mean() > 0.10:  # require >10% coverage
-                    features[f"alt_{feat_name}"] = aligned
+                    features[f"alt_{feat_name}"] = _f32(aligned)
             except Exception:
                 pass
 
@@ -628,7 +632,7 @@ def build_feature_matrix(
                 mu = interaction.mean(axis=1)
                 sigma = interaction.std(axis=1).replace(0, np.nan)
                 interaction_z = interaction.sub(mu, axis=0).div(sigma, axis=0).clip(-4, 4)
-                features[f"ix_{out_name}"] = interaction_z
+                features[f"ix_{out_name}"] = _f32(interaction_z)
             except Exception:
                 pass
 
@@ -648,7 +652,7 @@ def build_feature_matrix(
                 interaction = features[feat_a] * features[feat_b]
                 mu = interaction.mean(axis=1)
                 sigma = interaction.std(axis=1).replace(0, np.nan)
-                features[f"ix_{out_name}"] = interaction.sub(mu, axis=0).div(sigma, axis=0).clip(-4, 4)
+                features[f"ix_{out_name}"] = _f32(interaction.sub(mu, axis=0).div(sigma, axis=0).clip(-4, 4))
             except Exception:
                 pass
 
@@ -676,7 +680,7 @@ def build_feature_matrix(
                 loo_n = n_stocks - sect_returns[t].notna().astype(float).rolling(63, min_periods=21).sum()
                 sector_mom[t] = loo_sum / loo_n.replace(0, np.nan)
 
-        features["sector_momentum_63d"] = sector_mom
+        features["sector_momentum_63d"] = _f32(sector_mom)
 
     # ── Winsorize + cross-sectionally z-score continuous features ──────────
     # Apply to ALL continuous numeric features EXCEPT:
@@ -701,7 +705,7 @@ def build_feature_matrix(
     if winsorize:
         for name in _continuous_feats:
             try:
-                features[name] = _cs_winsorize(features[name], 0.01, 0.99)
+                features[name] = _f32(_cs_winsorize(features[name], 0.01, 0.99))
             except Exception:
                 pass
         print(f"      [winsor] winsorized {len(_continuous_feats)} continuous features at 1/99 pct")
@@ -723,7 +727,7 @@ def build_feature_matrix(
                 ):
                     _csz_skipped_broadcast += 1
                     continue
-                features[f"{name}_csz"] = _cs_zscore(feat_df)
+                features[f"{name}_csz"] = _f32(_cs_zscore(feat_df))
                 _csz_added += 1
             except Exception:
                 pass
@@ -732,24 +736,36 @@ def build_feature_matrix(
             f"(skipped {_csz_skipped_broadcast} zero-variance broadcast features)"
         )
 
-    panels = []
-    for feat_name, df in features.items():
-        s = df.stack(future_stack=True)
-        s.name = feat_name
-        panels.append(s)
+    # Pre-allocate float32 numpy array and fill column-by-column.
+    # This eliminates the .stack() intermediate (which created N_feats x
+    # N_samples-element Series) and the pd.concat copy. Saves ~50% peak RAM.
+    import gc
+    sample_df = next(iter(features.values()))
+    dates = sample_df.index
+    tickers = sample_df.columns
+    n_dates, n_tickers = len(dates), len(tickers)
+    n_samples = n_dates * n_tickers
+    feat_names = list(features.keys())
+    n_feats = len(feat_names)
 
-    # Opt 2: free intermediate feature dict (~16GB peak) before concat
+    panel_arr = np.empty((n_samples, n_feats), dtype=np.float32)
+    for i, name in enumerate(feat_names):
+        df = features.pop(name)  # pop frees memory immediately
+        panel_arr[:, i] = df.values.astype(np.float32).ravel(order='C')
+        del df
+
     del features
-    import gc; gc.collect()
+    gc.collect()
 
-    panel = pd.concat(panels, axis=1)
-    del panels; gc.collect()  # Opt 2: free stacked Series list too
-    panel.index.names = ["date", "ticker"]
+    # Build MultiIndex once (shared across all columns).
+    # from_product([dates, tickers]) iterates dates outer, tickers inner —
+    # this matches C-order ravel, identical to .stack(future_stack=True).
+    multi_idx = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+    panel = pd.DataFrame(panel_arr, index=multi_idx, columns=feat_names)
+    del panel_arr
+    gc.collect()
 
-    # Opt 1: cast to float32 — LightGBM/XGBoost internally bin to float32
-    # before split-finding (per LightGBM docs), so zero accuracy impact.
-    # Saves ~50% RAM on the feature panel.
-    panel = panel.astype(np.float32)
+    print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
 
     if use_cache:
         with open(_cache_file, "wb") as f:
@@ -1182,7 +1198,7 @@ class WalkForwardModel:
         # Rolling window: cap training data at N days instead of expanding.
         # None = expanding (use all history). 756 = ~3 years rolling.
         # Rolling drops stale regime data that confuses the model.
-        max_train_days: Optional[int] = None,
+        max_train_days: Optional[int] = 756,
         # Feature neutralization: regress out vol from all features before
         # training. Forces model to find orthogonal signal, not vol-sort.
         neutralize_vol: bool = False,
@@ -2429,6 +2445,9 @@ class WalkForwardModel:
             self.models_ = cached.get("models_", [])
             return cached["predictions"]
 
+        # Replace inf ONCE at the top instead of per-window (saves N_windows copies)
+        panel = panel.replace([np.inf, -np.inf], np.nan)
+
         self.feature_names_ = list(panel.columns)
         all_dates = panel.index.get_level_values("date").unique().sort_values()
         tickers   = panel.index.get_level_values("ticker").unique()
@@ -2453,14 +2472,16 @@ class WalkForwardModel:
             # Labels for dates in [cutoff - forward_window, cutoff) use returns
             # that haven't fully materialized yet, so we NaN them out.
             safe_label_end = max(0, i - self.forward_window)
-            train_dates = all_dates[:i]
+            start = max(0, i - self.max_train_days) if self.max_train_days else 0
+            train_dates = all_dates[start:i]
             gap_dates   = set(all_dates[safe_label_end:i])
 
             train_idx   = panel.index.get_level_values("date").isin(train_dates)
             # NaN passthrough: LGBM/XGB handle NaN natively; Ridge/MLP are
             # median-imputed inside _train_ensemble. Filling with 0 would
             # bias tree splits for momentum/amihud/etc (0 != missing).
-            X_train     = panel[train_idx].replace([np.inf, -np.inf], np.nan)
+            # inf already replaced once at the top of fit_predict.
+            X_train     = panel[train_idx]
             y_train     = labels.reindex(X_train.index).copy()
 
             # NaN out labels in the gap zone (forward returns not yet realized)
@@ -2511,7 +2532,7 @@ class WalkForwardModel:
                     try:
                         if len(pred_dates) > 0:
                             pred_idx = panel.index.get_level_values("date").isin(pred_dates)
-                            X_pred_chunk = panel[pred_idx].replace([np.inf, -np.inf], np.nan)
+                            X_pred_chunk = panel[pred_idx]
                             if len(X_pred_chunk) > 100:
                                 adv_auc = self.adversarial_validation(X_train, X_pred_chunk)
                                 if np.isfinite(adv_auc) and adv_auc > 0.75:
@@ -2531,7 +2552,7 @@ class WalkForwardModel:
             for pred_date in pred_dates:
                 if pred_date not in panel.index.get_level_values("date"):
                     continue
-                X_pred = panel.xs(pred_date, level="date").reindex(tickers).replace([np.inf, -np.inf], np.nan)
+                X_pred = panel.xs(pred_date, level="date").reindex(tickers)
                 scores, conf = self._predict_ensemble(X_pred, current_ensemble)
                 # Fix 1 (LOW-polish): center scores before confidence scaling so
                 # the subsequent cross-sectional rank (pct=True) actually reflects
