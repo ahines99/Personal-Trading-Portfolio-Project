@@ -852,7 +852,7 @@ def build_composite_signal(
             raw_signals[name] = raw_signals[name].where(mask_aligned)
 
     ranked_signals = {
-        name: cross_sectional_rank(sig)
+        name: cross_sectional_rank(sig).astype(np.float32)
         for name, sig in raw_signals.items()
         if name in weights  # only rank signals that have a weight
     }
@@ -1399,26 +1399,18 @@ def wavelet_band_energy(
             "spectral_entropy": empty.copy(),
         }
 
-    arr = returns.values.astype(np.float64)  # (n_rows, n_cols)
+    # Pre-allocate output arrays (float32 to save RAM)
+    result_names = [
+        "intra_week_energy", "weekly_energy", "monthly_energy",
+        "quarterly_energy", "dominant_frequency", "spectral_entropy",
+    ]
+    results = {
+        name: np.full((n_rows, n_cols), np.nan, dtype=np.float32)
+        for name in result_names
+    }
 
-    # Fill NaN with per-column expanding mean (causal, no lookahead)
-    col_means = np.nanmean(arr, axis=0, keepdims=True)
-    arr = np.where(np.isnan(arr), col_means, arr)
-
-    # Sliding window view: shape (n_windows, n_cols, window)
-    # sliding_window_view operates on axis=0, giving (n_windows, n_cols, window)
-    windows = sliding_window_view(arr, window, axis=0)  # (n_windows, n_cols, window)
-    n_windows = windows.shape[0]
-
-    # Demean each window (last axis is the window dimension)
-    windows = windows - np.mean(windows, axis=2, keepdims=True)
-
-    # Batch FFT: all windows × all tickers at once
-    fft_vals = np.fft.rfft(windows, axis=2)  # (n_windows, n_cols, n_bins)
-    power = np.abs(fft_vals) ** 2
-
-    # Precompute FFT frequencies and band masks (same for all windows)
-    freqs = np.fft.rfftfreq(window, d=1.0)  # cycles per day
+    # Precompute FFT frequencies and band masks (same for all chunks)
+    freqs = np.fft.rfftfreq(window, d=1.0).astype(np.float32)  # cycles per day
     with np.errstate(divide="ignore"):
         periods = np.where(freqs > 0, 1.0 / np.where(freqs > 0, freqs, 1.0), np.inf)
     mask_intra = (periods > 0) & (periods < 5)
@@ -1426,37 +1418,63 @@ def wavelet_band_energy(
     mask_monthly = (periods >= 21) & (periods < 63)
     mask_quarterly = (periods >= 63) & (periods <= window)
 
-    total = np.sum(power, axis=2, keepdims=True)  # (n_windows, n_cols, 1)
-    total_safe = np.where(total > 0, total, np.nan)
+    # Process in ticker-chunks to cap peak RAM (~1.4 GB per chunk instead of 30 GB)
+    chunk_size = 500
+    arr_full = returns.values  # keep original dtype, cast per-chunk
 
-    # Band energies (normalized): index into last axis with boolean mask
-    intra_e = np.sum(power[:, :, mask_intra], axis=2) / total_safe.squeeze(2)
-    weekly_e = np.sum(power[:, :, mask_weekly], axis=2) / total_safe.squeeze(2)
-    monthly_e = np.sum(power[:, :, mask_monthly], axis=2) / total_safe.squeeze(2)
-    quarterly_e = np.sum(power[:, :, mask_quarterly], axis=2) / total_safe.squeeze(2)
+    for start in range(0, n_cols, chunk_size):
+        end = min(start + chunk_size, n_cols)
+        chunk = arr_full[:, start:end].astype(np.float32)
 
-    # Dominant frequency (skip DC bin 0)
-    dom_bin = np.argmax(power[:, :, 1:], axis=2) + 1  # (n_windows, n_cols)
-    dominant_freq = freqs[dom_bin]
+        # Fill NaN with per-column mean (causal, no lookahead)
+        col_means = np.nanmean(chunk, axis=0, keepdims=True)
+        chunk = np.where(np.isnan(chunk), col_means, chunk)
 
-    # Spectral entropy
-    p_norm = power / total_safe
-    p_norm = np.where(p_norm > 0, p_norm, 1e-20)
-    entropy = -np.sum(p_norm * np.log(p_norm), axis=2)
+        # Sliding window view: (n_windows, chunk_cols, window)
+        windows = sliding_window_view(chunk, window, axis=0)
+        n_windows = windows.shape[0]
 
-    # Pad to original date index (first window-1 dates are NaN)
-    def _to_df(arr_2d):
-        full = np.full((n_rows, n_cols), np.nan, dtype=np.float64)
-        full[window - 1:] = arr_2d
-        return pd.DataFrame(full, index=idx, columns=cols)
+        # Demean each window
+        windows = windows - np.mean(windows, axis=2, keepdims=True)
+
+        # Batch FFT on this chunk only — complex64 since input is float32
+        fft_vals = np.fft.rfft(windows, axis=2)
+        power = np.abs(fft_vals) ** 2
+        del fft_vals, windows  # free immediately
+
+        total = np.sum(power, axis=2, keepdims=True)
+        total_safe = np.where(total > 0, total, np.nan)
+
+        # Band energies (normalized)
+        results["intra_week_energy"][window - 1:, start:end] = (
+            np.sum(power[:, :, mask_intra], axis=2) / total_safe.squeeze(2)
+        )
+        results["weekly_energy"][window - 1:, start:end] = (
+            np.sum(power[:, :, mask_weekly], axis=2) / total_safe.squeeze(2)
+        )
+        results["monthly_energy"][window - 1:, start:end] = (
+            np.sum(power[:, :, mask_monthly], axis=2) / total_safe.squeeze(2)
+        )
+        results["quarterly_energy"][window - 1:, start:end] = (
+            np.sum(power[:, :, mask_quarterly], axis=2) / total_safe.squeeze(2)
+        )
+
+        # Dominant frequency (skip DC bin 0)
+        dom_bin = np.argmax(power[:, :, 1:], axis=2) + 1
+        results["dominant_frequency"][window - 1:, start:end] = freqs[dom_bin]
+
+        # Spectral entropy
+        p_norm = power / total_safe
+        p_norm = np.where(p_norm > 0, p_norm, 1e-20)
+        results["spectral_entropy"][window - 1:, start:end] = (
+            -np.sum(p_norm * np.log(p_norm), axis=2)
+        )
+
+        del power, total, total_safe, p_norm  # free chunk memory
 
     return {
-        "intra_week_energy": _to_df(intra_e),
-        "weekly_energy": _to_df(weekly_e),
-        "monthly_energy": _to_df(monthly_e),
-        "quarterly_energy": _to_df(quarterly_e),
-        "dominant_frequency": _to_df(dominant_freq),
-        "spectral_entropy": _to_df(entropy),
+        name: pd.DataFrame(results[name], index=idx, columns=cols)
+        for name in result_names
     }
 
 

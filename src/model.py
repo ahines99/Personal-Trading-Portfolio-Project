@@ -111,8 +111,8 @@ def size_neutralize(
     lm = log_mcap_df.reindex(index=feature_df.index, columns=feature_df.columns)
     out = feature_df.copy()
 
-    x_arr = lm.to_numpy(dtype=float)
-    y_arr = feature_df.to_numpy(dtype=float)
+    x_arr = lm.to_numpy(dtype=np.float32)
+    y_arr = feature_df.to_numpy(dtype=np.float32)
     res = y_arr.copy()
 
     for i in range(y_arr.shape[0]):
