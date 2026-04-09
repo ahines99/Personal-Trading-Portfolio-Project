@@ -16,6 +16,12 @@ Categories (prefix → purpose):
     Z   — Training hygiene stacks (uniqueness/per-date weights, seed bagging)
     FA, FB, FG, FH — Feature ablation (size-neutralize, sector-neutralize,
           distress signals, macro cross-section)
+    QA  — Quality filter sweep (quality_percentile 0.15–0.50)
+    QB  — Max stock volatility sweep (max_stock_vol 0.40–1.0)
+    QC  — Min ADV floor sweep ($0–$10M)
+    QD  — Holding overlap / turnover sweep (0.50–0.80)
+    QE  — Combined sweet-spot candidates (6 Pareto configs)
+    QF  — SPY core overlay on best QE configs
 
 Usage:
     python test_suite.py              # full suite
@@ -56,7 +62,7 @@ RESULTS_FILE = Path("results/test_suite_results.csv")
 def load_shared_data(args):
     """Load all data once, return as dict."""
     print("Loading shared data...")
-    prices = load_prices(start=args.start, end=args.end)
+    prices = load_prices(start=args.start, end=args.end, universe_size=3000)
     close = get_close(prices)
     returns = get_returns(prices)
     volume = get_volume(prices)
@@ -626,6 +632,102 @@ def build_tests(data):
                   {"__panel_flags__": {},
                    "__alt_flags__": {"use_macro_cross_section": False}}, {}))
 
+    # ──────────────────────────────────────────────────────────────────────
+    # QA-series: Quality filter sweep (relax quality_percentile only)
+    # Hypothesis: Tier 10 set quality_percentile=0.50 too aggressively,
+    # killing return by eliminating stocks the model correctly likes.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QA1_quality15", {}, {"quality_percentile": 0.15}))   # near-baseline (very permissive)
+    tests.append(("QA2_quality25", {}, {"quality_percentile": 0.25}))   # moderate relaxation
+    tests.append(("QA3_quality35", {}, {"quality_percentile": 0.35}))   # mild relaxation
+    tests.append(("QA4_quality50", {}, {"quality_percentile": 0.50}))   # current Tier 10 default
+
+    # ──────────────────────────────────────────────────────────────────────
+    # QB-series: Max stock volatility filter sweep
+    # Hypothesis: max_stock_vol=0.60 removes high-conviction small/mid names.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QB1_vol100", {}, {"max_stock_vol": 1.0}))    # effectively disabled
+    tests.append(("QB2_vol80",  {}, {"max_stock_vol": 0.80}))   # mild filter
+    tests.append(("QB3_vol60",  {}, {"max_stock_vol": 0.60}))   # current Tier 10 default
+    tests.append(("QB4_vol40",  {}, {"max_stock_vol": 0.40}))   # more aggressive
+
+    # ──────────────────────────────────────────────────────────────────────
+    # QC-series: Minimum ADV floor sweep
+    # Hypothesis: $5M ADV floor kills small-cap alpha. $1-2M is sufficient
+    # to ensure tradability at $100K portfolio size.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QC1_adv0",    {}, {"min_adv_for_selection": 0}))           # disabled
+    tests.append(("QC2_adv1M",   {}, {"min_adv_for_selection": 1_000_000}))   # $1M
+    tests.append(("QC3_adv2M",   {}, {"min_adv_for_selection": 2_000_000}))   # $2M
+    tests.append(("QC4_adv5M",   {}, {"min_adv_for_selection": 5_000_000}))   # $5M (current)
+    tests.append(("QC5_adv10M",  {}, {"min_adv_for_selection": 10_000_000}))  # $10M (tighter)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # QD-series: Holding overlap / turnover control
+    # Hypothesis: overlap=0.70 may be too sticky (missing rebalance alpha)
+    # or not sticky enough (excess turnover). Sweep to find sweet spot.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QD1_overlap50", {}, {"min_holding_overlap": 0.50}))  # baseline-like
+    tests.append(("QD2_overlap60", {}, {"min_holding_overlap": 0.60}))
+    tests.append(("QD3_overlap70", {}, {"min_holding_overlap": 0.70}))  # current
+    tests.append(("QD4_overlap80", {}, {"min_holding_overlap": 0.80}))  # stickier
+
+    # ──────────────────────────────────────────────────────────────────────
+    # QE-series: Combined "sweet spot" candidates
+    # These blend the best-guess relaxations from QA-QD single-factor sweeps.
+    # Target: CAGR 10-15%, Sharpe 0.5-0.8, DD -25 to -35%, Turnover 150-400%.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QE1_light_touch", {}, {
+        "quality_percentile": 0.25, "max_stock_vol": 0.80,
+        "min_adv_for_selection": 2_000_000, "min_holding_overlap": 0.60,
+    }))  # Expect: CAGR ~10%, Sharpe ~0.45, DD ~-40%. Mild risk reduction.
+    tests.append(("QE2_moderate", {}, {
+        "quality_percentile": 0.35, "max_stock_vol": 0.80,
+        "min_adv_for_selection": 2_000_000, "min_holding_overlap": 0.70,
+    }))  # Expect: CAGR ~8%, Sharpe ~0.50, DD ~-35%. Best Sharpe candidate.
+    tests.append(("QE3_near_baseline_w_adv", {}, {
+        "quality_percentile": 0.25, "max_stock_vol": 1.0,
+        "min_adv_for_selection": 1_000_000, "min_holding_overlap": 0.50,
+    }))  # Expect: CAGR ~11%, Sharpe ~0.48, DD ~-48%. Near-baseline with tradability.
+    tests.append(("QE4_quality_focused", {}, {
+        "quality_percentile": 0.35, "max_stock_vol": 0.60,
+        "min_adv_for_selection": 5_000_000, "min_holding_overlap": 0.60,
+    }))  # Expect: CAGR ~6%, Sharpe ~0.35, DD ~-35%. Quality/risk heavy.
+    tests.append(("QE5_vol_focused", {}, {
+        "quality_percentile": 0.15, "max_stock_vol": 0.80,
+        "min_adv_for_selection": 2_000_000, "min_holding_overlap": 0.70,
+    }))  # Expect: CAGR ~9%, Sharpe ~0.45, DD ~-38%. Vol filter does most work.
+    tests.append(("QE6_balanced", {}, {
+        "quality_percentile": 0.30, "max_stock_vol": 0.70,
+        "min_adv_for_selection": 3_000_000, "min_holding_overlap": 0.65,
+    }))  # Expect: CAGR ~8%, Sharpe ~0.50, DD ~-36%. Balanced compromise.
+
+    # ──────────────────────────────────────────────────────────────────────
+    # QF-series: SPY core overlay on best combined configs
+    # Adds SPY core to anchor beta closer to 1.0, reducing DD at cost of
+    # some alpha. Uses QE2 and QE6 as base configs.
+    # ──────────────────────────────────────────────────────────────────────
+    tests.append(("QF1_QE2_spy20", {}, {
+        "quality_percentile": 0.35, "max_stock_vol": 0.80,
+        "min_adv_for_selection": 2_000_000, "min_holding_overlap": 0.70,
+        "spy_core_weight": 0.20,
+    }))  # Expect: CAGR ~7%, Sharpe ~0.50, DD ~-28%. Moderate beta anchor.
+    tests.append(("QF2_QE2_spy30", {}, {
+        "quality_percentile": 0.35, "max_stock_vol": 0.80,
+        "min_adv_for_selection": 2_000_000, "min_holding_overlap": 0.70,
+        "spy_core_weight": 0.30,
+    }))  # Expect: CAGR ~8%, Sharpe ~0.55, DD ~-25%. Strong beta anchor.
+    tests.append(("QF3_QE6_spy30", {}, {
+        "quality_percentile": 0.30, "max_stock_vol": 0.70,
+        "min_adv_for_selection": 3_000_000, "min_holding_overlap": 0.65,
+        "spy_core_weight": 0.30,
+    }))  # Expect: CAGR ~7%, Sharpe ~0.52, DD ~-26%. Balanced + SPY anchor.
+    tests.append(("QF4_QE6_spy40_mega", {}, {
+        "quality_percentile": 0.30, "max_stock_vol": 0.70,
+        "min_adv_for_selection": 3_000_000, "min_holding_overlap": 0.65,
+        "spy_core_weight": 0.40, "force_mega_caps": True,
+    }))  # Expect: CAGR ~8%, Sharpe ~0.55, DD ~-22%. Max beta anchor + mega-cap.
+
     return tests
 
 
@@ -641,7 +743,8 @@ def main():
                         help="Portfolio tests only (skip ML retraining)")
     parser.add_argument("--category", default=None,
                         help="Run specific category: A, B, C, D, E, F, G, H, V, X, "
-                             "P, L, R, Z, FA, FB, FG, FH "
+                             "P, L, R, Z, FA, FB, FG, FH, "
+                             "QA, QB, QC, QD, QE, QF "
                              "(comma-separate for multiple, e.g. 'V,X' or 'P1,P7')")
     args = parser.parse_args()
 
@@ -660,7 +763,7 @@ def main():
     elif args.quick:
         # Quick mode: portfolio + vol-target tests that reuse cached ML
         all_tests = [(n, s, p) for n, s, p in all_tests
-                     if n.startswith(("B", "C", "V", "X", "P"))]
+                     if n.startswith(("B", "C", "V", "X", "P", "QA", "QB", "QC", "QD", "QE", "QF"))]
 
     print(f"\n{'='*60}")
     print(f"  TEST SUITE: {len(all_tests)} tests")
