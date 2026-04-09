@@ -801,7 +801,6 @@ def run(args):
         max_stock_vol   = args.max_stock_vol,
         quality_percentile = args.quality_percentile,
         rvol            = rvol_63d,
-        quality_signal  = quality_signal,
     )
 
     # ── Volatility targeting overlay (ENABLED by default) ─────────────
