@@ -223,6 +223,133 @@ def _extract_annual_series(
         return pd.Series(dtype=float)
 
 
+def _extract_annual_series_multi(
+    facts: dict,
+    concepts: List[str],
+    taxonomy: str = "us-gaap",
+    include_quarterly: bool = True,
+) -> pd.Series:
+    """Try multiple XBRL concepts in order; return first non-empty series.
+
+    Useful when companies report under different tag names
+    (e.g. DeferredRevenueCurrent vs ContractWithCustomerLiabilityCurrent under ASC 606).
+    """
+    for c in concepts:
+        s = _extract_annual_series(facts, c, taxonomy, include_quarterly)
+        if not s.empty:
+            return s
+    return pd.Series(dtype=float)
+
+
+def load_edgar_fundamentals_extra(
+    tickers: List[str],
+    start: str = "2013-01-01",
+    end: str = "2024-01-01",
+    use_cache: bool = True,
+    max_tickers: int = 10_000,
+    sleep_sec: float = 0.12,
+) -> pd.DataFrame:
+    """Incremental EDGAR loader for Phase F C&Z signal raw fields.
+
+    Loads ONLY the 8 new XBRL concepts needed for the C&Z accounting signals
+    (XFIN, PayoutYield, NetPayoutYield, OperProfRD, Tax, cfp, DelDRC).
+    Cached separately from main EDGAR fundamentals so adding these doesn't
+    invalidate the 1.9GB main cache.
+
+    Returns DataFrame with MultiIndex columns (ticker, raw_*) and DatetimeIndex.
+    """
+    cache_name = f"edgar_fundamentals_extra_{start}_{end}_{max_tickers}_v1"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            print(f"      [EDGAR-EXTRA] loaded from cache ({cached.shape})")
+            return cached
+
+    print(f"      [EDGAR-EXTRA] fetching extra XBRL fields for up to {max_tickers} tickers...")
+    cik_map = _get_cik_map(tickers)
+    date_idx = pd.bdate_range(start, end)
+    results = {}
+
+    subset = [t for t in tickers if t in cik_map][:max_tickers]
+    n = len(subset)
+    print(f"      [EDGAR-EXTRA] processing {n} tickers (~{n*sleep_sec/60:.0f} min)")
+
+    for i, ticker in enumerate(subset):
+        cik = cik_map[ticker]
+        facts = _fetch_company_facts(cik)
+        if facts is None:
+            continue
+
+        # Cash flow statement items
+        dividends_paid = _extract_annual_series_multi(facts, [
+            "PaymentsOfDividends",
+            "PaymentsOfDividendsCommonStock",
+        ])
+        buybacks = _extract_annual_series_multi(facts, [
+            "PaymentsForRepurchaseOfCommonStock",
+            "PaymentsForRepurchaseOfEquity",
+        ])
+        stock_iss = _extract_annual_series_multi(facts, [
+            "ProceedsFromIssuanceOfCommonStock",
+            "ProceedsFromIssuanceOfEquityCommon",
+        ])
+        debt_iss = _extract_annual_series_multi(facts, [
+            "ProceedsFromIssuanceOfLongTermDebt",
+            "ProceedsFromIssuanceOfDebt",
+        ])
+        debt_repay = _extract_annual_series_multi(facts, [
+            "RepaymentsOfLongTermDebt",
+            "RepaymentsOfDebt",
+        ])
+
+        # Balance sheet
+        deferred_rev = _extract_annual_series_multi(facts, [
+            "ContractWithCustomerLiabilityCurrent",  # ASC 606 (post-2018)
+            "DeferredRevenueCurrent",                 # legacy
+            "DeferredRevenue",
+        ])
+
+        # Income statement
+        rd_expense = _extract_annual_series(facts, "ResearchAndDevelopmentExpense")
+        tax_expense = _extract_annual_series_multi(facts, [
+            "IncomeTaxExpenseBenefit",
+            "IncomeTaxesPaid",
+            "IncomeTaxesPaidNet",
+        ])
+
+        ticker_df = pd.DataFrame(index=date_idx)
+
+        def _daily(series: pd.Series, shift: int = 1) -> pd.Series:
+            if series.empty:
+                return pd.Series(np.nan, index=date_idx)
+            return series.reindex(date_idx, method="ffill").shift(shift)
+
+        ticker_df["raw_dividends_paid"]    = _daily(dividends_paid)
+        ticker_df["raw_buybacks"]          = _daily(buybacks)
+        ticker_df["raw_stock_issuance"]    = _daily(stock_iss)
+        ticker_df["raw_lt_debt_issuance"]  = _daily(debt_iss)
+        ticker_df["raw_lt_debt_repayment"] = _daily(debt_repay)
+        ticker_df["raw_deferred_revenue"]  = _daily(deferred_rev)
+        ticker_df["raw_rd"]                = _daily(rd_expense)
+        ticker_df["raw_taxes"]             = _daily(tax_expense)
+
+        results[ticker] = ticker_df
+        time.sleep(sleep_sec)
+
+        if (i + 1) % 100 == 0:
+            print(f"        {i+1}/{n} tickers fetched")
+
+    if not results:
+        print("      [EDGAR-EXTRA] no data retrieved")
+        return pd.DataFrame(index=date_idx)
+
+    out = pd.concat(results, axis=1)
+    out.index = pd.DatetimeIndex(out.index)
+    _save(out, cache_name)
+    print(f"      [EDGAR-EXTRA] done — {out.shape}")
+    return out
+
+
 def load_edgar_fundamentals(
     tickers: List[str],
     start: str = "2013-01-01",
@@ -705,7 +832,21 @@ def load_earnings_calendar(
             else:
                 earn["eps_surprise_pct"] = np.nan
 
-            results[ticker] = earn.set_index("earnings_date").sort_index()
+            # Add before_after_market field (yfinance doesn't provide; default unknown)
+            # so downstream consumers expecting this field don't crash
+            if "before_after_market" not in earn.columns:
+                earn["before_after_market"] = "unknown"
+
+            df_t = earn.set_index("earnings_date").sort_index()
+            # FIX (2026-04-16): dedup duplicate dates to prevent downstream reindex errors
+            # in build_earnings_signals (streak_ts.reindex). yfinance occasionally returns
+            # duplicate earnings dates (same announcement listed twice with different metadata).
+            if df_t.index.duplicated().any():
+                df_t["_nan_count"] = df_t.isna().sum(axis=1)
+                df_t = df_t.sort_values(["_nan_count"], ascending=True)
+                df_t = df_t[~df_t.index.duplicated(keep="first")]
+                df_t = df_t.drop(columns=["_nan_count"]).sort_index()
+            results[ticker] = df_t
 
         except Exception:
             pass
@@ -717,6 +858,200 @@ def load_earnings_calendar(
     _save(results, cache_name)
     print(f"      [EARN] done — {len(results)} tickers with data")
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b. Earnings calendar via EODHD bulk endpoint (replaces yfinance scraper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_earnings_calendar_eodhd(
+    tickers: List[str],
+    start: str = "2013-01-01",
+    end: str = "2026-04-12",
+    use_cache: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Bulk earnings calendar via EODHD /api/calendar/earnings.
+
+    Returns same contract as load_earnings_calendar():
+        Dict[ticker -> DataFrame] with index=earnings_date and columns:
+        eps_estimate, eps_actual, eps_surprise_pct
+
+    Advantages over yfinance:
+    - 25+ years of history (vs yfinance's ~8 quarters)
+    - Single bulk API call (1 API call cost) vs ticker-by-ticker scraping
+    - Stable endpoint (vs yfinance schema breakage)
+    """
+    import os
+    api_key = os.environ.get("EODHD_API_KEY", "")
+    if not api_key:
+        warnings.warn("[EARN-EODHD] no EODHD_API_KEY, falling back to yfinance")
+        return load_earnings_calendar(tickers, start=start, end=end, use_cache=use_cache)
+
+    cache_name = f"earnings_calendar_eodhd_{start}_{end}_{_ALT_DATA_CACHE_VERSION}"
+    if use_cache:
+        cached = _load(cache_name)
+        if cached is not None:
+            # MIGRATION (2026-04-17): older caches were built with a parser that
+            # silently always wrote "unknown" into `before_after_market` (camelCase
+            # vs snake_case mismatch against EODHD response). Detect those caches
+            # and force a re-fetch so the Phase D EAR-timing fix actually activates.
+            needs_refetch = False
+            if not isinstance(cached, dict) or len(cached) == 0:
+                needs_refetch = False  # nothing to validate
+            else:
+                missing_col = 0
+                all_unknown = 0
+                sampled = 0
+                for _t, _df in cached.items():
+                    if not isinstance(_df, pd.DataFrame) or _df.empty:
+                        continue
+                    sampled += 1
+                    if "before_after_market" not in _df.columns:
+                        missing_col += 1
+                        continue
+                    vals = _df["before_after_market"].astype(str).str.lower().str.strip()
+                    non_unknown = vals[~vals.isin(["unknown", "nan", "none", ""])]
+                    if len(non_unknown) == 0:
+                        all_unknown += 1
+                    if sampled >= 50:  # sample is enough to decide
+                        break
+                if sampled > 0 and (missing_col + all_unknown) >= max(1, int(0.9 * sampled)):
+                    needs_refetch = True
+                    warnings.warn(
+                        "[EARN-EODHD] cache appears to predate the "
+                        "before_after_market fix — every sampled ticker has the field "
+                        "missing or always 'unknown'. Forcing one-time re-fetch from "
+                        "EODHD so the Phase D EAR-timing window activates. "
+                        "(Cache file: " + str(_cache_path(cache_name)) + ")"
+                    )
+            if not needs_refetch:
+                print(f"      [EARN-EODHD] loaded from cache ({len(cached)} tickers)")
+                return cached
+
+    print(f"      [EARN-EODHD] fetching bulk earnings {start} -> {end}...")
+
+    url = "https://eodhd.com/api/calendar/earnings"
+    all_records = []
+
+    # Fetch in 6-month chunks to stay within response limits
+    # FIX (2026-04-16): advance chunk_start by 1 day to prevent boundary overlap
+    # (EODHD treats both `from` and `to` as inclusive, double-counting events on boundaries)
+    chunk_start = pd.Timestamp(start)
+    chunk_end = pd.Timestamp(end)
+    while chunk_start < chunk_end:
+        chunk_stop = min(chunk_start + pd.DateOffset(months=6), chunk_end)
+        params = {
+            "api_token": api_key,
+            "from": str(chunk_start.date()),
+            "to": str(chunk_stop.date()),
+            "fmt": "json",
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                earnings = data.get("earnings", []) if isinstance(data, dict) else data
+                all_records.extend(earnings)
+            else:
+                warnings.warn(f"[EARN-EODHD] HTTP {resp.status_code} for {chunk_start.date()}")
+        except Exception as e:
+            warnings.warn(f"[EARN-EODHD] request failed: {e}")
+        # +1 day prevents boundary-day double-count (was: chunk_start = chunk_stop)
+        chunk_start = chunk_stop + pd.Timedelta(days=1)
+        time.sleep(0.1)
+
+    if not all_records:
+        warnings.warn("[EARN-EODHD] no records returned, falling back to yfinance")
+        return load_earnings_calendar(tickers, start=start, end=end, use_cache=use_cache)
+
+    print(f"      [EARN-EODHD] {len(all_records)} raw records fetched")
+
+    # Parse into per-ticker DataFrames matching yfinance contract
+    ticker_set = {t.upper() for t in tickers}
+    results: Dict[str, pd.DataFrame] = {}
+
+    for rec in all_records:
+        code = rec.get("code", "")
+        # EODHD returns "AAPL.US" format — strip exchange suffix
+        ticker = code.split(".")[0].upper() if "." in code else code.upper()
+        if ticker not in ticker_set:
+            continue
+
+        report_date = rec.get("report_date")
+        if not report_date:
+            continue
+
+        eps_est = rec.get("estimate")
+        eps_act = rec.get("actual")
+        eps_surprise_pct = rec.get("percent")
+
+        # Compute surprise_pct if not provided but estimate + actual exist
+        if eps_surprise_pct is None and eps_est is not None and eps_act is not None:
+            try:
+                est_f = float(eps_est)
+                act_f = float(eps_act)
+                if abs(est_f) > 1e-9:
+                    eps_surprise_pct = ((act_f - est_f) / abs(est_f)) * 100
+            except (TypeError, ValueError):
+                pass
+
+        row = {
+            "earnings_date": pd.to_datetime(report_date, errors="coerce"),
+            "eps_estimate": _safe_float(eps_est),
+            "eps_actual": _safe_float(eps_act),
+            "eps_surprise_pct": np.clip(_safe_float(eps_surprise_pct) / 100, -2, 2)
+            if eps_surprise_pct is not None else np.nan,
+            # FIX (2026-04-17): EODHD API response uses snake_case
+            # `before_after_market` exclusively (verified via test_eodhd_earnings_api.py).
+            # Earlier code defensively also tried a camelCase variant which never
+            # exists in the response — removed to prevent confusion. The Phase D
+            # EAR-timing fix in alt_features.py keys off this field; if it is missing
+            # or always "unknown" the fix silently degrades to the default window.
+            "before_after_market": str(
+                rec.get("before_after_market", "unknown")
+            ).lower().strip(),
+        }
+
+        if ticker not in results:
+            results[ticker] = []
+        results[ticker].append(row)
+
+    # Convert lists to DataFrames + DEDUPLICATE
+    # FIX (2026-04-16): EODHD calendar returns spurious fiscal-quarter-end markers
+    # (rows with eps_estimate=NaN) alongside real earnings events. These doubled
+    # AAPL's count from expected 52 to actual 81. Solution:
+    #   1. Drop rows with no eps_estimate (the spurious markers)
+    #   2. Then dedup by date keeping row with most complete data
+    final: Dict[str, pd.DataFrame] = {}
+    for ticker, rows in results.items():
+        df = pd.DataFrame(rows)
+        df = df.dropna(subset=["earnings_date"])
+        # Drop spurious quarter-end markers (no estimate AND no actual = not a real event)
+        valid_mask = df["eps_estimate"].notna() | df["eps_actual"].notna()
+        df = df[valid_mask]
+        df = df.set_index("earnings_date").sort_index()
+        # When duplicates remain on same date, keep row with fewest NaNs (most complete)
+        if df.index.duplicated().any():
+            df["_nan_count"] = df.isna().sum(axis=1)
+            df = df.sort_values(["_nan_count"], ascending=True)  # complete rows first
+            df = df[~df.index.duplicated(keep="first")]
+            df = df.drop(columns=["_nan_count"]).sort_index()
+        final[ticker] = df
+
+    _save(final, cache_name)
+    print(f"      [EARN-EODHD] done — {len(final)} tickers with data")
+    return final
+
+
+def _safe_float(val) -> float:
+    """Safely convert to float, returning NaN on failure."""
+    if val is None or val == "":
+        return np.nan
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 # ─────────────────────────────────────────────────────────────────────────────

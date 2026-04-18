@@ -1,0 +1,86 @@
+{
+  "phase": "1.8d",
+  "locked_date": "20260411_095752",
+  "git_commit_sha": "dab62f7934ccd54c5a3b3bf36cefe82828cc30c2",
+  "git_clean": false,
+  "metrics": {
+    "cagr": 0.1424,
+    "spy_cagr": 0.1399,
+    "sharpe": 0.655,
+    "max_drawdown": -0.3657,
+    "dsr_n1": 0.919,
+    "dsr_n15": 0.738509112702822,
+    "psr": 0.992,
+    "alpha_p_value": 0.30296007534552083,
+    "rmw_loading": -0.12230022383482081,
+    "is_sharpe": 0.554,
+    "oos_sharpe": 1.181,
+    "T_days": 3411
+  },
+  "flags": {
+    "start": "2013-01-01",
+    "forward_window": 21,
+    "signal_smooth_halflife": 10.0,
+    "quality_percentile": 0.0,
+    "max_stock_vol": 1.0,
+    "min_adv_for_selection": 0,
+    "min_holding_overlap": 0.5,
+    "n_positions": 50,
+    "ml_blend": 0.3,
+    "vol_target": 0.3,
+    "max_leverage": 1.8,
+    "vol_ceiling": 0.4,
+    "quality_tilt": 0.35,
+    "cash_in_bear": 0.3,
+    "no_cs_zscore_all": true,
+    "sample_weight_halflife_years": 4.5
+  },
+  "reproduction_command": "\"C:\\Users\\Alex Hines\\AppData\\Local\\Programs\\Python\\Python313\\python.exe\" \"C:\\Users\\Alex Hines\\OneDrive\\Documents\\Personal Projects\\Personal-Trading-Portfolio-Project\\run_strategy.py\" --start 2013-01-01 --forward-window 21 --signal-smooth-halflife 10.0 --quality-percentile 0.0 --max-stock-vol 1.0 --min-adv-for-selection 0 --min-holding-overlap 0.5 --n-positions 50 --ml-blend 0.3 --vol-target 0.3 --max-leverage 1.8 --vol-ceiling 0.4 --quality-tilt 0.35 --cash-in-bear 0.3 --no-cs-zscore-all --sample-weight-halflife-years 4.5",
+  "readiness": {
+    "passed": 5,
+    "total": 8,
+    "score": 0.625,
+    "checks": [
+      {
+        "name": "CAGR > SPY",
+        "pass": true,
+        "detail": "14.24% vs SPY 13.99%"
+      },
+      {
+        "name": "Sharpe > 0.60",
+        "pass": true,
+        "detail": "0.655"
+      },
+      {
+        "name": "DSR (n=1) > 0.95",
+        "pass": false,
+        "detail": "0.919"
+      },
+      {
+        "name": "DSR (n=15 corrected) > 0.80",
+        "pass": false,
+        "detail": "0.739"
+      },
+      {
+        "name": "Alpha p-value < 0.10",
+        "pass": false,
+        "detail": "p=0.3030"
+      },
+      {
+        "name": "MaxDD > -40%",
+        "pass": true,
+        "detail": "-36.57%"
+      },
+      {
+        "name": "OOS Sharpe > Full-sample Sharpe",
+        "pass": true,
+        "detail": "IS=0.554 OOS=1.181 Full=0.655"
+      },
+      {
+        "name": "FF6 RMW loading > -0.20",
+        "pass": true,
+        "detail": "-0.122"
+      }
+    ]
+  }
+}

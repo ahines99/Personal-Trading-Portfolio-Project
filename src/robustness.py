@@ -8,14 +8,14 @@ your backtest isn't just overfitted luck?"
 
 Three approaches:
   1. Bootstrap (resample returns with replacement)
-     → Confidence interval on Sharpe. If p5 > 0, signal is likely real.
+     -> Confidence interval on Sharpe. If p5 > 0, signal is likely real.
 
   2. Permutation test (shuffle signal labels)
-     → If random signals score as well as yours, your signal has no edge.
+     -> If random signals score as well as yours, your signal has no edge.
 
   3. Capacity analysis (vary AUM)
-     → At what AUM does transaction cost drag kill the strategy?
-     → Required for any serious quant interview discussion.
+     -> At what AUM does transaction cost drag kill the strategy?
+     -> Required for any serious quant interview discussion.
 """
 
 import numpy as np
@@ -140,7 +140,7 @@ def permutation_test(
 
     # True IC
     true_decay = factor_decay_analysis(signal, returns, horizons=[forward_window])
-    true_ic    = true_decay[f"{forward_window}d_IC"]["mean_IC"]
+    true_ic    = true_decay.loc[f"{forward_window}d_IC", "mean_IC"]
 
     # Shuffled ICs
     shuffled_ics = []
@@ -156,7 +156,7 @@ def permutation_test(
             shuffled.loc[date] = row
 
         decay     = factor_decay_analysis(shuffled, returns, horizons=[forward_window])
-        shuf_ic   = decay[f"{forward_window}d_IC"]["mean_IC"]
+        shuf_ic   = decay.loc[f"{forward_window}d_IC", "mean_IC"]
         shuffled_ics.append(shuf_ic)
 
     print()
@@ -302,7 +302,7 @@ class RobustnessReport:
             for k, v in self.permutation.items():
                 if k != "interpretation":
                     print(f"  {k:20s}: {v:.4f}" if isinstance(v, float) else f"  {k:20s}: {v}")
-            print(f"\n  → {self.permutation['interpretation']}")
+            print(f"\n  -> {self.permutation['interpretation']}")
 
         if self.capacity is not None:
             print("\n--- Capacity Analysis ---")

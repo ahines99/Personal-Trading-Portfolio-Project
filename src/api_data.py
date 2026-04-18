@@ -167,7 +167,7 @@ def load_eodhd_fundamentals(
             # EODHD uses TICKER.EXCHANGE format
             symbol = f"{ticker}.US"
             data = _eodhd_get(f"fundamentals/{symbol}", {
-                "filter": "Financials,General,Highlights,Valuation"
+                "filter": "Financials,General,Highlights,Valuation,Earnings,SharesStats,Holders,outstandingShares"
             })
             if data and isinstance(data, dict):
                 results[ticker] = data
@@ -248,6 +248,9 @@ def parse_eodhd_quarterly_financials(
                     "operating_cf": _safe_float(cashflow.get("totalCashFromOperatingActivities")),
                     "capex": _safe_float(cashflow.get("capitalExpenditures")),
                     "dividends_paid": _safe_float(cashflow.get("dividendsPaid")),
+                    # HMLINT intangibles-adjusted value (Arnott-Harvey 2020)
+                    "rd_expense": _safe_float(income.get("researchDevelopment")),
+                    "sga_expense": _safe_float(income.get("sellingGeneralAdministrative")),
                 }
                 # Derived
                 rev = record["revenue"]
@@ -549,6 +552,7 @@ def build_eodhd_features(
     quarterly_df: pd.DataFrame,
     tickers: pd.Index,
     date_index: pd.DatetimeIndex,
+    close_prices: pd.DataFrame = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Build cross-sectional features from EODHD quarterly fundamentals.
@@ -574,6 +578,7 @@ def build_eodhd_features(
     metrics = [
         "revenue", "gross_margin", "roe", "roa", "net_margin",
         "operating_margin", "fcf", "accruals", "debt_to_equity", "eps",
+        "shares_outstanding",
     ]
 
     for metric in metrics:
@@ -612,10 +617,128 @@ def build_eodhd_features(
             elif metric in ("debt_to_equity",):
                 # Lower leverage = better
                 signals[f"q_{metric}"] = _cs_rank(-panel)
+            elif metric in ("shares_outstanding",):
+                # Buyback yield: -(YoY Δshares). Positive = shrinking = bullish.
+                # Grullon-Michaely 2004, Pontiff-Woodgate 2008.
+                # Phase D addition — gate via ENABLE_PHASE_D_SIGNALS env var (default ON)
+                if os.environ.get("ENABLE_PHASE_D_SIGNALS", "1") == "1":
+                    pct_qoq = panel.pct_change(63).abs()
+                    pct_yoy = panel.pct_change(252)
+                    # Split protection: flag >30% QoQ or >50% YoY as corporate action
+                    split_mask = (pct_qoq > 0.30) | (pct_yoy.abs() > 0.50)
+                    buyback_yield = (-pct_yoy).where(~split_mask, np.nan).clip(-0.15, 0.15)
+                    signals["q_buyback_yield"] = _cs_rank(buyback_yield)
             else:
                 signals[f"q_{metric}"] = _cs_rank(panel)
 
+    # ── HMLINT: intangibles-adjusted value (Arnott-Harvey 2020) ─────────
+    # Capitalise R&D (5-year declining weights) and SGA (30% × 3-year sum)
+    # to produce intangible-adjusted book equity, then rank price/intangible-book.
+    # Phase D addition — gate via ENABLE_PHASE_D_SIGNALS env var (default ON).
+    # Coverage of R&D data is 27-35% of top-1500, which creates sparse-NaN risk.
+    if close_prices is not None and os.environ.get("ENABLE_PHASE_D_SIGNALS", "1") == "1":
+        try:
+            hmlint = _build_hmlint_signal(
+                quarterly_df, close_prices, tickers, date_index, _cs_rank,
+            )
+            if hmlint is not None:
+                signals["hmlint_signal"] = hmlint
+        except Exception as _e:
+            import warnings
+            warnings.warn(f"HMLINT signal build failed: {_e}")
+
     return signals
+
+
+def _build_hmlint_signal(
+    quarterly_df: pd.DataFrame,
+    close_prices: pd.DataFrame,
+    tickers: pd.Index,
+    date_index: pd.DatetimeIndex,
+    _cs_rank,
+) -> Optional[pd.DataFrame]:
+    """
+    HMLINT = intangibles-adjusted book-to-market.
+
+    Intangible book = equity + capitalised_R&D + 0.3 × capitalised_SGA.
+    R&D capitalised via 5-year declining weights [1.0, 0.8, 0.6, 0.4, 0.2].
+    SGA capitalised via 30% × rolling 3-year sum.
+
+    Fallback: when R&D is NaN, use plain equity (standard book value).
+    Output: cross-sectionally ranked so cheaper = higher rank.
+    """
+    needed = {"total_equity", "rd_expense", "sga_expense", "shares_outstanding"}
+    if quarterly_df is None or quarterly_df.empty:
+        return None
+    if not needed.issubset(quarterly_df.columns):
+        import warnings
+        warnings.warn(
+            f"HMLINT: missing columns {needed - set(quarterly_df.columns)}; skipping"
+        )
+        return None
+
+    # ── Helper: build a forward-filled daily panel from quarterly_df ──
+    def _qtr_panel(metric: str) -> pd.DataFrame:
+        panel = pd.DataFrame(np.nan, index=date_index, columns=tickers, dtype="float32")
+        for ticker in tickers:
+            tk = quarterly_df[quarterly_df["ticker"] == ticker].sort_values("date")
+            if tk.empty or metric not in tk.columns:
+                continue
+            for _, row in tk.iterrows():
+                d = row["date"]
+                if pd.isna(d):
+                    continue
+                if d in date_index:
+                    panel.loc[d:, ticker] = row[metric]
+                else:
+                    valid = date_index[date_index >= d]
+                    if len(valid) > 0:
+                        panel.loc[valid[0]:, ticker] = row[metric]
+        return panel.ffill()
+
+    equity_panel = _qtr_panel("total_equity")
+    rd_panel = _qtr_panel("rd_expense")
+    sga_panel = _qtr_panel("sga_expense")
+    shares_panel = _qtr_panel("shares_outstanding")
+
+    # ── Capitalise R&D: 5-year declining weights ────────────────────────
+    # Each year ≈ 252 trading days.  Weight year-0=1.0 .. year-4=0.2.
+    rd_weights = [1.0, 0.8, 0.6, 0.4, 0.2]
+    cap_rd = pd.DataFrame(0.0, index=date_index, columns=tickers, dtype="float32")
+    for i, w in enumerate(rd_weights):
+        shifted = rd_panel.shift(252 * i)
+        # Quarterly values are point-in-time and ffilled; each represents
+        # one quarter of R&D.  Annualise by multiplying by 4 then weight.
+        cap_rd = cap_rd + shifted.fillna(0.0) * 4.0 * w
+
+    # ── Capitalise SGA: 30% × 3-year rolling sum ───────────────────────
+    cap_sga = pd.DataFrame(0.0, index=date_index, columns=tickers, dtype="float32")
+    for i in range(3):
+        shifted = sga_panel.shift(252 * i)
+        cap_sga = cap_sga + shifted.fillna(0.0) * 4.0  # annualise
+    cap_sga = 0.3 * cap_sga
+
+    # ── Intangible-adjusted book equity ─────────────────────────────────
+    # Fallback: where R&D is entirely NaN (e.g. financials), cap_rd==0
+    # so intangible_book collapses to plain equity — no NaNs introduced.
+    intangible_book = equity_panel.fillna(0.0) + cap_rd + cap_sga
+
+    # Book per share
+    shares = shares_panel.clip(lower=1.0)  # avoid division by zero
+    intangible_bps = intangible_book / shares
+
+    # Align close prices
+    close_aligned = close_prices.reindex(
+        index=date_index, columns=tickers, method="ffill"
+    )
+
+    # Price / intangible book-per-share  (lower = cheaper)
+    ratio = close_aligned / intangible_bps.replace(0, np.nan)
+    ratio = ratio.clip(-100, 100)  # guard extreme outliers
+
+    # Invert and rank: cheaper stocks get HIGHER rank
+    hmlint = _cs_rank(-ratio)
+    return hmlint
 
 
 def build_eodhd_sentiment_features(
@@ -799,6 +922,7 @@ def load_all_api_data(
     date_index: pd.DatetimeIndex,
     finnhub_max: int = 500,
     use_cache: bool = True,
+    close_prices: pd.DataFrame = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Load and build features from both EODHD and Finnhub.
@@ -812,31 +936,54 @@ def load_all_api_data(
     all_features = {}
     tickers_index = pd.Index(tickers)
 
-    # ── EODHD: Quarterly Fundamentals (requires All-In-One plan) ─────────
-    # NOTE: The $20 All-World plan does NOT include fundamentals.
-    # Uncomment below if you upgrade to All-In-One ($40+/mo).
+    # ── EODHD: Quarterly Fundamentals — DISABLED to restore Apr 15 baseline.
+    # Memory note `eodhd_roi_evaluation.md`: fundamentals redundant with EDGAR;
+    # reactivation injected ~18 alt_q_* features (q_roe, q_fcf, q_accruals, …)
+    # that diluted the ML model and dropped CAGR 25.67% → 17.02%. Keep EODHD
+    # for earnings + dividends only.
     # print("\n[API] Loading EODHD quarterly fundamentals...")
     # raw_fundamentals = load_eodhd_fundamentals(tickers, use_cache=use_cache)
     # if raw_fundamentals:
     #     quarterly_df = parse_eodhd_quarterly_financials(raw_fundamentals, tickers)
     #     if not quarterly_df.empty:
-    #         eodhd_features = build_eodhd_features(quarterly_df, tickers_index, date_index)
-    #         all_features.update(eodhd_features)
+    #         try:
+    #             eodhd_features = build_eodhd_features(quarterly_df, tickers_index, date_index, close_prices=close_prices)
+    #             all_features.update(eodhd_features)
+    #         except Exception as _e:
+    #             import warnings
+    #             warnings.warn(f"EODHD fundamentals feature build failed: {_e}")
 
     # ── EODHD: Dividends (available on All-World plan) ───────────────────
+    # Integration contract with CZ signals (`--use-cz-signals`):
+    #   When the orchestrator enables the CZ `payout_yield_signal` (which
+    #   subsumes dividend yield as part of total shareholder payout), it MUST
+    #   also export `DISABLE_DIVIDEND_YIELD=1` before invoking this loader.
+    #   Otherwise the two near-duplicate yield features dilute each other in
+    #   the ML feature importance and degrade signal quality.
+    #   The env-var is the integration point — cz_signals.py / run_strategy.py
+    #   are NOT modified by this gate; they merely set the env-var.
     print("[API] Loading EODHD dividends...")
-    dividends = load_eodhd_dividends(tickers, use_cache=use_cache)
-    if dividends:
-        # Build dividend yield feature
-        div_panel = pd.DataFrame(0.0, index=date_index, columns=tickers_index)
-        for ticker, div_df in dividends.items():
-            if ticker in div_panel.columns and "value" in div_df.columns:
-                annual_div = div_df["value"].resample("YE").sum()
-                annual_div = annual_div.reindex(date_index, method="ffill")
-                div_panel[ticker] = annual_div
-        if div_panel.sum().sum() > 0:
-            all_features["dividend_yield"] = div_panel.rank(axis=1, pct=True)
-            print(f"  [EODHD] Built dividend yield feature")
+    if os.environ.get("DISABLE_DIVIDEND_YIELD", "0") == "1":
+        print("[EODHD] dividend_yield SKIPPED "
+              "(DISABLE_DIVIDEND_YIELD=1, assuming CZ payout_yield_signal "
+              "will replace it)")
+    else:
+        dividends = load_eodhd_dividends(tickers, use_cache=use_cache)
+        if dividends:
+            # Restored Apr 15 baseline: annual-resample / ffill, key = "dividend_yield".
+            # The TTM-rolling rewrite renamed the key to "dividend_yield_signal" AND
+            # changed values, breaking the cache key match and degrading the model's
+            # #2 most-important feature (importance 357 / 414 in baseline).
+            div_panel = pd.DataFrame(0.0, index=date_index, columns=tickers_index,
+                                     dtype="float32")
+            for ticker, div_df in dividends.items():
+                if ticker in div_panel.columns and "value" in div_df.columns:
+                    annual_div = div_df["value"].resample("YE").sum()
+                    annual_div = annual_div.reindex(date_index, method="ffill")
+                    div_panel[ticker] = annual_div
+            if div_panel.sum().sum() > 0:
+                all_features["dividend_yield"] = div_panel.rank(axis=1, pct=True)
+                print(f"  [EODHD] Built dividend yield feature")
 
     # ── EODHD: Sentiment (daily scores + article counts) ──────────────────
     print("[API] Loading EODHD sentiment data...")

@@ -14,6 +14,7 @@ Feature set covers all OHLCV-derived signals:
 """
 
 import hashlib
+import os
 import pickle
 import random
 import warnings
@@ -27,7 +28,32 @@ _CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _impute_for_ridge(X: np.ndarray) -> np.ndarray:
+def _gaussian_rank_transform(X: np.ndarray) -> np.ndarray:
+    """Tier A (Week 1): Gaussian rank transform per column.
+
+    Converts each column to rank percentiles, then maps to the standard
+    normal CDF inverse. Strictly better than raw z-score for heavy-tailed
+    features fed to Ridge/MLP (Qlib / Gu-Kelly-Xiu 2020 standard).
+
+    Zero leakage: per-column operation, no temporal structure.
+    """
+    from scipy.stats import norm
+    X = np.asarray(X, dtype=np.float32)
+    n, p = X.shape
+    if n < 2:
+        return X
+    out = np.empty_like(X)
+    for j in range(p):
+        col = X[:, j]
+        # Rank with average method for ties, convert to [0,1]
+        ranks = pd.Series(col).rank(method="average", pct=True).values
+        # Clip to avoid -inf / +inf from norm.ppf(0) / norm.ppf(1)
+        ranks = np.clip(ranks, 1e-6, 1.0 - 1e-6)
+        out[:, j] = norm.ppf(ranks).astype(np.float32)
+    return out
+
+
+def _impute_for_ridge(X: np.ndarray, gaussian_rank: bool = False) -> np.ndarray:
     """Per-column median imputation for Ridge/MLP fitting.
 
     LightGBM and XGBoost handle NaN natively and MUST receive raw NaN
@@ -35,6 +61,10 @@ def _impute_for_ridge(X: np.ndarray) -> np.ndarray:
     handle NaN, so we fill with the per-column median computed from the
     finite values in that column. Inf values are first replaced with NaN.
     Columns that are entirely NaN are filled with 0.
+
+    Tier A: If gaussian_rank=True (default), applies Gaussian-rank
+    transform AFTER median imputation. This flattens heavy tails and
+    dramatically improves Ridge/MLP fit on noisy equity features.
     """
     if X.size == 0:
         return X
@@ -51,6 +81,11 @@ def _impute_for_ridge(X: np.ndarray) -> np.ndarray:
     idx = np.where(np.isnan(X))
     if len(idx[0]):
         X[idx] = np.take(col_median, idx[1])
+
+    # Tier A: Gaussian-rank transform (best for Ridge/MLP on heavy tails)
+    if gaussian_rank:
+        X = _gaussian_rank_transform(X)
+
     return X
 
 
@@ -196,6 +231,18 @@ def build_feature_matrix(
     _do_size_neutralize = bool(size_neutralize)
 
     # ── feature panel cache ──────────────────────────────────────────────────
+    # Cache-key isolation fix: include EXTRA_DENY_FEATURES env var so that
+    # different deny-lists produce distinct cache hashes. Previously the deny
+    # list was applied AFTER cache lookup, causing all isolation tests to
+    # collapse to a single cached panel (cache hit → no actual isolation).
+    _deny_raw = os.environ.get("EXTRA_DENY_FEATURES", "") or ""
+    _deny_norm = ",".join(sorted({s.strip().lower() for s in _deny_raw.split(",") if s.strip()}))
+    _deny_hash_suffix = os.environ.get("DENY_LIST_HASH_SUFFIX", "") or ""
+    if _deny_norm:
+        print(
+            f"      [cache] deny-list active: {len(_deny_norm.split(','))} entries "
+            f"→ hash includes deny suffix"
+        )
     _cache_key = hashlib.md5(
         f"{close.index[0]}_{close.index[-1]}_{close.shape}_{sorted(ranked_signals.keys())}"
         f"_{sorted(alt_features.keys()) if alt_features else []}"
@@ -203,14 +250,22 @@ def build_feature_matrix(
         f"_sn={bool(size_neutralize)}_shr={shares_outstanding is not None}"
         f"_sni={bool(sector_neutralize_features)}"
         f"_wz={bool(winsorize)}_csz={bool(cs_zscore_all)}"
-        f"_hm={bool(use_higher_moment)}_bw={bool(use_breadth_wavelet)}".encode()
+        f"_hm={bool(use_higher_moment)}_bw={bool(use_breadth_wavelet)}"
+        f"_deny={_deny_norm}_dhs={_deny_hash_suffix}".encode()
     ).hexdigest()[:12]
     _cache_file = _CACHE_DIR / f"feature_panel_{_cache_key}.pkl"
 
     if use_cache and _cache_file.exists():
         print(f"      [cache] Loading feature panel from {_cache_file.name}")
         with open(_cache_file, "rb") as f:
-            return pickle.load(f)
+            _cached_panel = pickle.load(f)
+        # Safety: fix infs in old cached panels (pre inf-fix code change)
+        _inf_cached = np.isinf(_cached_panel.values)
+        if _inf_cached.any():
+            _cached_panel.values[_inf_cached] = np.nan
+            print(f"      [cache] Fixed {_inf_cached.sum():,} stale inf values")
+        del _inf_cached
+        return _cached_panel
     # ─────────────────────────────────────────────────────────────────────────
 
     from features import (
@@ -343,7 +398,9 @@ def build_feature_matrix(
         try:
             features["realized_skew_21"] = _f32(-realized_skewness(returns, window=21))
             features["realized_skew_63"] = _f32(-realized_skewness(returns, window=63))
-            features["co_skew_252"] = _f32(-co_skewness(returns, market_returns, window=252))
+            _cs = co_skewness(returns, market_returns, window=252)
+            if _cs is not None:  # DISABLE_CO_SKEW_252=1 → skip (avoid dup with cz_signals.coskewness_signal)
+                features["co_skew_252"] = _f32(-_cs)
             sb_N, sb_P, sb_Mplus, sb_Mminus = semi_beta_decomposition(
                 returns, market_returns, window=252
             )
@@ -736,6 +793,87 @@ def build_feature_matrix(
             f"(skipped {_csz_skipped_broadcast} zero-variance broadcast features)"
         )
 
+    # ── Feature deny-list: prune zero-importance + redundant SNI variants ──
+    # Static deny-list of features that scored exactly 0.0 LightGBM gain
+    # importance across all walk-forward windows, plus SNI variants of
+    # momentum/volatility/beta features (where raw signal dominates).
+    _DENY_LIST = {
+        # Zero-importance features (84 from feature_importance.csv analysis)
+        "log_liquidity_z", "z_mkt_beta_63d_sni", "mom_126d_sni",
+        "signed_jump_21", "z_amihud_21d_sn", "mom_63d_sni",
+        "z_mom_63d_sni", "z_mom_126d_sni", "alt_naive_dtd_signal_sni_csz",
+        "alt_inflation_sensitivity_signal_sni_csz", "mom_126d_sn",
+        "z_mom_63d_sn", "alt_inflation_sensitivity_signal_csz",
+        "alt_eodhd_sentiment_chg_csz", "alt_eodhd_sentiment_chg",
+        "alt_vvix_vix_ratio_csz", "breadth_adv_dec", "breadth_nh_nl",
+        "wavelet_band_dominant_frequency", "z_rvol_21d",
+        "alt_operating_profitability_signal_sni",
+        "alt_net_share_issuance_signal_sni",
+        "alt_net_operating_assets_signal_sni",
+        "alt_gross_profitability_signal_sni", "alt_roe_signal_sni",
+        "alt_leverage_signal_sni", "z_mom_63d",
+        "alt_earnings_yield_signal", "mom_10d", "mom_21d",
+        "price_accel_21d", "bollinger_pct_b", "efficiency_21d",
+        "zscore_rev_20d", "rsi_14d", "alt_credit_beta_signal_sni",
+        "hurst_63d", "rank_sector_rel_mom", "ret_reversal_1d",
+        "sector_rel_mom_63d", "alt_value_composite_signal_sni",
+        "alt_sales_yield_signal_sni", "alt_analyst_revision_signal",
+        "rank_tail_risk", "amihud_21d", "mkt_beta_63d",
+        "alt_dxy_beta_signal_sni", "alt_mom_hyg_12_1", "obv_zscore",
+        "rank_residual_momentum", "rank_vol_reversal",
+        "alt_pc2_slope_beta_signal_sni", "amihud_21d_csz",
+        "idiovol_21d_csz", "residual_mom_21d_csz", "mom_63d",
+        "breadth_adv_dec_csz", "breadth_nh_nl_csz",
+        "breadth_pct_200ma_csz", "breadth_composite_z_csz",
+        "mom_21d_sn_csz", "mom_63d_sni_csz", "mom_12_1_sni_csz",
+        "idiovol_21d_sni_csz",
+        "alt_operating_profitability_signal_sni_csz",
+        "alt_net_operating_assets_signal_sni_csz",
+        "alt_roe_signal_sni_csz", "alt_net_share_issuance_signal_csz",
+        "alt_value_composite_signal_sni_csz", "alt_eps_trend_signal",
+        "alt_sales_yield_signal_sni_csz",
+        "alt_earnings_yield_signal_csz",
+        "alt_gross_margin_signal_sni_csz",
+        "alt_leverage_signal_sni_csz", "alt_building_permits_csz",
+        "alt_initial_claims_csz", "alt_mom_spy_12_1_csz",
+        "alt_cu_au_roc_3m_csz", "alt_cu_au_zscore_csz",
+        "alt_pc2_slope_beta_signal_csz", "alt_mom_hyg_12_1_csz",
+        "alt_mom_tlt_12_1_csz", "z_mkt_beta_63d",
+        "ix_idiovol_x_illiq_csz",
+        # SNI policy: drop _sni for momentum/vol/beta (raw signal dominates)
+        "mom_21d_sni", "mom_12_1_sni", "rvol_21d_sni",
+        "z_rvol_21d_sni", "idiovol_21d_sni", "z_idiovol_21d_sni",
+        "mkt_beta_63d_sni", "z_mkt_beta_63d_sn",
+        "z_mom_12_1_sni",
+        # NOTE (2026-04-17): Phase E bottom-80 prune entries REMOVED to recover
+        # 25.67% baseline. Phase E pruned features based on the baseline's own
+        # feature_importance.csv — this was overfitting to in-sample importance
+        # and pruned features that contributed to 2020/2022/2024 alpha patterns.
+        # If post-baseline analysis justifies re-adding specific features,
+        # validate each with isolated backtest first (per -30bps kill switch).
+    }
+
+    # EMPTY_DENY_LIST=1 clears the list entirely (ablation test for 25.67%
+    # baseline recovery). Fixed2 ran Apr 15 without any deny list; the 93-entry
+    # list here was introduced post-Fixed2 and may over-prune proven alpha.
+    if os.environ.get("EMPTY_DENY_LIST", "0") == "1":
+        _DENY_LIST = set()
+        print("      [deny-list] EMPTY_DENY_LIST=1 — all features retained")
+
+    # Support extra deny list via environment variable (for bisection tests)
+    _extra_deny_env = os.environ.get("EXTRA_DENY_FEATURES", "")
+    if _extra_deny_env:
+        _extra = {f.strip() for f in _extra_deny_env.split(",") if f.strip()}
+        _DENY_LIST = _DENY_LIST | _extra
+        print(f"      [deny-list] +{len(_extra)} features from EXTRA_DENY_FEATURES env var")
+
+    _n_before = len(features)
+    features = {k: v for k, v in features.items() if k not in _DENY_LIST}
+    _n_denied = _n_before - len(features)
+    if _n_denied > 0:
+        print(f"      [deny-list] Pruned {_n_denied} zero-importance/redundant features "
+              f"({_n_before} -> {len(features)})")
+
     # Pre-allocate float32 numpy array and fill column-by-column.
     # This eliminates the .stack() intermediate (which created N_feats x
     # N_samples-element Series) and the pd.concat copy. Saves ~50% peak RAM.
@@ -765,6 +903,14 @@ def build_feature_matrix(
     del panel_arr
     gc.collect()
 
+    # Replace inf values ONCE here (before cache) instead of during training.
+    # This avoids a ~14 GB temporary copy at fit_predict time.
+    _inf_mask = np.isinf(panel.values)
+    if _inf_mask.any():
+        panel.values[_inf_mask] = np.nan
+        print(f"      [inf-fix] Replaced {_inf_mask.sum():,} inf values with NaN")
+    del _inf_mask
+
     print(f"       {panel.shape[0]:,} samples x {panel.shape[1]} features")
 
     if use_cache:
@@ -785,6 +931,7 @@ def build_labels(
     market_returns: Optional[pd.Series] = None,
     forward_windows: Optional[List[int]] = None,
     investable_mask: Optional[pd.DataFrame] = None,
+    use_rank_targets: bool = False,
 ) -> pd.Series:
     """
     Build 6-grade relevance labels for LambdaRank.
@@ -877,6 +1024,13 @@ def build_labels(
         else:
             pct_rank = universe_rank
 
+        # ── Rank-target mode (Phase E Numerai): return continuous [0,1]
+        # percentile ranks instead of discrete 6-grade labels ──────────────
+        if use_rank_targets:
+            stacked = pct_rank.stack(future_stack=True)
+            stacked.name = "label"
+            return stacked
+
         def rank_to_grade_mh(row):
             return pd.cut(
                 row,
@@ -939,6 +1093,13 @@ def build_labels(
     else:
         pct_rank = universe_rank
 
+    # ── Rank-target mode (Phase E Numerai): return continuous [0,1]
+    # percentile ranks instead of discrete 6-grade labels ──────────────────
+    if use_rank_targets:
+        stacked = pct_rank.stack(future_stack=True)
+        stacked.name = "label"
+        return stacked
+
     def rank_to_grade(row):
         return pd.cut(
             row,
@@ -976,6 +1137,8 @@ def _default_monotone_constraints() -> Dict[str, int]:
         "price_52w_high": 1,
         # Value / B-M / E-P: +1 (high book/market -> premium)
         "alt_book_to_market": 1, "alt_earnings_yield": 1, "alt_ep_ratio": 1,
+        # HMLINT intangibles-adjusted value (Arnott-Harvey 2020)
+        "hmlint_signal": 1,
         # Quality ROE / profitability: +1
         "alt_roe": 1, "alt_roa": 1, "alt_gross_profitability": 1, "alt_profitability": 1,
         # F-score: +1
@@ -1178,12 +1341,12 @@ class WalkForwardModel:
         # LightGBM regularization (previously hardcoded in _fit_lgbm)
         lambda_l1: float = 5.0,
         lambda_l2: float = 10.0,
-        min_gain_to_split: float = 0.05,
+        min_gain_to_split: float = 0.05,  # Run 1 revert from 0.1
         # Opt 4: depth 5 (matches shallower num_leaves=20; Israel-Kelly-
         # Moskowitz 2020: shallow trees generalize better on noisy financial data)
         max_depth: int = 5,
         # Ridge alpha (previously hardcoded to 50.0)
-        ridge_alpha: float = 50.0,
+        ridge_alpha: float = 50.0,  # Run 1 revert from 300
         # Ensemble blend weights (4 models)
         lgbm_weight: float = 0.30,
         xgb_weight: float = 0.25,
@@ -1198,7 +1361,7 @@ class WalkForwardModel:
         # Rolling window: cap training data at N days instead of expanding.
         # None = expanding (use all history). 756 = ~3 years rolling.
         # Rolling drops stale regime data that confuses the model.
-        max_train_days: Optional[int] = 756,
+        max_train_days: Optional[int] = 756,  # R4 regressed -55bps; locked at 3y
         # Feature neutralization: regress out vol from all features before
         # training. Forces model to find orthogonal signal, not vol-sort.
         neutralize_vol: bool = False,
@@ -1210,7 +1373,7 @@ class WalkForwardModel:
         # ── Return-decile label gain (item 2) ─────────────────────────────
         use_return_decile_gain: bool = False,
         # ── Magnitude-weighted samples (item 3) ───────────────────────────
-        use_magnitude_weights: bool = False,
+        use_magnitude_weights: bool = False,  # Run 1 revert from True
         # ── New ensemble heads (items 4, 5) ───────────────────────────────
         huber_weight: float = 0.0,
         quantile_weight: float = 0.0,
@@ -1221,7 +1384,7 @@ class WalkForwardModel:
         # ── IC-based early stopping (item 9) ──────────────────────────────
         early_stop_on_ic: bool = True,
         # ── Min data in leaf (item 10) ────────────────────────────────────
-        min_data_in_leaf: int = 200,
+        min_data_in_leaf: int = 200,  # Run 1 revert from 1000
         # ── Monotonicity constraints (item 11) ────────────────────────────
         monotone_constraints: Optional[Dict[str, int]] = None,
         # ── Lopez de Prado sample weights (items 12, 13) ──────────────────
@@ -1251,6 +1414,34 @@ class WalkForwardModel:
         # "auto" = auto-detect groups from feature name prefixes.
         # List[List[int]] = explicit constraint groups.
         interaction_constraints: object = None,  # None | "auto" | List[List[int]]
+        # ── Phase 2.5: Exponential sample-weight decay halflife ───────────
+        # Controls the recency bias of training samples. Samples N days
+        # before the training window's last date get weight 0.5^(N/halflife).
+        # Default 630 (≈2.5 trading years) preserves prior hardcoded behavior.
+        # Set to 0 to disable decay entirely (equal weight on all samples).
+        # R18 agent recommended 4.5 years (1134 days) for non-stationary
+        # factor environments per Gu-Kelly-Xiu (2020).
+        sample_weight_decay_days: int = 630,
+        # ── Phase E: Numerai-style partial prediction neutralization ──────
+        # Regresses out systematic factor exposures from predictions.
+        # strength=0.0 disables (default, preserves locked baseline).
+        # strength=0.5 is recommended partial neutralization.
+        # strength=1.0 is full neutralization (destroys alpha for long-only).
+        neutralize_strength: float = 0.0,
+        neutralize_features: Optional[List[str]] = None,
+        # ── Phase E: Era-weighted ensemble blending (Numerai-style) ───────
+        # When ON, ensemble weights are dynamically adjusted each walk-forward
+        # window based on trailing per-model Spearman Rank-IC on holdout data.
+        # Uses 50/50 blend of fixed weights + era weights for stability.
+        # Default OFF to preserve locked baseline.
+        use_era_weights: bool = False,
+        # ── Phase E: Percentile-rank target transform (Numerai-style) ────
+        # When ON, build_labels returns continuous [0,1] cross-sectional
+        # percentile ranks instead of discrete 6-grade labels. LGBM still
+        # receives discretized grades (for LambdaRank), but Ridge gets the
+        # continuous rank targets (captures finer ordering signal).
+        # Default OFF to preserve locked baseline.
+        use_rank_targets: bool = False,
     ):
         self.min_train_days    = min_train_days
         self.retrain_freq      = retrain_freq
@@ -1299,6 +1490,11 @@ class WalkForwardModel:
         self.run_adversarial_validation = run_adversarial_validation  # Opt 3
         self.warm_start_lgbm   = warm_start_lgbm                     # Opt 5
         self.interaction_constraints_cfg = interaction_constraints    # Opt 6
+        self.sample_weight_decay_days = int(sample_weight_decay_days)  # Phase 2.5
+        self.neutralize_strength = float(max(0.0, min(1.0, neutralize_strength)))  # Phase E
+        self.neutralize_features = neutralize_features  # Phase E
+        self.use_era_weights = use_era_weights  # Phase E: era-weighted ensemble
+        self.use_rank_targets = use_rank_targets  # Phase E: rank target transform
 
         # If MLP disabled, zero its weight and renormalize the other model
         # weights so the ensemble still sums to 1.0. User-configured
@@ -1354,12 +1550,26 @@ class WalkForwardModel:
 
         # Carve out last 21 days as temporal holdout for early stopping.
         # groups[i] = number of tickers on day i, so we split by group count.
+        # Tier1: Add inner-fold purge — drop forward_window days before the
+        # val split to prevent label leakage across the train/val boundary
+        # (labels overlap by forward_window days).
         val_days  = min(21, len(groups) // 5)
+        purge_days = int(getattr(self, "forward_window", 5))
         val_rows  = int(groups[-val_days:].sum())
-        X_tr, X_val = X[:-val_rows], X[-val_rows:]
-        y_tr, y_val = y[:-val_rows], y[-val_rows:]
-        g_tr, g_val = groups[:-val_days], groups[-val_days:]
-        w_tr = sample_weight[:-val_rows] if sample_weight is not None else None
+        purge_rows = int(groups[-(val_days + purge_days):-val_days].sum()) if purge_days > 0 else 0
+        if purge_rows > 0 and len(X) > val_rows + purge_rows:
+            X_tr = X[:-(val_rows + purge_rows)]
+            y_tr = y[:-(val_rows + purge_rows)]
+            g_tr = groups[:-(val_days + purge_days)]
+            w_tr = sample_weight[:-(val_rows + purge_rows)] if sample_weight is not None else None
+        else:
+            X_tr = X[:-val_rows]
+            y_tr = y[:-val_rows]
+            g_tr = groups[:-val_days]
+            w_tr = sample_weight[:-val_rows] if sample_weight is not None else None
+        X_val = X[-val_rows:]
+        y_val = y[-val_rows:]
+        g_val = groups[-val_days:]
 
         # ── Label-gain schedule (item 2) ────────────────────────────────────
         if self.use_return_decile_gain:
@@ -1435,7 +1645,8 @@ class WalkForwardModel:
             p["seed"] = seed
             p["bagging_seed"] = seed
             p["feature_fraction_seed"] = seed
-            p["data_random_seed"] = seed
+            # data_random_seed removed: LGBM forbids changing it after
+            # Dataset construction. Other seeds already provide diversity.
             return lgb.train(
                 p, dtrain,
                 num_boost_round=_num_boost,
@@ -1938,7 +2149,12 @@ class WalkForwardModel:
         # feature would discard most warmup-period samples.
         mask = y_train.notna()
         X_ = X_train[mask]
-        y_ = y_train[mask].astype(int)
+        # Phase E rank targets: labels are continuous [0,1] — keep as float.
+        # Grade targets: labels are integer 0-5 — cast to int.
+        if self.use_rank_targets:
+            y_ = y_train[mask].astype(float)
+        else:
+            y_ = y_train[mask].astype(int)
 
         if len(X_) < 50:
             return None
@@ -1982,14 +2198,20 @@ class WalkForwardModel:
         feature_names         = list(X_.columns)
         ensemble: dict        = {"feature_subset": selected_features}
 
-        # Temporal sample weighting
+        # Temporal sample weighting (Phase 2.5: configurable halflife)
+        # Default 630 trading days (~2.5 years) preserves prior hardcoded behavior.
+        # Set sample_weight_decay_days=0 to disable decay (equal weight).
         dates = X_.index.get_level_values("date")
         unique_dates = dates.unique().sort_values()
         date_to_idx = {d: i for i, d in enumerate(unique_dates)}
         max_idx = len(unique_dates) - 1
         sample_idx = np.array([date_to_idx[d] for d in dates])
-        decay_lambda = np.log(2) / 630
-        sample_weight = np.exp(-decay_lambda * (max_idx - sample_idx))
+        if self.sample_weight_decay_days > 0:
+            decay_lambda = np.log(2) / float(self.sample_weight_decay_days)
+            sample_weight = np.exp(-decay_lambda * (max_idx - sample_idx))
+        else:
+            # Equal weight — decay disabled
+            sample_weight = np.ones(len(sample_idx), dtype=float)
 
         # ── Per-date equal weighting (item 13) ──────────────────────────────
         if self.use_per_date_weights:
@@ -2025,7 +2247,21 @@ class WalkForwardModel:
                 pass
 
         # ── Decile labels for return-decile label gain (item 2) ─────────────
-        if self.use_return_decile_gain:
+        if self.use_rank_targets:
+            # Phase E: labels are continuous [0,1] percentile ranks.
+            # LGBM/XGB need integer grades for LambdaRank — discretize back
+            # into 6 grades matching the standard scheme.
+            # Ridge/Huber/Quantile keep the continuous rank targets.
+            _rv = y_.values.astype(float)
+            y_lgbm = np.clip(
+                np.where(_rv >= 0.95, 5,
+                np.where(_rv >= 0.80, 4,
+                np.where(_rv >= 0.60, 3,
+                np.where(_rv >= 0.40, 2,
+                np.where(_rv >= 0.20, 1, 0))))),
+                0, 5,
+            ).astype(int)
+        elif self.use_return_decile_gain:
             try:
                 y_series = pd.Series(y_.values.astype(float), index=dates)
                 # Cross-sectional rank per date, scaled to 0..30 integer deciles
@@ -2233,7 +2469,157 @@ class WalkForwardModel:
         except Exception:
             return float("nan")
 
-    def _predict_ensemble(self, X_pred: pd.DataFrame, ensemble: dict) -> tuple:
+    def _neutralize_predictions(self, predictions: np.ndarray, X: pd.DataFrame,
+                                strength: float = 0.5,
+                                neutralize_features: Optional[List[str]] = None) -> np.ndarray:
+        """Partial feature neutralization on predictions (Phase E: Numerai-style).
+
+        Regress predictions against specified features, subtract `strength` fraction
+        of the fitted values. strength=0 means no neutralization, strength=1 means full.
+
+        Default features to neutralize: market beta, log market cap, 12-1 momentum,
+        realized vol. These are the main systematic factor exposures.
+        For a long-only momentum strategy, full neutralization destroys alpha;
+        partial (0.5) reduces unintended factor bets while preserving stock-specific signal.
+        """
+        if strength <= 0 or X is None or len(X) == 0:
+            return predictions
+
+        if neutralize_features is None:
+            # Default: neutralize against the top systematic factors
+            candidates = ["mkt_beta_63d", "log_mcap_z", "mom_12_1", "rvol_63d"]
+            neutralize_features = [c for c in candidates if c in X.columns]
+
+        if not neutralize_features:
+            return predictions
+
+        from sklearn.linear_model import LinearRegression
+
+        feat_matrix = X[neutralize_features].values
+        valid = ~np.isnan(feat_matrix).any(axis=1) & ~np.isnan(predictions)
+        if valid.sum() < 10:
+            return predictions
+
+        lr = LinearRegression()
+        lr.fit(feat_matrix[valid], predictions[valid])
+        fitted = lr.predict(feat_matrix)
+
+        # Partial neutralization: subtract only `strength` fraction
+        # Subtract demeaned fitted to preserve overall prediction mean
+        neutralized = predictions.copy()
+        neutralized[valid] = predictions[valid] - strength * (fitted[valid] - fitted[valid].mean())
+
+        return neutralized
+
+    # ------------------------------------------------------------------
+    # Phase E: Era-weighted ensemble blending helpers
+    # ------------------------------------------------------------------
+
+    def _compute_era_weights(
+        self,
+        model_ics: Dict[str, List[float]],
+        lookback: int = 4,
+        min_weight: float = 0.05,
+    ) -> Dict[str, float]:
+        """Compute ensemble weights from trailing per-model Spearman IC.
+
+        Returns a dict mapping model name -> weight (sums to 1.0).
+        Models with negative trailing IC get their weight floored to 0
+        before normalization (with min_weight enforcement).
+        """
+        weights: Dict[str, float] = {}
+        for model_name, ic_history in model_ics.items():
+            recent = ic_history[-lookback:] if len(ic_history) >= lookback else ic_history
+            avg_ic = float(np.mean(recent)) if recent else 0.0
+            weights[model_name] = max(avg_ic, 0.0)  # zero out negative-IC models
+
+        total = sum(weights.values())
+        if total < 1e-6:
+            # All models have non-positive IC — fall back to equal weights
+            n = len(weights)
+            return {k: 1.0 / n for k in weights}
+
+        # Normalize to sum to 1, enforce minimum weight
+        normalized = {k: max(v / total, min_weight) for k, v in weights.items()}
+        total_norm = sum(normalized.values())
+        return {k: v / total_norm for k, v in normalized.items()}
+
+    def _predict_ensemble_per_model(
+        self, X_pred: pd.DataFrame, ensemble: dict,
+    ) -> Dict[str, np.ndarray]:
+        """Return per-model ranked predictions (no blending).
+
+        Used by era-weight tracking to compute per-model IC on holdout data.
+        Keys match the model names used in _predict_ensemble: 'lgbm', 'xgboost',
+        'huber', 'quantile', 'mlp', 'ridge'.
+        """
+        feature_subset = ensemble.get("feature_subset", list(X_pred.columns))
+        X_aligned = X_pred.reindex(columns=feature_subset, fill_value=0)
+        X_vals = X_aligned.values
+        _X_imputed_cache: Dict[str, object] = {"arr": None}
+
+        def _get_imputed() -> np.ndarray:
+            if _X_imputed_cache["arr"] is None:
+                _X_imputed_cache["arr"] = _impute_for_ridge(X_vals)
+            return _X_imputed_cache["arr"]
+
+        def ranked(raw: np.ndarray) -> np.ndarray:
+            return pd.Series(raw).rank(pct=True).values
+
+        per_model: Dict[str, np.ndarray] = {}
+
+        if "lgbm" in ensemble:
+            lgbm_obj = ensemble["lgbm"]
+            if isinstance(lgbm_obj, list):
+                raw = np.mean([b.predict(X_vals) for b in lgbm_obj], axis=0)
+            else:
+                raw = lgbm_obj.predict(X_vals)
+            per_model["lgbm"] = ranked(raw)
+
+        if "xgboost" in ensemble:
+            dmat = xgb.DMatrix(X_vals, feature_names=ensemble.get("feature_subset", None))
+            best_iter = getattr(ensemble["xgboost"], "best_iteration", None)
+            if best_iter is not None:
+                xgb_raw = ensemble["xgboost"].predict(
+                    dmat, iteration_range=(0, int(best_iter) + 1)
+                )
+            else:
+                xgb_raw = ensemble["xgboost"].predict(dmat)
+            per_model["xgboost"] = ranked(xgb_raw)
+
+        if "huber" in ensemble and self.huber_weight > 0:
+            per_model["huber"] = ranked(ensemble["huber"].predict(X_vals))
+
+        if "quantile" in ensemble and self.quantile_weight > 0:
+            per_model["quantile"] = ranked(ensemble["quantile"].predict(X_vals))
+
+        if "mlp" in ensemble:
+            try:
+                mlp_model = ensemble["mlp"]["model"]
+                mlp_scaler = ensemble["mlp"]["scaler"]
+                X_scaled = mlp_scaler.transform(_get_imputed())
+                with torch.no_grad():
+                    mlp_model.cuda()
+                    X_tensor = torch.FloatTensor(X_scaled).cuda()
+                    mlp_preds = mlp_model(X_tensor).squeeze().cpu().numpy()
+                    mlp_model.cpu()
+                    torch.cuda.empty_cache()
+                per_model["mlp"] = ranked(mlp_preds)
+            except Exception:
+                pass
+
+        # Ridge is always present
+        _ridge_obj = ensemble["ridge"]
+        if isinstance(_ridge_obj, dict):
+            _ridge_X = _ridge_obj["scaler"].transform(_get_imputed())
+            per_model["ridge"] = ranked(_ridge_obj["model"].predict(_ridge_X))
+        else:
+            per_model["ridge"] = ranked(_ridge_obj.predict(_get_imputed()))
+
+        return per_model
+
+    def _predict_ensemble(self, X_pred: pd.DataFrame, ensemble: dict,
+                          era_weights: Optional[Dict[str, float]] = None) -> tuple:
         """
         Returns (blended_scores, confidence).
 
@@ -2258,6 +2644,25 @@ class WalkForwardModel:
         def ranked(raw: np.ndarray) -> np.ndarray:
             return pd.Series(raw).rank(pct=True).values
 
+        # ── Resolve per-model weights (fixed or era-blended) ────────────
+        # Fixed weights from constructor
+        _fixed_w = {
+            "lgbm": self.lgbm_weight,
+            "xgboost": self.xgb_weight,
+            "huber": self.huber_weight,
+            "quantile": self.quantile_weight,
+            "mlp": self.mlp_weight,
+            "ridge": self.ridge_weight,
+        }
+        if era_weights is not None:
+            # 50/50 blend of fixed weights and era-derived weights for stability
+            _eff_w: Dict[str, float] = {}
+            for k in _fixed_w:
+                era_w = era_weights.get(k, 0.0)
+                _eff_w[k] = 0.5 * _fixed_w[k] + 0.5 * era_w
+        else:
+            _eff_w = _fixed_w
+
         model_ranks = []
         scores  = np.zeros(len(X_vals))
         total_w = 0.0
@@ -2270,8 +2675,8 @@ class WalkForwardModel:
             else:
                 raw = lgbm_obj.predict(X_vals)
             lgbm_ranks = ranked(raw)
-            scores  += lgbm_ranks * self.lgbm_weight
-            total_w += self.lgbm_weight
+            scores  += lgbm_ranks * _eff_w["lgbm"]
+            total_w += _eff_w["lgbm"]
             model_ranks.append(lgbm_ranks)
 
         if "xgboost" in ensemble:
@@ -2286,22 +2691,22 @@ class WalkForwardModel:
             else:
                 xgb_raw = ensemble["xgboost"].predict(dmat)
             xgb_ranks = ranked(xgb_raw)
-            scores  += xgb_ranks * self.xgb_weight
-            total_w += self.xgb_weight
+            scores  += xgb_ranks * _eff_w["xgboost"]
+            total_w += _eff_w["xgboost"]
             model_ranks.append(xgb_ranks)
 
         # Huber head (item 4)
-        if "huber" in ensemble and self.huber_weight > 0:
+        if "huber" in ensemble and _eff_w["huber"] > 0:
             huber_ranks = ranked(ensemble["huber"].predict(X_vals))
-            scores += huber_ranks * self.huber_weight
-            total_w += self.huber_weight
+            scores += huber_ranks * _eff_w["huber"]
+            total_w += _eff_w["huber"]
             model_ranks.append(huber_ranks)
 
         # Quantile head (item 5)
-        if "quantile" in ensemble and self.quantile_weight > 0:
+        if "quantile" in ensemble and _eff_w["quantile"] > 0:
             q_ranks = ranked(ensemble["quantile"].predict(X_vals))
-            scores += q_ranks * self.quantile_weight
-            total_w += self.quantile_weight
+            scores += q_ranks * _eff_w["quantile"]
+            total_w += _eff_w["quantile"]
             model_ranks.append(q_ranks)
 
         # MLP predictions (GPU)
@@ -2317,13 +2722,13 @@ class WalkForwardModel:
                     mlp_model.cpu()  # move back to free VRAM
                     torch.cuda.empty_cache()
                 mlp_ranks = ranked(mlp_preds)
-                scores += mlp_ranks * self.mlp_weight
-                total_w += self.mlp_weight
+                scores += mlp_ranks * _eff_w["mlp"]
+                total_w += _eff_w["mlp"]
                 model_ranks.append(mlp_ranks)
             except Exception:
                 pass
 
-        ridge_w = self.ridge_weight
+        ridge_w = _eff_w["ridge"]
         if total_w < 0.01:
             ridge_w = 1.0  # only Ridge available
         # Fix 3: ensemble["ridge"] is a dict {"model", "scaler"} — apply the
@@ -2341,12 +2746,14 @@ class WalkForwardModel:
 
         blended = scores / max(total_w, 1e-6)
 
-        # Meta-labeling: multiply by stage-2 probability (item 8)
+        # Meta-labeling as REJECT GATE (R3): drop bottom 10% by meta_prob
+        # rather than multiply (multiply changes rankings — mathematically wrong).
         if self.use_meta_labeling and "meta" in ensemble:
             try:
                 meta_prob = ensemble["meta"].predict(X_vals)
-                # Blend into scores: score * meta_prob preserves ordering
-                blended = blended * meta_prob
+                thresh = np.nanpercentile(meta_prob, 10.0)
+                reject = meta_prob < thresh
+                blended = np.where(reject, -np.inf, blended)
             except Exception:
                 pass
 
@@ -2367,13 +2774,20 @@ class WalkForwardModel:
     # ------------------------------------------------------------------
 
     def fit_predict(self, panel: pd.DataFrame, labels: pd.Series,
-                    use_cache: bool = True) -> pd.DataFrame:
+                    use_cache: bool = True,
+                    sector_map: Optional[Dict[str, str]] = None,
+                    results_dir: Optional[Path] = None) -> pd.DataFrame:
         """
         Walk-forward training + prediction with disk caching.
 
         Cache key includes: panel shape, date range, number of features,
         model hyperparams. If any change, cache is invalidated.
+
+        Tier A: sector_map enables sector-relative prediction blend
+        (Asness-Moskowitz-Pedersen 2013 industry-neutral momentum).
         """
+        # Stash sector_map on self for prediction blending
+        self.sector_map = sector_map
         # ── Seed all stochastic subsystems for reproducibility ───────────
         np.random.seed(self.random_state)
         random.seed(self.random_state)
@@ -2404,6 +2818,18 @@ class WalkForwardModel:
         except Exception:
             _labels_hash = "na"
 
+        # Cache-key isolation fix: include EXTRA_DENY_FEATURES env var so that
+        # different deny-lists produce distinct ML-prediction cache hashes.
+        # Without this, isolation tests collapse to a single cached prediction
+        # set even though the active feature universe differs.
+        _deny_raw_ml = os.environ.get("EXTRA_DENY_FEATURES", "") or ""
+        _deny_norm_ml = ",".join(sorted({s.strip().lower() for s in _deny_raw_ml.split(",") if s.strip()}))
+        _deny_hash_suffix_ml = os.environ.get("DENY_LIST_HASH_SUFFIX", "") or ""
+        if _deny_norm_ml:
+            print(
+                f"  [cache] deny-list active: {len(_deny_norm_ml.split(','))} entries "
+                f"→ hash includes deny suffix"
+            )
         _cache_key = hashlib.md5(
             f"{panel.shape}_{panel.index.get_level_values('date').min()}_"
             f"{panel.index.get_level_values('date').max()}_"
@@ -2432,7 +2858,13 @@ class WalkForwardModel:
             f"ph={_panel_hash}_lh={_labels_hash}_"
             # Opt 3/5/6 params in cache key
             f"adv={self.run_adversarial_validation}_ws={self.warm_start_lgbm}_"
-            f"ic={self.interaction_constraints_cfg}".encode()
+            f"ic={self.interaction_constraints_cfg}_"
+            # Phase 2.5: sample-weight decay halflife (invalidates cache on change)
+            f"swd={self.sample_weight_decay_days}_"
+            f"eraw={self.use_era_weights}_"
+            f"rkt={self.use_rank_targets}_"
+            # Cache-isolation fix: include deny-list + override hash suffix
+            f"deny={_deny_norm_ml}_dhs={_deny_hash_suffix_ml}".encode()
         ).hexdigest()[:12]
         _cache_file = _CACHE_DIR / f"ml_predictions_{_cache_key}.pkl"
 
@@ -2445,8 +2877,8 @@ class WalkForwardModel:
             self.models_ = cached.get("models_", [])
             return cached["predictions"]
 
-        # Replace inf ONCE at the top instead of per-window (saves N_windows copies)
-        panel = panel.replace([np.inf, -np.inf], np.nan)
+        # NOTE: inf replacement now happens in build_feature_matrix() before
+        # caching. No need to replace here — saves ~14 GB temporary copy.
 
         self.feature_names_ = list(panel.columns)
         all_dates = panel.index.get_level_values("date").unique().sort_values()
@@ -2465,6 +2897,20 @@ class WalkForwardModel:
 
         current_ensemble = None
         _prev_lgbm_booster = None  # Opt 5: warm-start state
+
+        # ── Phase E: Era-weight tracking state ───────────────────────────
+        # model_ics: rolling buffer of per-model Spearman IC per window
+        # _prev_window_per_model_preds: per-model ranked predictions from
+        #   the previous window, keyed by pred_date -> {model_name -> ranks}
+        _era_model_ics: Dict[str, List[float]] = {}
+        _era_current_weights: Optional[Dict[str, float]] = None
+        _prev_window_per_model_preds: Dict[pd.Timestamp, Dict[str, np.ndarray]] = {}
+
+        # ── Per-model IC diagnostic logging (always on) ─────────────────
+        _diag_window_records: List[dict] = []
+        # Store per-model preds from current window for IC calc in next window
+        _diag_prev_preds: Dict[pd.Timestamp, Dict[str, np.ndarray]] = {}
+        _diag_prev_meta: dict = {}  # train_end, holdout_start/end, n_tickers
 
         for window_idx, (i, cutoff_date) in enumerate(train_cutoffs):
             # Use all features up to the cutoff, but mask labels whose
@@ -2546,14 +2992,110 @@ class WalkForwardModel:
                     "adv_auc":      adv_auc,
                 })
 
+            # ── Phase E: compute per-model IC from PREVIOUS window's holdout ──
+            if self.use_era_weights and _prev_window_per_model_preds:
+                # Gather all per-model ICs across previous window's prediction dates
+                _window_model_ics: Dict[str, List[float]] = {}
+                for _pd_date, _pm_preds in _prev_window_per_model_preds.items():
+                    if _pd_date not in labels.index.get_level_values("date"):
+                        continue
+                    _fwd_ret = labels.xs(_pd_date, level="date").reindex(tickers)
+                    _valid_mask = _fwd_ret.notna()
+                    if _valid_mask.sum() < 30:
+                        continue
+                    for _mname, _mranks in _pm_preds.items():
+                        _m_series = pd.Series(_mranks, index=tickers)
+                        _common = _valid_mask & _m_series.notna()
+                        if _common.sum() < 30:
+                            continue
+                        _ic = _m_series[_common].corr(_fwd_ret[_common], method="spearman")
+                        if np.isfinite(_ic):
+                            _window_model_ics.setdefault(_mname, []).append(_ic)
+
+                # Average ICs across dates in this window, append to rolling buffer
+                for _mname, _ic_list in _window_model_ics.items():
+                    _era_model_ics.setdefault(_mname, []).append(float(np.mean(_ic_list)))
+
+                # Recompute era weights from trailing IC buffer
+                if _era_model_ics:
+                    _era_current_weights = self._compute_era_weights(_era_model_ics)
+
+                # Clear previous window's predictions
+                _prev_window_per_model_preds.clear()
+
+            # ── Diagnostic: compute per-model IC from previous window ────
+            if _diag_prev_preds:
+                from scipy.stats import spearmanr
+                _diag_ics: Dict[str, List[float]] = {}
+                _diag_blended_ics: List[float] = []
+                _diag_n_tickers_list: List[int] = []
+                for _dd, _dpreds in _diag_prev_preds.items():
+                    if _dd not in labels.index.get_level_values("date"):
+                        continue
+                    _fwd = labels.xs(_dd, level="date").reindex(tickers)
+                    _vmask = _fwd.notna()
+                    if _vmask.sum() < 30:
+                        continue
+                    _diag_n_tickers_list.append(int(_vmask.sum()))
+                    for _mn, _mr in _dpreds.items():
+                        if _mn == "_blended":
+                            _bl_s = pd.Series(_mr, index=tickers)
+                            _cm = _vmask & _bl_s.notna()
+                            if _cm.sum() >= 30:
+                                _bic = spearmanr(_bl_s[_cm].values, _fwd[_cm].values)[0]
+                                if np.isfinite(_bic):
+                                    _diag_blended_ics.append(_bic)
+                            continue
+                        _ms = pd.Series(_mr, index=tickers)
+                        _cm = _vmask & _ms.notna()
+                        if _cm.sum() < 30:
+                            continue
+                        _dic = spearmanr(_ms[_cm].values, _fwd[_cm].values)[0]
+                        if np.isfinite(_dic):
+                            _diag_ics.setdefault(_mn, []).append(_dic)
+
+                # Build diagnostic record for previous window
+                _rec = {
+                    "window": _diag_prev_meta.get("window", window_idx - 1),
+                    "train_end": str(_diag_prev_meta.get("train_end", "")),
+                    "holdout_start": str(_diag_prev_meta.get("holdout_start", "")),
+                    "holdout_end": str(_diag_prev_meta.get("holdout_end", "")),
+                    "n_tickers": int(np.mean(_diag_n_tickers_list)) if _diag_n_tickers_list else 0,
+                    "blended_ic": float(np.mean(_diag_blended_ics)) if _diag_blended_ics else float("nan"),
+                }
+                _best_ic = float("-inf")
+                _best_model = ""
+                for _mn, _icl in _diag_ics.items():
+                    _avg = float(np.mean(_icl))
+                    _rec[f"{_mn}_ic"] = _avg
+                    if _avg > _best_ic:
+                        _best_ic = _avg
+                        _best_model = _mn
+                _rec["best_model"] = _best_model
+                _diag_window_records.append(_rec)
+                _diag_prev_preds.clear()
+
             if current_ensemble is None:
                 continue
+
+            # ── Phase E: collect per-model predictions for IC tracking ────
+            _window_per_model: Dict[pd.Timestamp, Dict[str, np.ndarray]] = {}
 
             for pred_date in pred_dates:
                 if pred_date not in panel.index.get_level_values("date"):
                     continue
                 X_pred = panel.xs(pred_date, level="date").reindex(tickers)
-                scores, conf = self._predict_ensemble(X_pred, current_ensemble)
+                scores, conf = self._predict_ensemble(
+                    X_pred, current_ensemble,
+                    era_weights=_era_current_weights if self.use_era_weights else None,
+                )
+                # Phase E: partial feature neutralization (Numerai-style)
+                if self.neutralize_strength > 0:
+                    scores = self._neutralize_predictions(
+                        scores, X_pred,
+                        strength=self.neutralize_strength,
+                        neutralize_features=self.neutralize_features,
+                    )
                 # Fix 1 (LOW-polish): center scores before confidence scaling so
                 # the subsequent cross-sectional rank (pct=True) actually reflects
                 # the confidence signal. Multiplying raw scores by a positive
@@ -2564,12 +3106,111 @@ class WalkForwardModel:
                 adjusted = (scores - 0.5) * (0.3 + 0.7 * conf)
                 predictions[pred_date] = pd.Series(adjusted, index=tickers)
 
+                # Phase E: store per-model predictions for next window's IC calc
+                if self.use_era_weights:
+                    _window_per_model[pred_date] = self._predict_ensemble_per_model(
+                        X_pred, current_ensemble,
+                    )
+
+                # Diagnostic: always collect per-model + blended preds for IC logging
+                if pred_date not in _diag_prev_preds:
+                    if self.use_era_weights and pred_date in _window_per_model:
+                        # Reuse already-computed per-model preds
+                        _diag_prev_preds[pred_date] = dict(_window_per_model[pred_date])
+                    else:
+                        _diag_prev_preds[pred_date] = dict(
+                            self._predict_ensemble_per_model(X_pred, current_ensemble)
+                        )
+                    # Also store the blended scores for blended IC
+                    _diag_prev_preds[pred_date]["_blended"] = scores.copy()
+
+            # Phase E: save this window's per-model preds for next iteration
+            if self.use_era_weights:
+                _prev_window_per_model_preds = _window_per_model
+
+            # Diagnostic: save metadata for this window
+            _diag_prev_meta = {
+                "window": window_idx,
+                "train_end": str(cutoff_date),
+                "holdout_start": str(pred_dates[0]) if len(pred_dates) > 0 else "",
+                "holdout_end": str(pred_dates[-1]) if len(pred_dates) > 0 else "",
+            }
+
+        # ── Diagnostic: flush last window's IC ─────────────────────────
+        if _diag_prev_preds:
+            from scipy.stats import spearmanr
+            _diag_ics_final: Dict[str, List[float]] = {}
+            _diag_blended_final: List[float] = []
+            _diag_nt_final: List[int] = []
+            for _dd, _dpreds in _diag_prev_preds.items():
+                if _dd not in labels.index.get_level_values("date"):
+                    continue
+                _fwd = labels.xs(_dd, level="date").reindex(tickers)
+                _vmask = _fwd.notna()
+                if _vmask.sum() < 30:
+                    continue
+                _diag_nt_final.append(int(_vmask.sum()))
+                for _mn, _mr in _dpreds.items():
+                    if _mn == "_blended":
+                        _bl_s = pd.Series(_mr, index=tickers)
+                        _cm = _vmask & _bl_s.notna()
+                        if _cm.sum() >= 30:
+                            _bic = spearmanr(_bl_s[_cm].values, _fwd[_cm].values)[0]
+                            if np.isfinite(_bic):
+                                _diag_blended_final.append(_bic)
+                        continue
+                    _ms = pd.Series(_mr, index=tickers)
+                    _cm = _vmask & _ms.notna()
+                    if _cm.sum() < 30:
+                        continue
+                    _dic = spearmanr(_ms[_cm].values, _fwd[_cm].values)[0]
+                    if np.isfinite(_dic):
+                        _diag_ics_final.setdefault(_mn, []).append(_dic)
+
+            _rec = {
+                "window": _diag_prev_meta.get("window", len(train_cutoffs) - 1),
+                "train_end": str(_diag_prev_meta.get("train_end", "")),
+                "holdout_start": str(_diag_prev_meta.get("holdout_start", "")),
+                "holdout_end": str(_diag_prev_meta.get("holdout_end", "")),
+                "n_tickers": int(np.mean(_diag_nt_final)) if _diag_nt_final else 0,
+                "blended_ic": float(np.mean(_diag_blended_final)) if _diag_blended_final else float("nan"),
+            }
+            _best_ic = float("-inf")
+            _best_model = ""
+            for _mn, _icl in _diag_ics_final.items():
+                _avg = float(np.mean(_icl))
+                _rec[f"{_mn}_ic"] = _avg
+                if _avg > _best_ic:
+                    _best_ic = _avg
+                    _best_model = _mn
+            _rec["best_model"] = _best_model
+            _diag_window_records.append(_rec)
+
+        # ── Diagnostic: write per-model IC CSV ───────────────────────────
+        if _diag_window_records:
+            diag_df = pd.DataFrame(_diag_window_records)
+            _diag_dir = results_dir if results_dir is not None else Path("results")
+            _diag_dir.mkdir(parents=True, exist_ok=True)
+            diag_df.to_csv(_diag_dir / "window_diagnostics.csv", index=False)
+            print(f"  [diagnostics] {len(diag_df)} windows logged to {_diag_dir / 'window_diagnostics.csv'}")
+
+        # Phase E: log final era weights
+        if self.use_era_weights and _era_current_weights is not None:
+            _w_str = ", ".join(f"{k}={v:.2f}" for k, v in sorted(_era_current_weights.items()))
+            print(f"  [era-weights] Final dynamic weights: {_w_str}")
+
         print()
         print(f"  [model] Generated predictions for {len(predictions)} days")
 
         pred_df = pd.DataFrame(predictions).T
         pred_df.index.name = "date"
         result = pred_df.rank(axis=1, pct=True)
+
+        # Tier A prediction EMA smoothing DISABLED (Run 1 revert) — isolate later
+        # Tier A sector-relative blend REMOVED (Run 1 revert):
+        # The 70/30 blend stacked on top of existing sector_neutralize_features
+        # and sector_rank_weight created triple sector neutralization, destroying
+        # inter-sector alpha. FF6 alpha dropped 3.52% -> 1.15% in B0. Delete.
 
         # ── Save to cache ────────────────────────────────────────────────
         # Strip GPU models before pickling (can't serialize CUDA tensors)

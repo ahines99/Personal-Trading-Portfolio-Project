@@ -17,6 +17,7 @@ Signal families:
     6. Cross-sectional rank
 """
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -990,7 +991,8 @@ def co_skewness(
     returns: pd.DataFrame,
     market_returns: pd.Series,
     window: int = 252,
-) -> pd.DataFrame:
+    disable: bool = False,
+) -> Optional[pd.DataFrame]:
     """
     Harvey-Siddique (2000, JF) conditional co-skewness, using 12-month
     daily rolling window:
@@ -1000,7 +1002,37 @@ def co_skewness(
     where ε_i and ε_m are demeaned stock / market returns.
 
     Negative premium: high co-skewness earns lower returns. Negated.
+
+    Coordination with src/cz_signals.py::coskewness_signal
+    ------------------------------------------------------
+    There are TWO coskewness implementations in the codebase:
+      - this one (`co_skew_252`, daily 252-day window, src/features.py)
+      - `coskewness_signal` (monthly 60-month window, src/cz_signals.py),
+        which is only loaded when `--use-cz-signals` is set.
+
+    When both feed the model panel they dilute each other's importance.
+    To disable this daily implementation in favour of the C&Z monthly one,
+    EITHER:
+      - call this function with `disable=True`, OR
+      - set the environment variable `DISABLE_CO_SKEW_252=1` before invoking
+        the pipeline.
+
+    When CZ coskewness_signal is active, set DISABLE_CO_SKEW_252=1 to avoid
+    duplicate feature in panel.
+
+    When disabled (either via the kwarg or the env var) this function
+    returns `None`, signalling to the caller that the feature should be
+    skipped. Callers must guard against the None return (the caller in
+    `src/model.py` is the only known user; orchestration of when to set
+    the env var is handled by `run_signal_test_suite.py` and direct user
+    invocation, not by this module).
     """
+    # Honour the env-var kill-switch in addition to the explicit kwarg, so
+    # external orchestration (test suites, ad-hoc shell invocations) can
+    # disable this feature without code edits in callers.
+    if disable or os.environ.get("DISABLE_CO_SKEW_252", "0") == "1":
+        return None
+
     min_p = max(63, window // 2)
     r_mean = returns.rolling(window, min_periods=min_p).mean()
     m_mean = market_returns.rolling(window, min_periods=min_p).mean()

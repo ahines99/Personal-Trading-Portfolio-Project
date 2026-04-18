@@ -1,0 +1,29 @@
+Metric,Value
+CAGR,22.58%
+Total Return,1473.89%
+SPY CAGR,13.99%
+Alpha vs SPY,+8.60%
+Annualized Volatility,33.67%
+Sharpe Ratio,0.715
+Sortino Ratio,1.001
+Calmar Ratio,0.412
+Information Ratio,0.479
+Max Drawdown,-54.76%
+Avg Drawdown Duration,32 days
+Daily Win Rate,52.3%
+Monthly Win Rate,56.3%
+Profit Factor,1.14
+Tail Ratio,0.93
+Total Transaction Costs,"$47,200"
+Beta to Market,1.491
+Probabilistic Sharpe (PSR),0.995
+Deflated Sharpe (DSR),0.947
+Expected Max SR (null),0.271
+DSR n_trials,1
+After-Tax CAGR (est.),16.18%
+Effective Tax Rate,32.8%
+ST/LT Fraction,100% ST / 0% LT
+Tax Drag,7.41%
+TLH Benefit,1.00%
+After-Tax Alpha Hurdle vs SPY,0.00%
+Account Recommendation,Roth IRA strongly recommended (0% tax drag vs 32.8% in taxable)

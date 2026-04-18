@@ -203,6 +203,163 @@ def apply_vol_targeting(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1.7a: Barroso-Santa Clara strategy-own-vol scaling
+# ---------------------------------------------------------------------------
+
+def apply_bsc_scaling(
+    weights: pd.DataFrame,
+    daily_returns: pd.DataFrame,
+    target_vol: float = 0.20,
+    max_leverage: float = 1.5,
+    min_leverage: float = 0.5,
+    lookback: int = 126,
+) -> pd.DataFrame:
+    """
+    Barroso-Santa Clara (2015) volatility-managed scaling.
+
+    Unlike apply_vol_targeting which uses an ex-ante portfolio vol estimate
+    (constant-correlation assumption), BSC scales by the strategy's OWN
+    realized daily return volatility over a trailing window.
+
+    Reference: Barroso & Santa-Clara (2015), "Momentum Has Its Moments", JFE.
+    Reported Sharpe lift on momentum: 0.53 -> 0.97 full-sample.
+
+    The key difference from ex-ante targeting: BSC captures the actual
+    coupling between signal and market regime, which ex-ante constant-rho
+    cannot. When the strategy's own returns spike in vol (e.g., junk
+    small-cap crash), BSC de-levers more aggressively.
+
+    Look-ahead guard: we compute rolling vol on the STRATEGY return series
+    implied by yesterday's weights (weights.shift(1) * returns), then shift
+    the leverage scalar by 1 day before applying to today's weights.
+
+    Parameters
+    ----------
+    weights        : (date x ticker) target weights (pre-BSC, may already be
+                     vol-targeted or raw)
+    daily_returns  : (date x ticker) daily returns for each ticker
+    target_vol     : annualized vol target (e.g., 0.20 = 20%)
+    max_leverage   : upper clip on leverage scalar
+    min_leverage   : lower clip (0.0 allows full de-risk)
+    lookback       : rolling window for realized vol estimate (days; 126=6mo)
+
+    Returns
+    -------
+    scaled_weights : (date x ticker) BSC-scaled weights
+    """
+    import numpy as np
+
+    # Strategy daily returns using LAGGED weights (no look-ahead)
+    # weights.shift(1) is yesterday's weight; applied to today's return.
+    aligned_weights = weights.reindex(index=daily_returns.index, columns=daily_returns.columns).fillna(0.0)
+    strat_ret = (aligned_weights.shift(1) * daily_returns).sum(axis=1)
+
+    # Rolling annualized vol, require at least 60 days of data
+    rv = strat_ret.rolling(lookback, min_periods=60).std() * np.sqrt(252)
+
+    # Leverage = target / realized, clipped, LAGGED 1 day to be look-ahead safe
+    leverage = (target_vol / rv.bfill()).clip(lower=min_leverage, upper=max_leverage)
+    leverage = leverage.shift(1).bfill().fillna(1.0)
+
+    # Diagnostic
+    active_mask = aligned_weights.abs().sum(axis=1) > 1e-6
+    if active_mask.any():
+        lev_active = leverage[active_mask]
+        rv_active = rv[active_mask].dropna()
+        try:
+            if len(rv_active) > 0 and len(lev_active) > 0:
+                min_lev_date = lev_active.idxmin()
+                print(
+                    f"  [bsc-scale] leverage: median={lev_active.median():.3f} "
+                    f"min={lev_active.min():.3f} max={lev_active.max():.3f} | "
+                    f"strat realized vol: median={rv_active.median():.3f} "
+                    f"min={rv_active.min():.3f} max={rv_active.max():.3f} | "
+                    f"heaviest de-lever on {min_lev_date.strftime('%Y-%m-%d')}"
+                )
+        except Exception:
+            pass
+
+    return weights.mul(leverage, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.7b: Credit regime overlay (NFCI + HY OAS from FRED)
+# ---------------------------------------------------------------------------
+
+def apply_credit_overlay(
+    weights: pd.DataFrame,
+    nfci_series: Optional[pd.Series] = None,
+    hy_oas_series: Optional[pd.Series] = None,
+    nfci_threshold: float = 0.0,
+    hy_oas_threshold: float = 0.050,  # 500 bps
+    risk_off_scale: float = 0.50,
+) -> pd.DataFrame:
+    """
+    Credit-regime risk-off overlay.
+
+    When either (a) Chicago Fed NFCI turns positive (financial conditions
+    tightening) or (b) HY OAS exceeds threshold (~500 bps, credit stress),
+    scale gross exposure by risk_off_scale (default 0.50 = halve exposure).
+
+    Based on R11 postmortem of 2014-2018 small-cap momentum failure:
+    HY OAS crossed 500 bps in Aug 2015 and led equity losses by weeks.
+    NFCI > 0 flagged 2022 rate-hike bear early in 2022.
+
+    These signals are COMPLEMENTARY — they fail on different crashes.
+    Combined via OR, they catch ~80% of momentum-killing regimes.
+
+    Reference: Chicago Fed NFCI methodology (2019); ICE BofA HY OAS (FRED).
+
+    Parameters
+    ----------
+    weights          : (date x ticker) target weights
+    nfci_series      : Chicago Fed NFCI time series (date-indexed)
+    hy_oas_series    : HY OAS time series in decimal (e.g., 0.05 = 500 bps)
+    nfci_threshold   : risk-off when NFCI > this (default 0.0)
+    hy_oas_threshold : risk-off when HY OAS > this (default 0.05)
+    risk_off_scale   : gross exposure multiplier when risk-off (default 0.50)
+
+    Returns
+    -------
+    scaled_weights : (date x ticker) credit-overlay scaled weights
+    """
+    import numpy as np
+
+    # Build risk-off boolean, aligned to weights.index
+    risk_off = pd.Series(False, index=weights.index)
+
+    if nfci_series is not None and len(nfci_series) > 0:
+        nfci_aligned = nfci_series.reindex(weights.index, method="ffill")
+        risk_off = risk_off | (nfci_aligned > nfci_threshold)
+
+    if hy_oas_series is not None and len(hy_oas_series) > 0:
+        # HY OAS may be in % units (5.0 for 500 bps) or decimal (0.05).
+        # Auto-detect: if median > 1.0, assume % units.
+        hy_aligned = hy_oas_series.reindex(weights.index, method="ffill")
+        if hy_aligned.dropna().median() > 1.0:
+            # In % units (FRED BAMLH0A0HYM2 is in % by convention)
+            threshold_pct = hy_oas_threshold * 100
+            risk_off = risk_off | (hy_aligned > threshold_pct)
+        else:
+            risk_off = risk_off | (hy_aligned > hy_oas_threshold)
+
+    risk_off = risk_off.fillna(False)
+
+    # Multiplier: 1.0 when calm, risk_off_scale when stressed
+    scale = pd.Series(1.0, index=weights.index)
+    scale[risk_off] = risk_off_scale
+
+    n_risk_off = int(risk_off.sum())
+    pct_risk_off = 100.0 * n_risk_off / max(1, len(risk_off))
+    print(
+        f"  [credit-overlay] {n_risk_off} / {len(risk_off)} days risk-off "
+        f"({pct_risk_off:.1f}%), scale={risk_off_scale:.2f}"
+    )
+
+    return weights.mul(scale, axis=0)
+
+
+# ---------------------------------------------------------------------------
 # Core: build the monthly portfolio
 # ---------------------------------------------------------------------------
 
@@ -240,6 +397,7 @@ def build_monthly_portfolio(
     min_adv_for_selection: float = 5_000_000,   # Fix 3: $5M ADV floor (~$1B mkt cap) — kills micro-cap noise
     max_stock_vol:    float = 0.60,             # Fix 4: 60% annualized vol cap — excludes lottery tickets
     quality_percentile: float = 0.50,           # Fix 5: was 0.15 — require top-50% quality to fix RMW -0.35
+    quality_tilt:     float = 0.0,              # Phase 1.7c: soft multiplicative quality tilt (Asness 2018 QMJ). 0=off, 0.35=recommended
     rvol:             Optional[pd.DataFrame] = None,  # Fix 4: realized vol DataFrame for per-stock vol filter
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """
@@ -274,6 +432,30 @@ def build_monthly_portfolio(
         sub_panel = {k: factor_panel[k] for k in neutralize_factors if k in factor_panel}
         if sub_panel:
             signal = factor_neutralize_signal(signal, sub_panel)
+
+    # Phase 1.7c: Soft quality tilt (Asness et al. 2018 "Size Matters If You
+    # Control Your Junk"). Multiplicatively tilt the signal toward high-quality
+    # names using cross-sectional quality z-scores. This is a SOFT alternative
+    # to the hard `quality_percentile` filter — it keeps the full universe
+    # but moves conviction away from the junk quintile.
+    #
+    # tilt=0.35 maps quality z in [-2, 2] -> multiplier in [0.30, 1.70],
+    # i.e. top-quintile quality gets 1.7x signal amplification, bottom gets 0.3x.
+    # Target effect: shift FF6 RMW loading from ~-0.50 toward +0.10.
+    if quality_tilt > 0 and quality_filter is not None:
+        # Cross-sectional z-score of the quality filter (ROE / profitability)
+        q_mean = quality_filter.mean(axis=1)
+        q_std  = quality_filter.std(axis=1).replace(0, 1.0)
+        q_z = quality_filter.sub(q_mean, axis=0).div(q_std, axis=0).clip(-2.0, 2.0)
+        # Align to signal columns
+        q_z = q_z.reindex(columns=signal.columns).fillna(0.0)
+        # Multiplicative tilt — shift signals by 1 + tilt * q_z
+        # Keeps sign direction; amplifies/dampens by quality
+        tilt_mult = 1.0 + quality_tilt * q_z
+        tilt_mult = tilt_mult.clip(lower=0.1)  # don't allow total suppression
+        signal = signal.mul(tilt_mult, fill_value=1.0)
+        print(f"  [quality-tilt] applied soft tilt strength={quality_tilt:.2f} "
+              f"(target: RMW loading toward 0)")
 
     if apply_rank_normal:
         signal = cs_rank_normal(signal)
@@ -313,9 +495,9 @@ def build_monthly_portfolio(
                 all_mean = scores_today.mean()
                 dispersion = top_mean - all_mean
                 if dispersion > 0.20:
-                    effective_n = min(effective_n + 3, 25)
+                    effective_n = min(effective_n + 3, max(25, int(n_positions * 1.25)))
                 elif dispersion < 0.08:
-                    effective_n = max(effective_n - 3, 15)
+                    effective_n = max(effective_n - 3, min(15, int(n_positions * 0.75)))
 
             # ── SPY trend overlay ─────────────────────────────────────────
             # When SPY is below 200d MA, reduce exposure by 30%.

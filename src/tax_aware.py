@@ -318,6 +318,118 @@ def tax_aware_trade_filter(
     return adjusted
 
 
+class TaxAwareLedger:
+    """Lightweight cumulative ledger wrapping TaxLotTracker for backtest wiring.
+
+    Unlike TaxLotTracker.ytd_realized_* (which resets each calendar year),
+    this ledger accumulates realized ST/LT gains across the ENTIRE backtest
+    horizon so we can compute a true actual-HIFO after-tax CAGR at the end.
+
+    Trade accounting uses continuous "dollar-shares": a lot is recorded with
+    shares = dollars_traded / price so the ledger works cleanly with float
+    position sizes from weight-based rebalancing.
+    """
+
+    def __init__(self, st_rate: float = 0.328, lt_rate: float = 0.188):
+        self.tracker = TaxLotTracker(st_rate=st_rate, lt_rate=lt_rate)
+        self.st_rate = st_rate
+        self.lt_rate = lt_rate
+        self.cum_st_gain: float = 0.0
+        self.cum_lt_gain: float = 0.0
+        self.cum_realized_gain: float = 0.0
+        self.n_buys: int = 0
+        self.n_sells: int = 0
+        self.gross_sold_dollars: float = 0.0
+
+    def record_buy(self, ticker: str, dollars: float, price: float, trade_date: date):
+        """Record a buy; dollars > 0."""
+        if dollars <= 0 or price <= 0:
+            return
+        shares = dollars / price
+        self.tracker.add_lot(ticker, shares, price, trade_date)
+        self.n_buys += 1
+
+    def record_sell(self, ticker: str, dollars: float, price: float, trade_date: date):
+        """Record a sell; dollars > 0 (absolute notional)."""
+        if dollars <= 0 or price <= 0:
+            return
+        shares = dollars / price
+        available = self.tracker.get_position(ticker)
+        if available <= 0:
+            return
+        shares = min(shares, available)
+        # execute_sell resets YTD totals on year boundaries, so capture the
+        # per-call realized ST/LT delta by snapshotting before/after.
+        st_before = self.tracker.ytd_realized_st
+        lt_before = self.tracker.ytd_realized_lt
+        year_before = self.tracker._year
+        self.tracker.execute_sell(ticker, shares, price, trade_date)
+        if self.tracker._year != year_before:
+            # Year rolled: before-values belong to previous year, delta is just the new totals
+            st_delta = self.tracker.ytd_realized_st
+            lt_delta = self.tracker.ytd_realized_lt
+        else:
+            st_delta = self.tracker.ytd_realized_st - st_before
+            lt_delta = self.tracker.ytd_realized_lt - lt_before
+        self.cum_st_gain += st_delta
+        self.cum_lt_gain += lt_delta
+        self.cum_realized_gain += (st_delta + lt_delta)
+        self.gross_sold_dollars += dollars
+        self.n_sells += 1
+
+    def summary(self, final_nav: float, initial_capital: float, years: float) -> dict:
+        """Compute actual after-tax CAGR using realized ST/LT gains.
+
+        We treat taxes as paid out of NAV at the end of the horizon (a
+        conservative proxy for pay-as-you-go since taxes on short-term gains
+        are owed in the year realized). Unrealized gains at horizon end are
+        NOT taxed (deferred), which is the correct treatment for a live
+        portfolio still in flight.
+        """
+        st = self.cum_st_gain
+        lt = self.cum_lt_gain
+        realized = st + lt
+        tax_paid = max(st, 0.0) * self.st_rate + max(lt, 0.0) * self.lt_rate
+        # Losses offset gains within each bucket first; use a simple netted rule:
+        net_st_taxable = max(st, 0.0) if st > 0 else 0.0
+        net_lt_taxable = max(lt, 0.0) if lt > 0 else 0.0
+        # Apply loss offset: if ST net negative, it reduces LT taxable (and vice versa)
+        if st < 0 and lt > 0:
+            net_lt_taxable = max(0.0, lt + st)
+        if lt < 0 and st > 0:
+            net_st_taxable = max(0.0, st + lt)
+        tax_paid = net_st_taxable * self.st_rate + net_lt_taxable * self.lt_rate
+
+        after_tax_nav = final_nav - tax_paid
+        if years > 0 and initial_capital > 0 and after_tax_nav > 0:
+            pretax_cagr = (final_nav / initial_capital) ** (1.0 / years) - 1.0
+            after_tax_cagr = (after_tax_nav / initial_capital) ** (1.0 / years) - 1.0
+            effective_rate = 1.0 - (after_tax_cagr / pretax_cagr) if pretax_cagr > 0 else 0.0
+        else:
+            pretax_cagr = 0.0
+            after_tax_cagr = 0.0
+            effective_rate = 0.0
+
+        st_frac = (st / realized) if realized > 0 else 0.0
+        lt_frac = (lt / realized) if realized > 0 else 0.0
+
+        return {
+            "pretax_cagr_actual": pretax_cagr,
+            "after_tax_cagr_hifo": after_tax_cagr,
+            "cum_st_gain": st,
+            "cum_lt_gain": lt,
+            "cum_realized_gain": realized,
+            "tax_paid": tax_paid,
+            "effective_tax_rate_actual": effective_rate,
+            "st_fraction_actual": st_frac,
+            "lt_fraction_actual": lt_frac,
+            "n_buys": self.n_buys,
+            "n_sells": self.n_sells,
+            "gross_sold_dollars": self.gross_sold_dollars,
+            "open_lots_at_end": len(self.tracker.lots),
+        }
+
+
 def compute_tax_summary(tracker: TaxLotTracker, prices: Dict[str, float],
                         as_of: date) -> dict:
     """Compute a summary of the portfolio's tax position.

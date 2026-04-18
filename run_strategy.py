@@ -23,13 +23,19 @@ Usage:
 
 import argparse
 import gc
+import os
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+# Pandas compatibility shim — must run BEFORE any pickle.load on cached data.
+# Patches StringDtype to silently drop deprecated `na_value` arg from old caches.
+import pandas_compat  # noqa: F401
 
 from data_loader     import load_prices, get_close, get_returns, get_volume, get_sectors
 from features        import (build_composite_signal, realized_volatility,
@@ -43,9 +49,10 @@ from metrics         import (compute_full_tearsheet, monte_carlo_sharpe,
 from model           import build_feature_matrix, build_labels, WalkForwardModel
 from regime          import (detect_combined_regime, build_market_series,
                               performance_by_regime, stress_test)
-from robustness      import bootstrap_tearsheet
+from robustness      import bootstrap_tearsheet, run_full_robustness
 from dashboard       import build_dashboard
-from alt_data_loader import (load_edgar_fundamentals, load_fred_macro,
+from alt_data_loader import (load_edgar_fundamentals, load_edgar_fundamentals_extra,
+                              load_fred_macro,
                               load_vix_term_structure, load_short_interest,
                               load_earnings_calendar, load_insider_transactions,
                               load_analyst_actions, load_earnings_estimates,
@@ -57,6 +64,7 @@ from alt_data_loader import (load_edgar_fundamentals, load_fred_macro,
                               load_treasury_yield_curve)
 from alt_features    import build_alt_features
 from api_data        import load_all_api_data
+from cz_signals      import build_cz_price_signals, build_cz_accounting_signals
 
 
 def parse_args():
@@ -74,8 +82,8 @@ def parse_args():
     p.add_argument("--end",             default="2026-03-01")
     p.add_argument("--capital",         default=100_000, type=float,
                    help="Starting capital (default $100K)")
-    p.add_argument("--n-positions",     default=20, type=int,
-                   help="Number of stocks to hold (default 20)")
+    p.add_argument("--n-positions",     default=30, type=int,
+                   help="Number of stocks to hold (SWEEP-1 winner: N=30 @ 17.81% CAGR)")
     p.add_argument("--weighting",       default="signal",
                    choices=["equal", "signal", "inverse_vol"],
                    help="Position weighting scheme")
@@ -88,8 +96,19 @@ def parse_args():
     p.add_argument("--skip-ml",         action="store_true")
     p.add_argument("--skip-alt-data",   action="store_true")
     p.add_argument("--skip-robustness", action="store_true")
+    p.add_argument("--results-dir", default=None,
+                   help="Override results output directory (for parallel sweeps)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Force a cache miss for the feature panel by setting "
+                        "DENY_LIST_HASH_SUFFIX to a random UUID for this run.")
+    p.add_argument("--clear-cache", action="store_true",
+                   help="Before any work, delete data/cache/feature_panel_*.pkl "
+                        "and data/cache/ml_predictions_*.pkl. Prints the deleted "
+                        "files and total bytes freed.")
+    p.add_argument("--n-permutations", type=int, default=100,
+                   help="Permutation test iterations (0 to skip permutation only)")
     p.add_argument("--n-bootstrap",     default=500, type=int)
-    p.add_argument("--forward-window",  default=5, type=int,
+    p.add_argument("--forward-window",  default=7, type=int,
                    help="Forward return window for ML labels (default 5 = weekly; "
                         "aligns with where alpha decays to — 21d IC is negative, 5d IC_IR=0.062)")
     p.add_argument("--retrain-freq", default=63, type=int,
@@ -103,10 +122,10 @@ def parse_args():
     p.add_argument("--sector-rank-weight", default=0.0, type=float,
                    help="Weight on within-sector rank in label construction "
                         "(0.0 = pure universe rank, default; 0.5 = legacy 50/50 blend)")
-    p.add_argument("--beta-neutral-labels", action="store_true",
-                   help="Residualize forward-return labels vs SPY beta (Tier 1 fix for "
-                        "beta drag at the LABEL layer; OFF by default). When ON, passes "
-                        "market_returns to build_labels and WalkForwardModel.")
+    p.add_argument("--beta-neutral-labels", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Residualize forward-return labels vs SPY beta. "
+                        "(Run 1 revert: default OFF. SPY fix preserved for when re-enabled.)")
     p.add_argument("--stop-loss",       default=0.15, type=float,
                    help="Stop-loss threshold (default 15%%)")
     p.add_argument("--cash-in-bear",    default=0.15, type=float,
@@ -115,16 +134,29 @@ def parse_args():
                    help="Run Optuna Bayesian hyperparameter search before final fit")
     p.add_argument("--optuna-trials",   default=40, type=int,
                    help="Number of Optuna trials when --optimize-ml is set (default 40)")
-    p.add_argument("--vol-target",      default=0.16, type=float,
+    p.add_argument("--vol-target",      default=0.40, type=float,
                    help="Annualized vol target for portfolio leverage scaling "
                         "(default 0.16 = 16%%, ENABLED by default per Moreira-Muir 2017 "
                         "and DeMiguel et al. JF 2024; pass 0 or --no-vol-target to disable)")
     p.add_argument("--no-vol-target",   action="store_true",
                    help="Disable vol targeting overlay (overrides --vol-target)")
-    p.add_argument("--max-leverage",    default=1.3, type=float,
+    p.add_argument("--max-leverage",    default=2.0, type=float,
                    help="Max leverage cap for vol targeting (default 1.3 = up to 30%% margin; "
                         "Moreira-Muir requires leverage > 1 to capture the Sharpe lift during "
                         "low-vol regimes. IBKR Reg-T allows 2:1, so 1.3 is conservative)")
+    p.add_argument("--min-leverage",    default=0.8, type=float,
+                   help="Min leverage floor for vol targeting (default 0.8). "
+                        "Lower floors let high-vol months collapse net beta; "
+                        "raise to 1.0 for lever-up-only asymmetric targeting.")
+    p.add_argument("--vol-ceiling",     default=0.25, type=float,
+                   help="Upper clip on ex-ante portfolio vol used in vol-targeting "
+                        "denominator (default 0.25). With a small-cap book whose "
+                        "realized vol is ~0.30, this ceiling pins effective leverage "
+                        "at target_vol/0.25. Raise to 0.35-0.40 to let --vol-target "
+                        ">= 0.25 actually engage leverage above 1.0x.")
+    p.add_argument("--vol-floor",       default=0.08, type=float,
+                   help="Lower clip on ex-ante portfolio vol (default 0.08). "
+                        "Prevents silly leverage spikes in post-crash vol collapses.")
     p.add_argument("--use-vol-buckets", action="store_true",
                    help="Use vol-bucket-neutral selection (V4 default, now OFF — suppresses beta)")
     p.add_argument("--max-selection-pool", default=1500, type=int,
@@ -150,7 +182,7 @@ def parse_args():
     p.add_argument("--num-leaves", default=20, type=int,
                    help="LightGBM num_leaves (default 20, shallow per Israel-Kelly-Moskowitz 2020)")
     p.add_argument("--n-estimators", default=300, type=int,
-                   help="LightGBM n_estimators (default 300; early stopping catches most windows)")
+                   help="LightGBM n_estimators (default 300; Run 1 revert from 1500)")
     p.add_argument("--max-depth", default=5, type=int,
                    help="LightGBM max_depth (default 5, consistent with num_leaves=20)")
     p.add_argument("--warm-start-lgbm", action="store_true",
@@ -175,20 +207,32 @@ def parse_args():
                    help="LambdaRank truncation level (default 20)")
     p.add_argument("--use-return-decile-gain", action="store_true",
                    help="Use return-decile gain mapping in ranking objective")
-    p.add_argument("--use-magnitude-weights", action="store_true",
-                   help="Weight samples by absolute forward-return magnitude")
+    p.add_argument("--use-magnitude-weights", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Weight samples by absolute forward-return magnitude (Run 1 revert: default OFF)")
     p.add_argument("--huber-weight", default=0.0, type=float,
                    help="Blend weight on Huber regression head (default 0.0)")
     p.add_argument("--quantile-weight", default=0.0, type=float,
                    help="Blend weight on quantile regression head (default 0.0)")
     p.add_argument("--quantile-alpha", default=0.75, type=float,
                    help="Quantile level for quantile regression head (default 0.75)")
-    p.add_argument("--use-meta-labeling", action="store_true",
-                   help="Enable meta-labeling second-stage classifier")
+    p.add_argument("--use-meta-labeling", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Meta-labeling second-stage classifier. R3 tested reject-gate "
+                        "variant and regressed -68 bps — kept off by default.")
 
     # ── Sample-weight + regularization flags ─────────────────────────────
     p.add_argument("--min-data-in-leaf", default=200, type=int,
-                   help="LightGBM min_data_in_leaf (default 200)")
+                   help="LightGBM min_data_in_leaf (default 200; Run 1 reverted from 1000 "
+                        "which over-regularized and lost A0's #1 feature)")
+    p.add_argument("--sample-weight-halflife-years", default=4.5, type=float,
+                   help="Phase 2.5: Exponential sample-weight decay halflife in "
+                        "TRADING YEARS (default 2.5 = 630 trading days, preserves "
+                        "prior hardcoded behavior). Samples N years before the "
+                        "training window's last date get weight 0.5^(N/halflife). "
+                        "Set to 0 to disable decay entirely (equal weight). "
+                        "R18 agent recommended 4.5 years for non-stationary factor "
+                        "environments per Gu-Kelly-Xiu (2020).")
     p.add_argument("--use-uniqueness-weights", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Apply label uniqueness sample-weights (default ON)")
@@ -198,8 +242,11 @@ def parse_args():
     p.add_argument("--early-stop-on-ic", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Early-stop boosters on rank-IC rather than loss (default ON)")
+    p.add_argument("--use-era-weights", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Phase E: era-weighted ensemble blending from trailing per-model IC (default OFF)")
     p.add_argument("--lgbm-num-seeds", default=1, type=int,
-                   help="Number of LightGBM seeds to average (default 1)")
+                   help="Number of LightGBM seeds to average (default 1; Run 1 revert from 5)")
     p.add_argument("--use-mlp", action="store_true",
                    help="Include MLP head in ensemble (default OFF)")
     p.add_argument("--random-state", default=42, type=int,
@@ -230,15 +277,83 @@ def parse_args():
     p.add_argument("--sector-neutralize-fundamentals", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Sector-neutralize fundamentals (default ON)")
+    # Sprint 2: EDGAR text-based signals (Lazy Prices + LM sentiment)
+    p.add_argument("--use-lazy-prices", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable Cohen-Malloy-Nguyen Lazy Prices text similarity signal "
+                        "(requires data/cache/edgar_text/ populated)")
+    p.add_argument("--use-lm-sentiment", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable Loughran-McDonald sentiment features from EDGAR text "
+                        "(requires data/cache/edgar_text/ populated)")
+    p.add_argument("--edgar-text-cache-dir", default="data/cache/edgar_text", type=str,
+                   help="Cache directory for EDGAR 10-K/10-Q text filings")
+    p.add_argument("--use-sraf-sentiment", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable SRAF pre-computed LM sentiment features "
+                        "(requires data/cache/sraf/lm_10x_summaries_1993_2025.csv)")
+    p.add_argument("--sraf-csv-path",
+                   default="data/cache/sraf/lm_10x_summaries_1993_2025.csv", type=str,
+                   help="Path to SRAF 10X summaries CSV")
+    # Phase 6: FINRA historical bi-monthly short interest
+    p.add_argument("--use-finra-short-interest", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="FINRA short interest signals (Fixed2: +138 bps, 0.785 Sharpe). "
+                        "Publication-date aligned after bug fix.")
+    # Phase B: EODHD $60 data upgrades
+    p.add_argument("--use-eodhd-earnings", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="EODHD bulk earnings calendar with beforeAfterMarket timing "
+                        "(Phase D: enables EAR timing fix)")
+    # Phase F: Chen-Zimmermann anomaly signals (price-only)
+    p.add_argument("--use-cz-signals", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable C&Z price-only anomaly signals: coskewness, "
+                        "coskew_acx, mom_season (Heston-Sadka 6-10yr seasonality). "
+                        "Discovered via run_cz_research.py IC analysis.")
+    p.add_argument("--cz-only", default=None, type=str,
+                   help="Comma-separated list of C&Z signal names to enable; "
+                        "all others disabled. e.g. --cz-only=xfin,coskewness. "
+                        "Valid names: coskewness, coskew_acx, mom_season, "
+                        "payout_yield, net_payout_yield, xfin, cfp, "
+                        "operprof_rd, tax, deldrc. "
+                        "Mutually exclusive with --cz-exclude.")
+    p.add_argument("--cz-exclude", default=None, type=str,
+                   help="Comma-separated list of C&Z signal names to disable; "
+                        "others stay default-enabled. e.g. --cz-exclude=tax,deldrc. "
+                        "Mutually exclusive with --cz-only.")
+    # Phase G: Options-derived signals (Orats historical + Tradier live)
+    p.add_argument("--use-options-signals", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable options-derived signals: dCPVolSpread, SmileSlope, "
+                        "VRP, IV Rank, Risk Reversal, etc. Requires data/cache/options/ "
+                        "populated by run_options_setup.py --download-orats")
 
     # ── Portfolio signal shaping flags ───────────────────────────────────
-    p.add_argument("--signal-smooth-halflife", default=5.0, type=float,
+    p.add_argument("--signal-smooth-halflife", default=10.0, type=float,
                    help="Exp half-life (days) for signal smoothing in portfolio "
                         "construction (default 5.0)")
     p.add_argument("--apply-rank-normal", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Apply rank-normal transform to signals pre-selection "
                         "(default ON)")
+
+    # ── Prediction neutralization (Phase E: Numerai-style) ────────────────
+    p.add_argument("--neutralize-strength", default=0.0, type=float,
+                   help="Partial feature neutralization strength on predictions "
+                        "(0.0 = disabled, 0.5 = recommended partial, 1.0 = full). "
+                        "Regresses out systematic factor exposures post-prediction. "
+                        "Default 0.0 preserves locked baseline.")
+    p.add_argument("--neutralize-features", default=None, nargs="*", type=str,
+                   help="Features to neutralize against (default: auto-select "
+                        "mkt_beta_63d, log_mcap_z, mom_12_1, rvol_63d). "
+                        "Pass explicit list to override.")
+    p.add_argument("--use-rank-targets", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Numerai-style percentile-rank target transform. Labels "
+                        "become continuous [0,1] cross-sectional ranks instead of "
+                        "6 discrete grades. LGBM gets re-discretized grades for "
+                        "LambdaRank; Ridge trains on continuous ranks. Default OFF.")
 
     # ── ML / momentum blend ──────────────────────────────────────────────
     p.add_argument("--ml-blend", default=0.70, type=float,
@@ -252,9 +367,9 @@ def parse_args():
     p.add_argument("--max-stock-vol", default=0.60, type=float,
                    help="Maximum annualized 63d vol for stock selection (0.60 = 60%%). "
                         "Kills high-vol speculative names that drove -52%% max DD.")
-    p.add_argument("--quality-percentile", default=0.50, type=float,
+    p.add_argument("--quality-percentile", default=0.70, type=float,
                    help="Minimum quality (ROE/profitability) percentile for selection. "
-                        "0.50 = require top-50%% quality. Fixes RMW -0.35 anti-profitability "
+                        "SWEEP-2U winner: 0.70 @ 18.70% CAGR. Fixes RMW -0.35 anti-profitability "
                         "loading from baseline.")
     p.add_argument("--min-holding-overlap", default=0.70, type=float,
                    help="Minimum fraction of positions retained between rebalances. "
@@ -263,7 +378,46 @@ def parse_args():
                    help="Enable mid-month position swap (adds ~170%% turnover for marginal "
                         "signal improvement). OFF by default.")
 
-    return p.parse_args()
+    # ── Phase 1.7: Regime overlay + quality tilt (research-backed) ────────
+    p.add_argument("--bsc-scaling", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable Barroso-Santa Clara (2015) strategy-own-vol scaling. "
+                        "Replaces ex-ante vol-targeting with realized strategy vol. "
+                        "(Run 1 revert: default OFF -- B0 showed aggressive deleveraging "
+                        "killed CAGR. Use apply_vol_targeting at vol_target=0.30 instead.)")
+    p.add_argument("--bsc-target-vol", default=0.20, type=float,
+                   help="BSC target annualized vol (default 0.20 = 20%%)")
+    p.add_argument("--bsc-lookback", default=126, type=int,
+                   help="BSC rolling vol lookback in trading days (default 126 = 6mo)")
+    p.add_argument("--bsc-min-leverage", default=0.30, type=float,
+                   help="BSC minimum leverage floor (default 0.30, Tier1). "
+                        "Allows aggressive de-risking in crisis.")
+    p.add_argument("--credit-overlay", action="store_true",
+                   help="Enable credit-regime risk-off overlay (NFCI + HY OAS). "
+                        "Halves gross exposure when credit conditions tighten.")
+    p.add_argument("--credit-risk-off-scale", default=0.50, type=float,
+                   help="Gross exposure multiplier when credit risk-off (default 0.50)")
+    p.add_argument("--credit-nfci-threshold", default=0.0, type=float,
+                   help="NFCI threshold for risk-off (default 0.0; >0 = tight)")
+    p.add_argument("--credit-hyoas-threshold", default=0.050, type=float,
+                   help="HY OAS threshold in decimal (default 0.050 = 500 bps)")
+    p.add_argument("--quality-tilt", default=0.35, type=float,
+                   help="Soft multiplicative quality tilt (Asness 2018 QMJ). "
+                        "0.0=off (default), 0.35=recommended. Shifts signal toward "
+                        "high-profitability names to neutralize RMW loading from "
+                        "~-0.50 toward 0. Does NOT filter the universe, only tilts.")
+    p.add_argument("--force-spy-in-panel", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Force SPY into the price panel even if not in liquidity universe "
+                        "(default ON). Fixes regime detector fallback to equal-weight proxy.")
+    p.add_argument("--use-tax-aware", action="store_true",
+                   help="Enable HIFO tax-lot tracking during backtest and emit "
+                        "actual after-tax CAGR (gated OFF by default).")
+
+    args = p.parse_args()
+    if args.cz_only and args.cz_exclude:
+        p.error("--cz-only and --cz-exclude are mutually exclusive")
+    return args
 
 
 def section(title: str):
@@ -426,8 +580,31 @@ def optimize_hyperparameters_pruned(
 
 
 def run(args):
-    results_dir = Path(__file__).parent / "results"
-    results_dir.mkdir(exist_ok=True)
+    results_dir = Path(__file__).parent / (getattr(args, "results_dir", None) or "results")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Cache management flags ──────────────────────────────────────────
+    if getattr(args, "no_cache", False):
+        suffix = uuid.uuid4().hex
+        os.environ["DENY_LIST_HASH_SUFFIX"] = suffix
+        print(f"[cache] --no-cache: forcing miss via DENY_LIST_HASH_SUFFIX={suffix}")
+    if getattr(args, "clear_cache", False):
+        cache_root = Path(__file__).parent / "data" / "cache"
+        patterns = ["feature_panel_*.pkl", "ml_predictions_*.pkl"]
+        deleted_files = []
+        total_bytes = 0
+        for pat in patterns:
+            for path in cache_root.glob(pat):
+                try:
+                    sz = path.stat().st_size
+                    path.unlink()
+                    deleted_files.append(path)
+                    total_bytes += sz
+                    print(f"[cache] deleted {path} ({sz:,} bytes)")
+                except OSError as e:
+                    print(f"[cache] failed to delete {path}: {e}")
+        print(f"[cache] --clear-cache: removed {len(deleted_files)} file(s), "
+              f"freed {total_bytes:,} bytes ({total_bytes / (1024*1024):.2f} MiB)")
 
     section("PERSONAL TRADING PORTFOLIO")
     print(f"  Period:     {args.start} -> {args.end}")
@@ -458,6 +635,40 @@ def run(args):
     volume  = get_volume(prices)
     print(f"      {len(close.columns)} tickers x {len(close)} trading days")
 
+    # ── Phase 1.6: Force SPY into price panel (fixes regime detector fallback) ──
+    # regime.py falls back to an equal-weighted universe proxy when SPY is
+    # missing, which produces a weaker bear signal and misfires on small-cap
+    # crashes. Force-load SPY here so regime.py, benchmarking, and factor
+    # regressions all use the real SPY series.
+    if args.force_spy_in_panel and "SPY" not in close.columns:
+        try:
+            spy_panel = load_prices(
+                ["SPY"], start=args.start, end=args.end,
+                use_cache=True, dynamic_universe=False,
+            )
+            spy_close  = get_close(spy_panel)
+            spy_ret    = get_returns(spy_panel)
+            spy_vol    = get_volume(spy_panel)
+            if "SPY" in spy_close.columns:
+                # Align to existing index
+                close["SPY"]   = spy_close["SPY"].reindex(close.index)
+                returns["SPY"] = spy_ret["SPY"].reindex(returns.index)
+                volume["SPY"]  = spy_vol["SPY"].reindex(volume.index)
+                # Also inject into the multi-level `prices` panel so regime.py sees it.
+                # prices is a multi-level DataFrame with (field, ticker) columns.
+                try:
+                    for field in ["Open", "High", "Low", "Close", "Volume"]:
+                        if (field, "SPY") not in prices.columns and field in spy_panel.columns.get_level_values(0):
+                            prices[(field, "SPY")] = spy_panel[field]["SPY"].reindex(prices.index)
+                except Exception as e:
+                    print(f"      [SPY] panel inject warning (non-fatal): {e}")
+                print(f"      [SPY] force-loaded into price panel (Phase 1.6 fix)")
+            else:
+                print(f"      [SPY] WARNING: load_prices(['SPY']) returned empty; "
+                      f"regime detector will fall back to equal-weight proxy")
+        except Exception as e:
+            print(f"      [SPY] load failed: {e}. regime detector will fall back.")
+
     print("[1b/6] Loading sector map...")
     sector_map = get_sectors(close.columns.tolist())
 
@@ -465,6 +676,11 @@ def run(args):
     # Alternative data
     # ------------------------------------------------------------------
     alt_features_dict = None
+    fred_df = None  # Phase 1.8 fix: initialize so credit overlay scope check works even if skip_alt_data
+    # Phase 1.8 fix: initialize credit overlay stashes so they're always defined,
+    # even if --skip-alt-data (which skips the fred_df load and the stash-before-del step).
+    credit_overlay_nfci = None
+    credit_overlay_hy_oas = None
     if not args.skip_alt_data:
         print("[1c/6] Loading alternative data sources...")
         tickers_list = close.columns.tolist()
@@ -474,7 +690,26 @@ def run(args):
         vix_df   = load_vix_term_structure(start=args.start, end=args.end)
         si_df    = load_short_interest(tickers_list)
 
-        earnings_dict = load_earnings_calendar(tickers_list, start=args.start, end=args.end)
+        # Phase 1.7b: Chicago Fed NFCI (not in the default FRED loader yet).
+        # Fetch inline so we don't invalidate the fred_df cache.
+        if "NFCI" not in fred_df.columns:
+            try:
+                import pandas as _pd_nfci
+                _nfci_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NFCI"
+                _nfci_df = _pd_nfci.read_csv(_nfci_url, index_col=0, parse_dates=True)
+                _nfci_s = _nfci_df.iloc[:, 0].replace(".", float("nan")).astype(float)
+                _nfci_s = _nfci_s.reindex(fred_df.index, method="ffill").shift(1)
+                fred_df = fred_df.copy()
+                fred_df["NFCI"] = _nfci_s
+                print(f"      [FRED] NFCI fetched inline: {_nfci_s.notna().sum()} valid obs")
+            except Exception as _e_nfci:
+                print(f"      [FRED] NFCI fetch failed: {_e_nfci} (credit overlay will use HY OAS only)")
+
+        if args.use_eodhd_earnings:
+            from src.alt_data_loader import load_earnings_calendar_eodhd
+            earnings_dict = load_earnings_calendar_eodhd(tickers_list, start=args.start, end=args.end)
+        else:
+            earnings_dict = load_earnings_calendar(tickers_list, start=args.start, end=args.end)
         insider_dict  = load_insider_transactions(tickers_list, start=args.start, end=args.end)
         analyst_dict  = load_analyst_actions(tickers_list, start=args.start, end=args.end)
         estimates_df  = load_earnings_estimates(tickers_list)
@@ -526,6 +761,14 @@ def run(args):
             sector_oas_df     = sector_oas_df_,
             ebp_df            = ebp_df_,
             treasury_yields_df = treasury_df_,
+            # Sprint 2: EDGAR text features
+            use_lazy_prices       = args.use_lazy_prices,
+            use_lm_sentiment      = args.use_lm_sentiment,
+            use_sraf_sentiment    = args.use_sraf_sentiment,
+            sraf_csv_path         = args.sraf_csv_path,
+            edgar_text_cache_dir  = args.edgar_text_cache_dir,
+            # Phase 6: FINRA historical bi-monthly short interest
+            use_finra_short_interest = args.use_finra_short_interest,
         )
         n_alt = len(alt_features_dict)
         print(f"      {n_alt} alt feature panels loaded")
@@ -542,12 +785,126 @@ def run(args):
             tickers=close.columns.tolist(),
             date_index=close.index,
             finnhub_max=500,  # top 500 tickers for Finnhub (rate limit)
+            close_prices=close,
         )
         if api_features:
             if alt_features_dict is None:
                 alt_features_dict = {}
             alt_features_dict.update(api_features)
             print(f"      Total features (free + paid): {len(alt_features_dict)}")
+
+    # ------------------------------------------------------------------
+    # Chen-Zimmermann anomaly signals (re-implemented from C&Z research)
+    # ------------------------------------------------------------------
+    if args.use_cz_signals:
+        print("[1e/6] Building C&Z anomaly signals...")
+
+        # ── Build per-signal enable dicts from CLI flags ─────────────────
+        cz_price_names = ["coskewness", "coskew_acx", "mom_season"]
+        cz_acct_names = ["payout_yield", "net_payout_yield", "xfin", "cfp",
+                         "operprof_rd", "tax", "deldrc"]
+        cz_all_names = set(cz_price_names) | set(cz_acct_names)
+
+        if args.cz_only:
+            requested = {s.strip() for s in args.cz_only.split(",") if s.strip()}
+            unknown = requested - cz_all_names
+            if unknown:
+                print(f"      [cz] WARNING: --cz-only had unknown names: "
+                      f"{sorted(unknown)} (valid: {sorted(cz_all_names)})")
+            enable_price = {n: (n in requested) for n in cz_price_names}
+            enable_accounting = {n: (n in requested) for n in cz_acct_names}
+        elif args.cz_exclude:
+            excluded = {s.strip() for s in args.cz_exclude.split(",") if s.strip()}
+            unknown = excluded - cz_all_names
+            if unknown:
+                print(f"      [cz] WARNING: --cz-exclude had unknown names: "
+                      f"{sorted(unknown)} (valid: {sorted(cz_all_names)})")
+            enable_price = {n: (n not in excluded) for n in cz_price_names}
+            enable_accounting = {n: (n not in excluded) for n in cz_acct_names}
+        else:
+            enable_price = {n: True for n in cz_price_names}
+            enable_accounting = {n: True for n in cz_acct_names}
+
+        print(f"[cz] price enabled: {sorted([k for k, v in enable_price.items() if v])}")
+        print(f"[cz] accounting enabled: "
+              f"{sorted([k for k, v in enable_accounting.items() if v])}")
+
+        # --- Price-only signals ---
+        market_ret = returns["SPY"] if "SPY" in returns.columns else returns.mean(axis=1)
+        cz_price = build_cz_price_signals(
+            returns=returns,
+            market_returns=market_ret,
+            enable=enable_price,
+        )
+        if cz_price:
+            alt_features_dict.update(cz_price)
+            print(f"      C&Z price signals added: {list(cz_price.keys())}")
+
+        # --- Accounting signals (require EDGAR extra fields) ---
+        if not args.skip_alt_data and not edgar_df.empty:
+            print("[1e2/6] Loading EDGAR extra fields for C&Z accounting signals...")
+            edgar_extra_df = load_edgar_fundamentals_extra(
+                tickers_list, start=args.start, end=args.end,
+            )
+            if not edgar_extra_df.empty:
+                cz_acct = build_cz_accounting_signals(
+                    edgar_extra=edgar_extra_df,
+                    edgar_main=edgar_df,
+                    tickers=close.columns,
+                    date_index=close.index,
+                    close=close,
+                    enable=enable_accounting,
+                )
+                if cz_acct:
+                    alt_features_dict.update(cz_acct)
+                    print(f"      C&Z accounting signals added: {list(cz_acct.keys())}")
+
+    # ------------------------------------------------------------------
+    # Options-derived signals (Phase G: Orats historical + Tradier live)
+    # ------------------------------------------------------------------
+    if args.use_options_signals:
+        print("[1f/6] Loading options signals (Orats + Tradier)...")
+        try:
+            from options_signals import build_options_signals
+            iv_panels_path = Path("data/cache/options/iv_panels_orats.pkl")
+            if not iv_panels_path.exists():
+                print(f"      [opts] No IV panels at {iv_panels_path}")
+                print(f"      [opts] Run: python run_options_setup.py --download-orats")
+            else:
+                iv_panels = pd.read_pickle(iv_panels_path)
+                # Pass earnings calendar (loaded earlier as `earnings_dict`)
+                # so the iv_crush signal (Beber-Brandt) can identify event
+                # dates. Falls back to None if alt-features path didn't run.
+                _earn_cal_for_opts = locals().get("earnings_dict", None)
+                opt_signals = build_options_signals(
+                    iv_panels=iv_panels,
+                    returns=returns,
+                    target_tickers=close.columns,
+                    target_date_index=close.index,
+                    earnings_calendar=_earn_cal_for_opts,
+                )
+                if opt_signals:
+                    alt_features_dict.update(opt_signals)
+                    print(f"      Options signals added: {list(opt_signals.keys())}")
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Options signals failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Phase 1.8 fix: before deleting fred_df, extract NFCI + HY OAS series
+    # needed by the credit overlay. Otherwise they're gone by the time the
+    # overlay tries to apply them at portfolio construction.
+    credit_overlay_nfci = None
+    credit_overlay_hy_oas = None
+    if fred_df is not None:
+        try:
+            if "NFCI" in fred_df.columns:
+                credit_overlay_nfci = fred_df["NFCI"].copy()
+            if "BAMLH0A0HYM2" in fred_df.columns:
+                credit_overlay_hy_oas = fred_df["BAMLH0A0HYM2"].copy()
+        except Exception as _e:
+            print(f"      [credit-overlay prep] warning: {_e}")
 
     # Free raw alt-data DataFrames no longer needed (signals already built).
     # Keeps alt_features_dict (the signal panels) but drops the heavy source data.
@@ -616,8 +973,17 @@ def run(args):
             winsorize=args.winsorize,
             cs_zscore_all=args.cs_zscore_all,
         )
-        # Equal-weighted market-return proxy for beta-neutral labels
-        mkt_return = returns.mean(axis=1) if args.beta_neutral_labels else None
+        # Tier1 fix: Use SPY as market proxy, not equal-weighted universe mean.
+        # EW-universe has small-cap bias identical to what we're trying to strip.
+        if args.beta_neutral_labels:
+            if "SPY" in returns.columns:
+                mkt_return = returns["SPY"]
+                print("      [beta-neutral] Using SPY as market proxy (Tier1 fix)")
+            else:
+                mkt_return = returns.mean(axis=1)
+                print("      [beta-neutral] SPY missing, falling back to EW mean")
+        else:
+            mkt_return = None
         _label_kwargs = dict(
             risk_adjust=args.risk_adjust_labels,
             sector_map=sector_map,
@@ -625,6 +991,7 @@ def run(args):
             beta_neutral=args.beta_neutral_labels,
             market_returns=mkt_return,
             investable_mask=investable_mask,  # Fix 1: rank labels within investable set
+            use_rank_targets=args.use_rank_targets,  # Phase E: Numerai-style rank targets
         )
         if args.forward_windows is not None:
             _label_kwargs["forward_windows"] = args.forward_windows
@@ -646,7 +1013,7 @@ def run(args):
             warm_start_lgbm=args.warm_start_lgbm,
             run_adversarial_validation=args.adversarial_validation,
             interaction_constraints=args.interaction_constraints if args.interaction_constraints != "none" else None,
-            learning_rate=0.05,
+            learning_rate=0.05,  # Run 1 revert from 0.02
             lgbm_weight=0.60,
             ridge_weight=0.40,
             lambdarank_truncation=args.lambdarank_truncation,
@@ -660,9 +1027,16 @@ def run(args):
             use_uniqueness_weights=args.use_uniqueness_weights,
             use_per_date_weights=args.use_per_date_weights,
             early_stop_on_ic=args.early_stop_on_ic,
+            use_era_weights=args.use_era_weights,
             lgbm_num_seeds=args.lgbm_num_seeds,
             use_mlp=args.use_mlp,
             random_state=args.random_state,
+            # Phase 2.5: convert years → trading days (252/yr). 0 = disable decay.
+            sample_weight_decay_days=int(round(args.sample_weight_halflife_years * 252))
+                                     if args.sample_weight_halflife_years > 0 else 0,
+            neutralize_strength=args.neutralize_strength,
+            neutralize_features=args.neutralize_features,
+            use_rank_targets=args.use_rank_targets,  # Phase E: rank target transform
         )
         if args.forward_windows is not None:
             ml_kwargs["forward_windows"] = args.forward_windows
@@ -701,7 +1075,8 @@ def run(args):
         # of predictions. 252 gives enough data for 90+ features while maximizing
         # the OOS evaluation period.
         wf = WalkForwardModel(**ml_kwargs)
-        ml_signal = wf.fit_predict(panel, labels)
+        ml_signal = wf.fit_predict(panel, labels, sector_map=sector_map,
+                                    results_dir=results_dir)
 
         # Light smoothing (5-day)
         ml_signal_smooth = ml_signal.rolling(5, min_periods=1).mean()
@@ -800,6 +1175,7 @@ def run(args):
         min_adv_for_selection = args.min_adv_for_selection,
         max_stock_vol   = args.max_stock_vol,
         quality_percentile = args.quality_percentile,
+        quality_tilt    = args.quality_tilt,
         rvol            = rvol_63d,
     )
 
@@ -817,20 +1193,64 @@ def run(args):
     # anchor stays at its specified target weight. For now, the effective
     # leverage on SPY is identical to satellite leverage; if spy_core is large,
     # revisit to apply vol-targeting only to the risky satellite portion.
-    vol_target_active = (not args.no_vol_target) and args.vol_target > 0
-    if vol_target_active:
-        from portfolio import apply_vol_targeting
-        print(f"  [vol-target] Scaling exposure to {args.vol_target*100:.0f}% annualized vol "
-              f"(max_leverage={args.max_leverage:.2f})")
-        weights = apply_vol_targeting(
+    # Phase 1.7a: Barroso-Santa Clara strategy-own-vol scaling
+    # REPLACES ex-ante apply_vol_targeting when --bsc-scaling is set.
+    # Uses strategy's actual realized vol instead of constant-correlation estimate.
+    if args.bsc_scaling:
+        from portfolio import apply_bsc_scaling
+        print(f"  [bsc-scale] Barroso-Santa Clara scaling: target={args.bsc_target_vol*100:.0f}% "
+              f"lookback={args.bsc_lookback}d max_lev={args.max_leverage:.2f} "
+              f"min_lev={args.bsc_min_leverage:.2f}")
+        weights = apply_bsc_scaling(
             weights,
-            realized_vol=rvol,
-            target_vol=args.vol_target,
+            daily_returns=returns,
+            target_vol=args.bsc_target_vol,
             max_leverage=args.max_leverage,
-            min_leverage=0.8,
+            min_leverage=args.bsc_min_leverage,
+            lookback=args.bsc_lookback,
         )
     else:
-        print("  [vol-target] disabled")
+        vol_target_active = (not args.no_vol_target) and args.vol_target > 0
+        if vol_target_active:
+            from portfolio import apply_vol_targeting
+            print(f"  [vol-target] Scaling exposure to {args.vol_target*100:.0f}% annualized vol "
+                  f"(max_leverage={args.max_leverage:.2f}, min_leverage={args.min_leverage:.2f}, "
+                  f"vol_ceiling={args.vol_ceiling:.2f}, vol_floor={args.vol_floor:.2f})")
+            weights = apply_vol_targeting(
+                weights,
+                realized_vol=rvol,
+                target_vol=args.vol_target,
+                max_leverage=args.max_leverage,
+                min_leverage=args.min_leverage,
+                vol_floor=args.vol_floor,
+                vol_ceiling=args.vol_ceiling,
+            )
+        else:
+            print("  [vol-target] disabled")
+
+    # Phase 1.7b: Credit regime overlay (NFCI + HY OAS from FRED)
+    # Halves gross exposure when credit conditions tighten. Independent of
+    # vol-targeting — can stack with either BSC or apply_vol_targeting.
+    if args.credit_overlay:
+        from portfolio import apply_credit_overlay
+        # Phase 1.8 fix: use stashed series (fred_df was deleted for RAM earlier)
+        nfci_s = credit_overlay_nfci
+        hy_oas_s = credit_overlay_hy_oas
+        if nfci_s is None and hy_oas_s is None:
+            print(f"  [credit-overlay] SKIPPED — neither NFCI nor HY OAS available in fred_df")
+        else:
+            print(f"  [credit-overlay] applying with "
+                  f"NFCI={'yes' if nfci_s is not None else 'no'}, "
+                  f"HY_OAS={'yes' if hy_oas_s is not None else 'no'}, "
+                  f"risk_off_scale={args.credit_risk_off_scale:.2f}")
+            weights = apply_credit_overlay(
+                weights,
+                nfci_series=nfci_s,
+                hy_oas_series=hy_oas_s,
+                nfci_threshold=args.credit_nfci_threshold,
+                hy_oas_threshold=args.credit_hyoas_threshold,
+                risk_off_scale=args.credit_risk_off_scale,
+            )
 
     port_stats = compute_portfolio_stats(weights, rebalance_dates)
     print(f"      Positions:  {port_stats['avg_positions']:.0f} avg")
@@ -859,6 +1279,12 @@ def run(args):
         commission_bps=0.0,
         slippage_bps=2.0,
     )
+    tax_ledger = None
+    if getattr(args, "use_tax_aware", False):
+        from tax_aware import TaxAwareLedger
+        tax_ledger = TaxAwareLedger(st_rate=0.328, lt_rate=0.188)
+        print("[backtest] Tax-aware HIFO ledger ENABLED (st=32.8%, lt=18.8%)")
+
     result = run_backtest(
         weights,
         prices,
@@ -868,6 +1294,7 @@ def run(args):
         adv=adv_30d,
         stop_loss_pct=args.stop_loss,
         monthly_loss_limit=0.0,  # disabled — too defensive in V4
+        tax_ledger=tax_ledger,
     )
 
     # SPY benchmark
@@ -885,7 +1312,13 @@ def run(args):
                 spy_series = spy_series.iloc[:, 0]
         else:
             spy_series = spy_ret
-        spy_series = spy_series.reindex(result.daily_returns.index).fillna(0)
+        # BUG FIX: use dropna instead of fillna(0). yfinance SPY data may
+        # end before the backtest end date; fillna(0) was creating zero-return
+        # days at the tail that silently corrupted beta/alpha/IR via a
+        # degenerate regression. Dropping NaN rows is the correct point-in-time
+        # approach — benchmark metrics are computed only over dates where SPY
+        # actually exists.
+        spy_series = spy_series.reindex(result.daily_returns.index).dropna()
         spy_equity = (1 + spy_series).cumprod() * args.capital
     except Exception:
         spy_series = pd.Series(0.0, index=result.daily_returns.index)
@@ -934,6 +1367,35 @@ def run(args):
             print(f"    {k:30s}: {v:>8.2%}" if abs(v) < 10 else f"    {k:30s}: ${v:>12,.0f}")
         else:
             print(f"    {k:30s}: {v}")
+
+    # Actual HIFO after-tax CAGR from live tax ledger (if enabled)
+    if tax_ledger is not None:
+        final_nav_val = float(result.equity_curve.iloc[-1])
+        years_elapsed = max(
+            (result.equity_curve.index[-1] - result.equity_curve.index[0]).days / 365.25,
+            1e-6,
+        )
+        hifo = tax_ledger.summary(
+            final_nav=final_nav_val,
+            initial_capital=args.capital,
+            years=years_elapsed,
+        )
+        print("\n  After-Tax (HIFO actual):")
+        print(f"    Pre-Tax CAGR (check)        : {hifo['pretax_cagr_actual']*100:.2f}%")
+        print(f"    After-Tax CAGR (HIFO)       : {hifo['after_tax_cagr_hifo']*100:.2f}%")
+        print(f"    ST Gain $                   : ${hifo['cum_st_gain']:>14,.0f}")
+        print(f"    LT Gain $                   : ${hifo['cum_lt_gain']:>14,.0f}")
+        print(f"    ST/LT Fraction (actual)     : {hifo['st_fraction_actual']*100:.1f}% ST / {hifo['lt_fraction_actual']*100:.1f}% LT")
+        print(f"    Effective Tax Rate (actual) : {hifo['effective_tax_rate_actual']*100:.2f}%")
+        print(f"    Tax Paid $                  : ${hifo['tax_paid']:>14,.0f}")
+        print(f"    Buys / Sells / Open Lots    : {hifo['n_buys']} / {hifo['n_sells']} / {hifo['open_lots_at_end']}")
+        # Append to tearsheet
+        tearsheet.loc["After-Tax CAGR (HIFO)", "Value"] = f"{hifo['after_tax_cagr_hifo']*100:.2f}%"
+        tearsheet.loc["ST Gain $", "Value"] = f"${hifo['cum_st_gain']:,.0f}"
+        tearsheet.loc["LT Gain $", "Value"] = f"${hifo['cum_lt_gain']:,.0f}"
+        tearsheet.loc["ST/LT Fraction (actual)", "Value"] = f"{hifo['st_fraction_actual']*100:.0f}%/{hifo['lt_fraction_actual']*100:.0f}%"
+        tearsheet.loc["Effective Tax Rate (actual)", "Value"] = f"{hifo['effective_tax_rate_actual']*100:.2f}%"
+        tearsheet.to_csv(results_dir / "tearsheet.csv")
 
     # ------------------------------------------------------------------
     # PHASE 5 — Robustness + Dashboard
@@ -991,13 +1453,37 @@ def run(args):
     except Exception as e:
         print(f"  [Factor correlation failed: {e}]")
 
-    # Bootstrap (optional)
+    # Full robustness suite (optional): bootstrap + permutation + capacity
     bootstrap_df = None
     if not args.skip_robustness:
-        print("\n  Bootstrap confidence intervals...")
-        bootstrap_df = bootstrap_tearsheet(result.daily_returns, n_simulations=args.n_bootstrap)
-        print(bootstrap_df.to_string())
-        bootstrap_df.to_csv(results_dir / "bootstrap_ci.csv")
+        print("\n  Full robustness suite (bootstrap + permutation + capacity)...")
+        robustness_report = run_full_robustness(
+            strategy_returns = result.daily_returns,
+            signal           = final_signal,
+            returns          = returns,
+            weights          = weights,
+            prices           = prices,
+            n_bootstrap      = args.n_bootstrap,
+            n_permutations   = getattr(args, "n_permutations", 100),
+        )
+        robustness_report.print_summary()
+
+        # Bootstrap CI -> existing file (preserves dashboard.py contract)
+        bootstrap_df = robustness_report.bootstrap
+        if bootstrap_df is not None:
+            bootstrap_df.to_csv(results_dir / "bootstrap_ci.csv")
+
+        # Permutation test -> new CSV
+        if robustness_report.permutation is not None:
+            perm_df = pd.DataFrame(
+                [(k, v) for k, v in robustness_report.permutation.items()],
+                columns=["metric", "value"],
+            )
+            perm_df.to_csv(results_dir / "permutation_test.csv", index=False)
+
+        # Capacity analysis -> new CSV
+        if robustness_report.capacity is not None:
+            robustness_report.capacity.to_csv(results_dir / "capacity_analysis.csv")
 
     # Sector allocation
     sector_alloc = sector_allocation(weights, sector_map)

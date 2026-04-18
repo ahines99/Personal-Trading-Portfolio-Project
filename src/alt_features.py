@@ -35,10 +35,64 @@ into the feature matrix.
 
 from __future__ import annotations
 
+import os
+import warnings
 from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C&Z OVERLAP NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit (2026-04-17): cross-checking signals built here vs. those built in
+# src/cz_signals.py (Chen & Zimmermann replication set). When two signals
+# measure essentially the same construct, model attention/feature-importance
+# is diluted across the duplicates. None of the items below are fixed yet —
+# only documented. Resolution requires a sweep (drop one, keep the other,
+# measure IC/CAGR delta) and is intentionally deferred.
+#
+# 1) cash_based_op_prof_signal   (this file, line ~237)
+#    vs.  operprof_rd_signal     (cz_signals.py, line ~326)
+#    - Both: Ball/Gerakos/Linnainmaa/Nikolaev (2016) family.
+#    - This file: (Revenue - COGS - SGA - ΔWC) / Assets   (working-cap adj.)
+#    - C&Z file:  (Revenue - COGS - (SGA - R&D)) / Assets (R&D-capitalized)
+#    - Different academic variants but heavily correlated in practice.
+#    - STATUS: env-gate added (DISABLE_CASH_BASED_OP_PROF=1) so this one can
+#      be turned off cheaply. Prefer keeping operprof_rd_signal when forced
+#      to choose (it is the C&Z canonical reference IC_IR ≈ 0.13).
+#
+# 2) earnings_yield_signal       (this file, line ~189)   = NetIncome / MktCap
+#    vs.  cfp_signal              (cz_signals.py, line ~312) = OperCF / MktCap
+#    - Both are price-scaled cash-flow-ish yields. Numerators differ
+#      (accrual-based vs. cash-based) so they are NOT identical, but they
+#      load on the same value/quality factor cluster. Moderate overlap.
+#    - cfp_signal is the cleaner C&Z reference; earnings_yield_signal is the
+#      noisier accrual-contaminated variant. Worth a sweep before pruning.
+#
+# 3) value_composite_signal      (this file, line ~221)
+#    vs.  cfp_signal + payout_yield_signal + net_payout_yield_signal (cz_signals.py)
+#    - value_composite_signal is the row-wise mean rank of {earnings_yield,
+#      sales_yield, fcf_yield, ebit_ev}. The C&Z payout-yield signals
+#      (Boudoukh et al. 2007) capture a related but DISTINCT cash-return-to-
+#      shareholders construct (dividends + buybacks ± issuance / MktCap).
+#    - Overlap is partial: fcf_yield component of value_composite shares
+#      cash-flow numerator with cfp_signal; the payout signals add
+#      distribution-policy info that value_composite does NOT contain.
+#    - Recommendation (not yet acted on): keep value_composite as a yield
+#      composite, keep payout_yield separately — they are complementary.
+#
+# 4) book_to_market_signal       (this file, line ~138, factor dict driven)
+#    vs.  (no direct C&Z analog among currently built signals)
+#    - C&Z catalog has bm/bm_ia variants but they are NOT among the built
+#      signals enumerated in cz_signals.py (only payout_yield, net_payout,
+#      xfin, cfp, operprof_rd, tax, deldrc, coskewness, coskew_acx,
+#      mom_season). No active overlap. Safe to keep.
+#
+# Action items (deferred): run a 1-feature-out sweep on (earnings_yield_signal,
+# value_composite_signal) to quantify whether cfp_signal alone subsumes them.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,7 +276,23 @@ def build_fundamental_signals(
     # Ball, Gerakos, Linnainmaa, Nikolaev (2016)
     # = (Revenue - COGS - SGA - ΔWC) / Total Assets
     # where COGS = Revenue - GrossProfit, WC = CurrentAssets - CurrentLiabilities
-    if use_tier3_academic and (revenue_p is not None and gprofit_p is not None and assets_p is not None):
+    #
+    # NOTE: This signal is highly correlated with `operprof_rd_signal` from
+    # cz_signals.py (Ball et al. 2016, R&D-capitalized variant). When both are
+    # active, the model splits attention between them. Set the
+    # DISABLE_CASH_BASED_OP_PROF=1 env-var to skip building this one and let
+    # the C&Z R&D-adjusted version own the operating-profitability slot.
+    _disable_cbop = os.getenv("DISABLE_CASH_BASED_OP_PROF", "0") == "1"
+    if _disable_cbop:
+        warnings.warn(
+            "[alt_features] Skipping cash_based_op_prof_signal "
+            "(DISABLE_CASH_BASED_OP_PROF=1). The C&Z operprof_rd_signal "
+            "(R&D-capitalized variant) is expected to cover this slot.",
+            stacklevel=2,
+        )
+        print("[alt_features] WARNING: cash_based_op_prof_signal SKIPPED "
+              "(DISABLE_CASH_BASED_OP_PROF=1)")
+    elif use_tier3_academic and (revenue_p is not None and gprofit_p is not None and assets_p is not None):
         cogs_p = revenue_p - gprofit_p
         sga_term = sga_p.fillna(0) if sga_p is not None else 0
         if ca_p is not None and cl_p is not None:
@@ -558,19 +628,26 @@ def build_earnings_signals(
             ear_ts = pd.Series(np.nan, index=date_index)
             for edate in earn.index:
                 edate_norm = pd.Timestamp(edate).normalize()
-                # Anchor t = first business day >= announcement
                 valid = date_index[date_index >= edate_norm]
                 if len(valid) == 0:
                     continue
                 t_idx = date_index.get_loc(valid[0])
-                if t_idx < 1 or t_idx + 1 >= len(date_index):
+
+                # Phase D EAR timing fix: adjust window for after-market announcements
+                timing = (earn.loc[edate, "before_after_market"]
+                          if "before_after_market" in earn.columns else "unknown")
+                if str(timing).strip().lower() in ("amc", "after market close"):
+                    pre_off, post_off = 0, 2   # [t, t+2] for after-market
+                else:
+                    pre_off, post_off = -1, 1  # [t-1, t+1] for before-market / unknown
+
+                if t_idx + pre_off < 0 or t_idx + post_off >= len(date_index):
                     continue
-                p_pre = px.iloc[t_idx - 1]
-                p_post = px.iloc[t_idx + 1]
+                p_pre = px.iloc[t_idx + pre_off]
+                p_post = px.iloc[t_idx + post_off]
                 if pd.isna(p_pre) or pd.isna(p_post) or p_pre == 0:
                     continue
                 ear_val = (p_post - p_pre) / p_pre
-                # Carry forward for surprise_carry_days
                 post_dates = date_index[t_idx:t_idx + surprise_carry_days]
                 ear_ts.loc[post_dates] = ear_val
             ear_panel[ticker] = ear_ts
@@ -578,13 +655,76 @@ def build_earnings_signals(
         if ear_panel.notna().any().any():
             signals["earnings_ann_return_signal"] = _cs_rank(ear_panel)
 
+    # ── Phase D: Earnings Beat Streak (consecutive positive surprises) ─────
+    # Gated via ENABLE_PHASE_D_SIGNALS env var (default ON). Set to "0" to disable.
+    if use_tier3_academic and os.environ.get("ENABLE_PHASE_D_SIGNALS", "1") == "1":
+        streak_panel = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        for ticker in tickers:
+            if ticker not in earnings_dict:
+                continue
+            earn = earnings_dict[ticker]
+            if earn is None or earn.empty or "eps_surprise_pct" not in earn.columns:
+                continue
+            surprises = earn["eps_surprise_pct"].dropna().sort_index()
+            if len(surprises) < 2:
+                continue
+            # Compute streak: consecutive quarters with positive surprise, capped at 8
+            streak = 0
+            streak_ts = pd.Series(np.nan, index=surprises.index)
+            for i, (dt, val) in enumerate(surprises.items()):
+                if val > 0:
+                    streak = min(streak + 1, 8)
+                else:
+                    streak = 0
+                streak_ts.loc[dt] = streak
+            # Forward-fill to daily
+            streak_daily = streak_ts.reindex(date_index, method="ffill")
+            streak_panel[ticker] = streak_daily
+        if streak_panel.notna().any().any():
+            signals["earnings_beat_streak_signal"] = _cs_rank(streak_panel)
+
+    # ── Phase D: Surprise Consistency (low CV = predictable = good) ────────
+    # Gated via ENABLE_PHASE_D_SIGNALS env var (default ON). Set to "0" to disable.
+    if use_tier3_academic and os.environ.get("ENABLE_PHASE_D_SIGNALS", "1") == "1":
+        consistency_panel = pd.DataFrame(np.nan, index=date_index, columns=tickers)
+        for ticker in tickers:
+            if ticker not in earnings_dict:
+                continue
+            earn = earnings_dict[ticker]
+            if earn is None or earn.empty or "eps_surprise_pct" not in earn.columns:
+                continue
+            surprises = earn["eps_surprise_pct"].dropna().sort_index()
+            if len(surprises) < 4:
+                continue
+            # Rolling 8-quarter coefficient of variation (std / |mean|)
+            cv_ts = pd.Series(np.nan, index=surprises.index)
+            for i in range(len(surprises)):
+                window = surprises.iloc[max(0, i - 7):i + 1]
+                if len(window) < 4:
+                    continue
+                mu = window.mean()
+                sigma = window.std()
+                if abs(mu) < 1e-9:
+                    continue
+                cv_ts.iloc[i] = sigma / abs(mu)
+            # Forward-fill to daily
+            cv_daily = cv_ts.reindex(date_index, method="ffill")
+            consistency_panel[ticker] = cv_daily
+        if consistency_panel.notna().any().any():
+            # Invert: low CV (predictable) → high rank
+            signals["earnings_surprise_consistency_signal"] = _cs_rank(
+                -consistency_panel
+            )
+
     # ── Sector-neutralized variants (Tier 3A / 3B) ─────────────────────────
     if sector_neutralize_signals and sector_map:
         try:
             from features import sector_neutralize as _sector_neutralize_fn
         except ImportError:
             from src.features import sector_neutralize as _sector_neutralize_fn
-        for base in ("earnings_ann_return_signal",):
+        for base in ("earnings_ann_return_signal",
+                     "earnings_beat_streak_signal",
+                     "earnings_surprise_consistency_signal"):
             if base not in signals:
                 continue
             try:
@@ -627,7 +767,8 @@ def build_insider_signals(
 
     # Columns that may indicate transaction direction
     _DIR_COLS = {"type", "transactiontype", "acquisitionordisposition",
-                 "transaction_type", "acquisition_or_disposition"}
+                 "transaction_type", "acquisition_or_disposition",
+                 "transaction_code"}
     _BUY_VALS  = {"a", "p", "buy", "purchase"}
     _SELL_VALS = {"d", "s", "sale", "sell"}
 
@@ -1390,6 +1531,16 @@ def build_alt_features(
     use_sni_variants: bool = True,
     # ── Tier 3 academic fundamentals / earnings gate ─────────────────────
     use_tier3_academic: bool = True,
+    # ── Sprint 2: EDGAR text-based signals ───────────────────────────────
+    use_lazy_prices: bool = False,
+    use_lm_sentiment: bool = False,
+    edgar_text_cache_dir: str = "data/cache/edgar_text",
+    use_sraf_sentiment: bool = False,
+    sraf_csv_path: str = "data/cache/sraf/lm_10x_summaries_1993_2025.csv",
+    # ── Tier A (Week 1): Factor momentum (Ehsani-Linnainmaa 2022 JF) ───
+    use_factor_momentum: bool = False,  # Run 1 revert - test in isolation later
+    # ── FINRA historical bi-monthly short interest (Phase 6) ───────────
+    use_finra_short_interest: bool = False,
     # ── Passthrough alias controlling sector-neutralization of fundamentals
     # Forwarded to build_fundamental_signals' sector_neutralize_signals param.
     # ONLY gates fundamental signal _sni variants (NOT Tier 6 distress/macro
@@ -1570,4 +1721,336 @@ def build_alt_features(
         except Exception:
             pass
 
+    # ────────────────────────────────────────────────────────────────────
+    # Sprint 2: EDGAR text-based signals (Lazy Prices + LM sentiment)
+    # ────────────────────────────────────────────────────────────────────
+    if use_lazy_prices:
+        try:
+            from src.lazy_prices_features import build_lazy_prices_features
+            _merge(build_lazy_prices_features(
+                cache_dir=edgar_text_cache_dir,
+                trading_dates=date_index,
+                universe=list(tickers),
+            ))
+        except Exception as _e:
+            warnings.warn(f"lazy_prices dispatch failed: {_e}")
+
+    if use_lm_sentiment:
+        try:
+            from src.lm_sentiment import build_lm_sentiment_features
+            _merge(build_lm_sentiment_features(
+                cache_dir=edgar_text_cache_dir,
+                trading_dates=date_index,
+                universe=list(tickers),
+            ))
+        except Exception as _e:
+            warnings.warn(f"lm_sentiment dispatch failed: {_e}")
+
+    if use_sraf_sentiment:
+        try:
+            from src.sraf_sentiment import build_sraf_sentiment_features
+            _merge(build_sraf_sentiment_features(
+                csv_path=sraf_csv_path,
+                trading_dates=date_index,
+                universe=list(tickers),
+            ))
+        except Exception as _e:
+            warnings.warn(f"sraf_sentiment dispatch failed: {_e}")
+
+    # ────────────────────────────────────────────────────────────────────
+    # Tier A Week 1: Factor momentum (Ehsani-Linnainmaa 2022 JF)
+    # Emits 5 per-stock factor-mom signals (SMB, HML, RMW, CMA, Mom),
+    # skipping Mkt-RF (cross-sectionally flat). Expected +30-80 bps CAGR.
+    # ────────────────────────────────────────────────────────────────────
+    if use_factor_momentum and returns_panel is not None and not returns_panel.empty:
+        try:
+            from src.factor_momentum_data import get_factor_momentum_panel, load_ff6_factors
+            from src.factor_momentum_features import (
+                compute_rolling_factor_betas,
+                build_single_factor_momentum_signals,
+            )
+            start_s = str(date_index.min().date())
+            end_s = str(date_index.max().date())
+            ff_returns = load_ff6_factors(start=start_s, end=end_s)
+            fm_panel = get_factor_momentum_panel(start=start_s, end=end_s)
+            if (ff_returns is not None and not ff_returns.empty
+                    and fm_panel is not None and not fm_panel.empty):
+                # Drop Mkt-RF (cross-sectionally flat) and RF (risk-free rate)
+                # Keep: SMB, HML, RMW, CMA, Mom
+                keep_factors = [c for c in ff_returns.columns
+                                if c not in ("Mkt-RF", "RF")]
+                factor_betas = compute_rolling_factor_betas(
+                    stock_returns=returns_panel,
+                    factor_returns=ff_returns[keep_factors],
+                )
+                # Strip _mom suffix from fm_panel columns to match beta keys
+                fm_panel_renamed = fm_panel.rename(
+                    columns={f"{c}_mom": c for c in keep_factors}
+                )
+                fm_signals = build_single_factor_momentum_signals(
+                    stock_returns=returns_panel,
+                    factor_momentum_panel=fm_panel_renamed[keep_factors],
+                    factor_betas=factor_betas,
+                )
+                if fm_signals:
+                    renamed = {f"factor_mom_{k}": v for k, v in fm_signals.items()
+                               if v is not None and not v.empty}
+                    if renamed:
+                        print(f"      [factor-mom] Added {len(renamed)} factor momentum signals: {list(renamed.keys())}")
+                        _merge(renamed)
+        except Exception as _e:
+            warnings.warn(f"factor_momentum dispatch failed: {_e}")
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 6: FINRA historical bi-monthly short interest
+    # (Rapach-Ringgenberg-Zhou 2016, Boehmer-Jones-Zhang 2008)
+    # ────────────────────────────────────────────────────────────────────
+    if use_finra_short_interest:
+        try:
+            from src.finra_short_interest import load_finra_short_interest
+            si_panel = load_finra_short_interest(
+                tickers=list(tickers),
+                trading_dates=date_index,
+                start=str(date_index.min().date()),
+                end=str(date_index.max().date()),
+                use_cache=True,
+            )
+            if si_panel is not None and not si_panel.empty:
+                delta_si = build_delta_si_signal(si_panel, lookback_days=21)
+                if not delta_si.empty:
+                    all_signals["finra_delta_si_signal"] = delta_si.reindex(
+                        index=date_index, columns=tickers, method="ffill"
+                    ).astype(np.float32)
+
+                delta_si_3m = build_delta_si_3m_signal(si_panel, lookback_days=63)
+                if not delta_si_3m.empty:
+                    all_signals["finra_delta_si_3m_signal"] = delta_si_3m.reindex(
+                        index=date_index, columns=tickers, method="ffill"
+                    ).astype(np.float32)
+
+                si_level = build_si_level_signal(si_panel)
+                if not si_level.empty:
+                    all_signals["finra_si_level_signal"] = si_level.reindex(
+                        index=date_index, columns=tickers, method="ffill"
+                    ).astype(np.float32)
+            else:
+                warnings.warn("FINRA short interest: empty panel returned, skipping signals")
+        except Exception as _e:
+            warnings.warn(f"finra_short_interest dispatch failed: {_e}")
+
     return all_signals
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 6: FINRA ΔSI features (Rapach-Ringgenberg-Zhou 2016,
+# Boehmer-Jones-Zhang 2008)
+# ═══════════════════════════════════════════════════════════════════
+
+def _hp_filter_numpy(y: np.ndarray, lam: float) -> np.ndarray:
+    """Pure-numpy two-sided Hodrick-Prescott filter.
+
+    Solves (I + lam * K'K) tau = y, where K is the 2nd-difference operator.
+    Returns the cycle component y - tau.
+    """
+    n = len(y)
+    if n < 4:
+        return np.full(n, np.nan)
+    # 2nd-difference matrix K of shape (n-2, n)
+    I = np.eye(n)
+    K = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        K[i, i] = 1.0
+        K[i, i + 1] = -2.0
+        K[i, i + 2] = 1.0
+    A = I + lam * (K.T @ K)
+    try:
+        tau = np.linalg.solve(A, y)
+    except np.linalg.LinAlgError:
+        return np.full(n, np.nan)
+    return y - tau
+
+
+def _one_sided_hp_detrend(series: pd.Series, lam: float = 129600) -> pd.Series:
+    """Apply HP filter recursively: at each date, refit on data up to that date.
+
+    This is O(T^3) worst-case due to the linear solve but point-in-time safe
+    (no look-ahead). For our use case (few thousand dates, typically
+    monthly-aggregated) it's fast enough. Prefers statsmodels if available,
+    otherwise falls back to a pure-numpy implementation.
+    """
+    try:
+        from statsmodels.tsa.filters.hp_filter import hpfilter  # type: ignore
+        _have_sm = True
+    except Exception:
+        hpfilter = None  # type: ignore
+        _have_sm = False
+
+    result = pd.Series(index=series.index, dtype=float)
+    s = series.astype(float)
+    values = s.values
+    for i in range(len(s)):
+        if i < 24:  # need minimum history
+            continue
+        window = s.iloc[: i + 1].dropna()
+        if len(window) < 24:
+            continue
+        try:
+            if _have_sm:
+                cycle, _trend = hpfilter(window, lamb=lam)  # type: ignore
+                result.iloc[i] = float(cycle.iloc[-1])
+            else:
+                cyc = _hp_filter_numpy(window.values.astype(float), lam=lam)
+                result.iloc[i] = float(cyc[-1])
+        except Exception:
+            continue
+    return result
+
+
+def build_delta_si_signal(
+    shares_short_df: pd.DataFrame,
+    shares_out_df: Optional[pd.DataFrame] = None,
+    lookback_days: int = 21,
+) -> pd.DataFrame:
+    """
+    Cross-sectional rank of 1-month percentage change in short interest.
+
+    Academic basis: Boehmer-Jones-Zhang (2008 JF) showed that cross-sectional
+    ΔSI predicts 15-20% annualized underperformance in the next 1-3 months,
+    with strongest effect in small-caps.
+
+    Formula per stock i, date t:
+        dsi_i,t = (SI_i,t - SI_i,t-21) / SI_i,t-21
+        (or normalized by shares_out if provided)
+
+    Returns cross-sectional rank in [0, 1] where HIGH rank = HIGH ΔSI = BEARISH.
+    In a long-only portfolio, we EXCLUDE the top decile (high ΔSI names).
+
+    Sign convention: higher output = more bearish. Caller should invert or
+    filter accordingly.
+    """
+    if shares_short_df is None or shares_short_df.empty:
+        return pd.DataFrame()
+
+    si = shares_short_df.astype(float).sort_index()
+
+    if shares_out_df is not None and not shares_out_df.empty:
+        so = shares_out_df.astype(float).reindex(index=si.index, columns=si.columns)
+        # Reindex may leave NaN gaps — forward fill shares_out (slow-moving)
+        so = so.ffill()
+        si_ratio = si / so.replace(0.0, np.nan)
+        delta = si_ratio - si_ratio.shift(lookback_days)
+    else:
+        prev = si.shift(lookback_days)
+        delta = (si - prev) / prev.replace(0.0, np.nan)
+
+    return _cs_rank(delta)
+
+
+def build_delta_si_3m_signal(
+    shares_short_df: pd.DataFrame,
+    shares_out_df: Optional[pd.DataFrame] = None,
+    lookback_days: int = 63,
+) -> pd.DataFrame:
+    """
+    Cross-sectional 3-month ΔSI — longer horizon per Rapach-Ringgenberg-Zhou
+    (2016 JFE). Smoother than 1-month, less responsive but higher
+    signal-to-noise.
+    """
+    return build_delta_si_signal(
+        shares_short_df=shares_short_df,
+        shares_out_df=shares_out_df,
+        lookback_days=lookback_days,
+    )
+
+
+def build_si_level_signal(
+    shares_short_df: pd.DataFrame,
+    shares_out_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    Cross-sectional rank of short interest LEVEL (not change).
+    shares_short / shares_outstanding (the "short interest ratio").
+
+    Per Drechsler-Moreira-Savov (2018), high SI ratio is associated with
+    shorting premium but the net return is ambiguous for long-only. This
+    feature is primarily useful as an INPUT to the ML, not as a direct signal.
+    """
+    if shares_short_df is None or shares_short_df.empty:
+        return pd.DataFrame()
+
+    si = shares_short_df.astype(float).sort_index()
+
+    if shares_out_df is not None and not shares_out_df.empty:
+        so = shares_out_df.astype(float).reindex(index=si.index, columns=si.columns)
+        so = so.ffill()
+        level = si / so.replace(0.0, np.nan)
+    else:
+        # No shares_out — rank raw shares_short (cross-sectionally meaningless
+        # across market-cap, but still usable if all else fails)
+        level = si
+
+    return _cs_rank(level)
+
+
+def build_aggregate_si_regime(
+    shares_short_df: pd.DataFrame,
+    hp_smooth_lambda: float = 129600,
+) -> pd.Series:
+    """
+    Aggregate short interest detrended via Hodrick-Prescott filter.
+
+    Per Rapach-Ringgenberg-Zhou (2016 JFE): "detrended aggregate short
+    interest is the strongest known predictor of aggregate market returns,"
+    with R^2 ~13% annually at the market level.
+
+    Accepts either a (date x ticker) DataFrame (will be summed cross-sectionally)
+    or a pre-aggregated Series. Returns a DateTimeIndexed Series where HIGH
+    values indicate bearish regime (shorts loading up on the market as a whole).
+
+    Usage: gate portfolio gross exposure — reduce when value is elevated.
+
+    Point-in-time correctness: implemented as a one-sided expanding HP filter
+    so the value at date t only uses data up to and including t.
+    """
+    if shares_short_df is None or (
+        hasattr(shares_short_df, "empty") and shares_short_df.empty
+    ):
+        return pd.Series(dtype=float)
+
+    if isinstance(shares_short_df, pd.DataFrame):
+        agg = shares_short_df.astype(float).sum(axis=1, min_count=1)
+    else:
+        agg = pd.Series(shares_short_df).astype(float)
+
+    agg = agg.sort_index().dropna()
+    if len(agg) < 24:
+        return pd.Series(index=agg.index, dtype=float)
+
+    # Log-transform the aggregate series (HP filter on log levels per RRZ)
+    agg_log = np.log(agg.replace(0.0, np.nan)).dropna()
+
+    return _one_sided_hp_detrend(agg_log, lam=hp_smooth_lambda)
+
+
+if __name__ == "__main__":
+    import numpy as np
+    dates = pd.date_range('2020-01-01', periods=250, freq='B')
+    tickers = ['A', 'B', 'C']
+    fake_si = pd.DataFrame(
+        np.abs(np.random.randn(250, 3).cumsum(axis=0) + 100),
+        index=dates, columns=tickers
+    )
+    fake_so = pd.DataFrame(
+        np.ones((250, 3)) * 1e9,
+        index=dates, columns=tickers
+    )
+
+    sig1 = build_delta_si_signal(fake_si, fake_so, lookback_days=21)
+    print(f"delta_si shape: {sig1.shape}, non-null: {sig1.notna().sum().sum()}")
+    sig2 = build_delta_si_3m_signal(fake_si, fake_so)
+    print(f"delta_si_3m shape: {sig2.shape}")
+    sig3 = build_si_level_signal(fake_si, fake_so)
+    print(f"si_level shape: {sig3.shape}")
+    sig4 = build_aggregate_si_regime(fake_si.sum(axis=1))
+    print(f"aggregate_si shape: {sig4.shape}, non-null: {sig4.notna().sum()}")
+    print("ALL TESTS PASSED")

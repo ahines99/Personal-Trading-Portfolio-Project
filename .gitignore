@@ -1,4 +1,4 @@
-data/cache/*.pkl
+data/cache/
 __pycache__/
 *.pyc
 .env
@@ -6,6 +6,7 @@ __pycache__/
 .env.*.local
 .venv/
 venv/
+env/
 .pytest_cache/
 .DS_Store
 .ipynb_checkpoints/
@@ -13,5 +14,14 @@ venv/
 *.log
 .claude/settings.json
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 catboost_info/
 results/*.parquet
+
+# Experiment/scratch result directories. Allow the committed baseline snapshot.
+results/_*/
+!results/_repro_fixed2_v3/
+!results/_repro_fixed2_v3/**
+results/_baseline_features.txt
+results/_current_cache_features.txt
+results/capacity_analysis.csv

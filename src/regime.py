@@ -175,6 +175,11 @@ def performance_by_regime(
     strat  = strategy_returns.loc[common]
     reg    = regime.loc[common]
 
+    # Phase 1.8 fix: coerce mixed-type regime values to strings so sorted()
+    # doesn't crash when float NaNs coexist with string labels.
+    reg    = reg.astype(str).replace("nan", None).dropna()
+    strat  = strat.loc[reg.index]
+
     records = []
     for regime_state in sorted(reg.unique()):
         mask  = reg == regime_state
