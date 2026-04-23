@@ -1,0 +1,103 @@
+# Paper trading config example.
+#
+# Copy this file to config/paper_trading.yaml and fill in account-specific values.
+# Environment variables with the PAPER_TRADING_ prefix override YAML at load time.
+# Example:
+#   PAPER_TRADING_STAGE=2
+#   PAPER_TRADING_BROKER=tradier_sandbox
+#   PAPER_TRADING_CAPITAL_MODE=paper
+#   PAPER_TRADING_ACCOUNT_ID=<sandbox account id>
+
+# Execution stage:
+#   1 = shadow only, no broker contact
+#   2 = broker read-only
+#   3 = manual approval paper trading
+#   4 = controlled automation
+stage: 1
+
+# Broker backend:
+#   mock
+#   tradier_sandbox
+#   tradier_live
+broker: mock
+
+# Capital mode:
+#   paper
+#   live
+capital_mode: paper
+
+# Required broker account identifier.
+account_id: PAPER-ACCOUNT-ID
+
+# Base output root for paper artifacts and bundles.
+# Phase A writes timestamped bundles under this root as
+# _paper_phase_a_<timestamp>/intents.json. Phase B loads the latest bundle from
+# this root unless --bundle-dir is supplied.
+results_dir: results
+
+# Optional explicit promoted baseline results directory.
+# If null, a later resolver will read CURRENT_BASELINE.md.
+baseline_path: null
+
+# Maximum allowed age of the most recent signal date before preflight fails.
+signal_max_staleness_days: 7
+
+# Rebalance calendar source:
+#   strategy = use the strategy rebalance logic
+#   explicit = use the explicit calendar entries below
+rebalance_calendar_source: strategy
+
+# Only used when rebalance_calendar_source=explicit.
+# Format:
+# rebalance_calendar:
+#   - date: "2026-05-06"
+#     config_hash: "abc123"
+rebalance_calendar: []
+
+# Portfolio sizing and trade filters.
+portfolio_notional_usd: 100000.0
+min_trade_notional_usd: 50.0
+
+# Safety and execution bounds.
+max_order_count: 10
+max_single_order_notional_usd: 50000.0
+allowed_order_types:
+  - market
+dry_run: true
+intents_only: false
+
+# Stage 4 execution mode:
+#   manual = Stage 4 still requires an approval record before Phase B
+#   auto = Stage 4 auto-approves only when preflight and previews are green
+stage4_mode: manual
+
+# State and notifications.
+# File presence at this path halts Phase B and Stage 4 preflight.
+kill_switch_path: paper_trading/state/KILL_SWITCH
+alert_channel: null
+desktop_alerts_enabled: true
+email_alerts_enabled: false
+alert_recipients: []
+alert_log_path: paper_trading/monitoring_alerts.jsonl
+alert_smtp_profile: null
+alert_mute_types: []
+
+# Optional Stage 4 canary controls.
+canary_mode: false
+canary_days: 10
+canary_max_single_order_notional_usd: 500.0
+canary_max_order_count: 5
+canary_tracking_path: paper_trading/canary_state.json
+
+# Phase B and operational safety thresholds.
+overnight_drift_halt_pct: 5.0
+turnover_cap_pct: 25.0
+estimated_cost_cap_pct: 0.15
+max_margin_usage_pct: 80.0
+submission_poll_seconds: 60
+submission_poll_interval_seconds: 5
+approval_deadline_time_et: "08:00"
+
+# Hard-stop thresholds.
+hard_halt_drawdown_pct: null
+hard_halt_daily_loss_pct: null
