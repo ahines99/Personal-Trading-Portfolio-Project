@@ -195,3 +195,28 @@ def test_factory_returns_mock_client_for_mock_backend() -> None:
     )
     assert isinstance(client, MockBrokerClient)
     assert client.ping() is True
+
+
+def test_mock_broker_client_updates_positions_after_fill(
+    mock_broker_client: MockBrokerClient,
+) -> None:
+    preview = mock_broker_client.preview_equity_order("AAA", 10.0, "SELL", "market")
+    placed = mock_broker_client.place_equity_order(
+        "AAA",
+        10.0,
+        "SELL",
+        "market",
+        preview_result=preview,
+    )
+
+    terminal = mock_broker_client.poll_until_terminal(
+        placed["broker_order_id"],
+        timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert terminal["status"] == "filled"
+    aaa = next(
+        row for row in mock_broker_client.get_positions() if row["ticker"] == "AAA"
+    )
+    assert aaa["quantity"] == pytest.approx(110.0)

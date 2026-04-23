@@ -47,11 +47,20 @@ class MockBrokerClient(BrokerClient):
 
     def get_balances(self) -> BrokerBalances:
         """Return the configured broker balances without mutating internal state."""
+        self._refresh_balances()
         return deepcopy(self._balances)
 
     def get_positions(self) -> list[BrokerPositionRecord]:
         """Return the configured broker positions without mutating internal state."""
-        return deepcopy(self._positions)
+        self._refresh_balances()
+        nav = self._portfolio_nav()
+        rows: list[BrokerPositionRecord] = []
+        for position in self._positions:
+            row = deepcopy(dict(position))
+            market_value = float(row.get("market_value", 0.0))
+            row["current_weight"] = market_value / nav if abs(nav) > 1e-9 else 0.0
+            rows.append(row)
+        return rows
 
     def preview_equity_order(
         self,
@@ -171,6 +180,8 @@ class MockBrokerClient(BrokerClient):
             "execution_price": execution_price,
             "polls_remaining": self._fill_after_polls,
             "preview_id": preview["preview_id"],
+            "applied_fill_quantity": 0.0,
+            "fills": [],
         }
         self._orders[broker_order_id] = order
 
@@ -254,6 +265,7 @@ class MockBrokerClient(BrokerClient):
             "updated_at": str(order["updated_at"]),
             "reason": order["reason"],
             "tag": str(order["tag"]),
+            "fills": deepcopy(list(order.get("fills", []))),
             "raw": deepcopy(order),
         }
 
@@ -310,6 +322,7 @@ class MockBrokerClient(BrokerClient):
 
         order["polls_remaining"] = max(polls_remaining - 1, 0)
         order["updated_at"] = _utc_now_iso()
+        self._apply_order_fill_delta(order)
 
     def _reference_price(self, symbol: str) -> float:
         normalized_symbol = str(symbol).strip().upper()
@@ -328,6 +341,93 @@ class MockBrokerClient(BrokerClient):
             raise KeyError(f"Unknown mock broker order: {broker_order_id!r}")
         return self._orders[normalized_order_id]
 
+    def _apply_order_fill_delta(self, order: dict[str, object]) -> None:
+        filled_quantity = float(order.get("filled_quantity", 0.0) or 0.0)
+        applied_fill_quantity = float(order.get("applied_fill_quantity", 0.0) or 0.0)
+        fill_delta = filled_quantity - applied_fill_quantity
+        if fill_delta <= 0:
+            return
+
+        self._apply_fill(
+            symbol=str(order["symbol"]),
+            qty=fill_delta,
+            side=str(order["side"]),
+            price=float(order["execution_price"]),
+        )
+        fill_sequence = len(order.get("fills", [])) + 1
+        fills = list(order.get("fills", []))
+        fill_timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        fills.append(
+            {
+                "fill_id": f"mock-fill-{order['broker_order_id']}-{fill_sequence}",
+                "broker_fill_id": f"mock-fill-{order['broker_order_id']}-{fill_sequence}",
+                "qty": fill_delta,
+                "price": float(order["execution_price"]),
+                "commission": 0.0,
+                "timestamp": fill_timestamp,
+            }
+        )
+        order["fills"] = fills
+        order["applied_fill_quantity"] = filled_quantity
+
+    def _apply_fill(self, *, symbol: str, qty: float, side: str, price: float) -> None:
+        normalized_symbol = str(symbol).strip().upper()
+        normalized_side = str(side).strip().lower()
+        sign = 1.0 if normalized_side in {"buy", "buy_to_cover"} else -1.0
+        quantity_delta = sign * float(qty)
+        notional_delta = float(qty) * float(price)
+
+        matched = False
+        for position in self._positions:
+            if str(position.get("ticker", "")).strip().upper() != normalized_symbol:
+                continue
+            next_quantity = float(position.get("quantity", 0.0)) + quantity_delta
+            if abs(next_quantity) <= 1e-9:
+                self._positions.remove(position)
+            else:
+                position["quantity"] = next_quantity
+                position["market_value"] = next_quantity * float(price)
+                position["cost_basis"] = float(price)
+            matched = True
+            break
+
+        if not matched and abs(quantity_delta) > 1e-9:
+            self._positions.append(
+                {
+                    "ticker": normalized_symbol,
+                    "quantity": quantity_delta,
+                    "cost_basis": float(price),
+                    "market_value": quantity_delta * float(price),
+                    "current_weight": 0.0,
+                    "unrealized_pnl": 0.0,
+                }
+            )
+
+        cash = float(self._balances.get("cash", 0.0))
+        self._balances["cash"] = cash - (sign * notional_delta)
+        self._refresh_balances()
+
+    def _portfolio_nav(self) -> float:
+        total_equity = float(self._balances.get("total_equity", 0.0) or 0.0)
+        equity = float(self._balances.get("equity", 0.0) or 0.0)
+        if abs(total_equity) > 1e-9:
+            return total_equity
+        if abs(equity) > 1e-9:
+            return equity
+        return float(self._balances.get("cash", 0.0) or 0.0) + sum(
+            float(position.get("market_value", 0.0) or 0.0)
+            for position in self._positions
+        )
+
+    def _refresh_balances(self) -> None:
+        market_value = sum(float(position.get("market_value", 0.0) or 0.0) for position in self._positions)
+        cash = float(self._balances.get("cash", 0.0) or 0.0)
+        total_equity = cash + market_value
+        self._balances["market_value"] = market_value
+        self._balances["equity"] = total_equity
+        self._balances["total_equity"] = total_equity
+        self._balances["buying_power"] = max(cash, 0.0)
+
 
 def _validate_preview_result(
     preview_result: dict[str, object] | None,
@@ -336,7 +436,13 @@ def _validate_preview_result(
     if preview_result is None:
         raise ValueError("preview_result is required for place_equity_order")
     preview = dict(preview_result)
-    if not preview.get("result", False):
+    raw_preview_payload = preview.get("raw_payload")
+    broker_preview = (
+        dict(raw_preview_payload)
+        if isinstance(raw_preview_payload, dict)
+        else preview
+    )
+    if not broker_preview.get("result", False):
         raise ValueError("preview_result must indicate a successful preview")
 
     for key, preview_key in (
@@ -346,16 +452,20 @@ def _validate_preview_result(
         ("order_type", "type"),
         ("limit_price", "limit_price"),
     ):
-        if preview.get(preview_key) != request[key]:
+        if broker_preview.get(preview_key) != request[key]:
             raise ValueError(
                 f"preview_result does not match order request for {key}: "
-                f"{preview.get(preview_key)!r} != {request[key]!r}"
+                f"{broker_preview.get(preview_key)!r} != {request[key]!r}"
             )
-    if not str(preview.get("preview_id", "")).strip():
+    preview_id = broker_preview.get("preview_id") or preview.get("preview_id")
+    if not str(preview_id or "").strip():
         raise ValueError("preview_result must include a preview_id")
-    if not str(preview.get("tag", "")).strip():
+    tag = broker_preview.get("tag")
+    if not str(tag or "").strip():
         raise ValueError("preview_result must include a tag")
-    return preview
+    broker_preview["preview_id"] = preview_id
+    broker_preview["tag"] = tag
+    return broker_preview
 
 
 def _utc_now_iso() -> str:

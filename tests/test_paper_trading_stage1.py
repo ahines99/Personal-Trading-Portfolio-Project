@@ -68,6 +68,32 @@ def test_load_target_book_non_rebalance_holds_state(tmp_path):
     assert pytest.approx(prior["BBB"], rel=1e-9) == 0.50
 
 
+def test_load_target_book_ignores_future_state_snapshot(tmp_path):
+    repo_root, baseline_dir, _ = _build_fake_repo(tmp_path)
+    state_dir = repo_root / "paper_trading" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "as_of_date": "2026-01-07",
+                "weights": {"AAA": 0.10, "BBB": 0.90},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    target, prior, metadata = loaders.load_target_book(
+        as_of_date="2026-01-06",
+        config={"baseline_path": str(baseline_dir), "signal_max_staleness_days": 365},
+        repo_root=repo_root,
+    )
+
+    assert metadata["is_rebalance_day"] is True
+    assert pytest.approx(target["AAA"], rel=1e-9) == 0.60
+    assert pytest.approx(prior["AAA"], rel=1e-9) == 0.55
+    assert pytest.approx(prior["BBB"], rel=1e-9) == 0.45
+
+
 def test_controller_run_daily_dry_run_writes_bundle_without_state(tmp_path):
     repo_root, baseline_dir, as_of_date = _build_fake_repo(tmp_path)
     controller = PaperTradingController(

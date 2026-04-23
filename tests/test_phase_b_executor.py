@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import run_paper_phase_a  # noqa: E402
 from paper.phase_b_executor import PhaseBExecutor  # noqa: E402
 from paper.brokerage.interface import BrokerClient  # noqa: E402
+from paper.order_blotter import OrderBlotter, OrderStatus  # noqa: E402
 
 
 class ExecutionMockBroker(BrokerClient):
@@ -240,6 +241,60 @@ def test_phase_b_executor_submits_and_reconciles(tmp_path: Path) -> None:
         if line.strip()
     ]
     assert any(row["status"] == "FILLED" for row in orders)
+
+
+def test_phase_b_executor_default_mock_backend_replays_bundle_state(tmp_path: Path) -> None:
+    repo_root, baseline_dir, as_of_date = _build_fake_repo(tmp_path)
+    phase_a_result = run_paper_phase_a.run_phase_a(
+        config={
+            **_base_config(baseline_dir),
+            "submission_poll_seconds": 0,
+            "submission_poll_interval_seconds": 0,
+            "mock_fill_after_polls": 1,
+        },
+        repo_root=repo_root,
+        as_of_date=as_of_date,
+    )
+    bundle_dir = Path(phase_a_result["bundle_dir"])
+    intents = json.loads((bundle_dir / "intents.json").read_text(encoding="utf-8"))
+    approval_record = {
+        "status": "APPROVED",
+        "approved": True,
+        "approved_at": _valid_approval_timestamp(intents),
+        "approver": "tester",
+        "config_hash": intents["config_hash"],
+        "rebalance_id": intents["rebalance_id"],
+    }
+    (bundle_dir / "approval.json").write_text(json.dumps(approval_record), encoding="utf-8")
+    unrelated_blotter = OrderBlotter(repo_root / "paper_trading" / "blotter" / "orders.jsonl")
+    unrelated_blotter.create_order(
+        rebalance_id=uuid4(),
+        symbol="ZZZ",
+        side="SELL",
+        qty=1.0,
+        order_type="market",
+        status=OrderStatus.APPROVED,
+        parent_intent_hash="unrelated-intent",
+    )
+
+    executor = PhaseBExecutor(
+        config={
+            **_base_config(baseline_dir),
+            "submission_poll_seconds": 0,
+            "submission_poll_interval_seconds": 0,
+            "mock_fill_after_polls": 1,
+        },
+        repo_root=repo_root,
+    )
+    result = executor.run(bundle_dir=bundle_dir)
+
+    assert result["status"] == "SUCCESS"
+    assert result["executed_trade_count"] == 2
+    assert result["reconciliation_ok"] is True
+    reconciliation = json.loads((bundle_dir / "reconciliation_report.json").read_text(encoding="utf-8"))
+    actual_weights = reconciliation["actual_weights"]
+    assert actual_weights["AAA"] == pytest.approx(0.6, rel=1e-4)
+    assert actual_weights["BBB"] == pytest.approx(0.4, rel=1e-4)
 
 
 def test_phase_b_executor_halts_on_overnight_drift(tmp_path: Path) -> None:

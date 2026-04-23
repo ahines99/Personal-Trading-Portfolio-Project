@@ -329,6 +329,18 @@ def _normalize_target_state(target_weights: Any) -> dict[str, Any]:
         }
         return {"positions": positions, "cash_weight": target_weights.target_cash_pct}
 
+    if isinstance(target_weights, Mapping):
+        payload = dict(target_weights)
+        position_payload = payload.get("positions")
+        if position_payload is not None:
+            positions = _normalize_symbol_payload_map(
+                position_payload,
+                weight_keys=("target_weight", "weight"),
+                default_weight_key="target_weight",
+            )
+            cash_weight = _to_float(payload.get("cash_weight"), default=0.0) or 0.0
+            return {"positions": positions, "cash_weight": cash_weight}
+
     positions = _normalize_symbol_payload_map(
         target_weights,
         weight_keys=("target_weight", "weight"),

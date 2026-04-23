@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from .daily_gate import verify_prior_day_reconciliation
+from .brokerage.mock import MockBrokerClient
 from .loaders import resolve_baseline_path
 from .models import ApprovalRecord, ApprovalStatus, IntentBundle, IntentBundleStatus
 from .order_blotter import OrderBlotter
@@ -84,7 +85,7 @@ class PhaseBExecutor:
                 raise ValueError("Phase B requires an approved intent bundle.")
 
             failure_stage = "broker_preflight"
-            broker = self._get_broker_client()
+            broker = self._get_broker_client(effective_bundle)
             if not broker.ping():
                 raise RuntimeError("Broker connectivity failed during Phase B preflight.")
 
@@ -124,6 +125,8 @@ class PhaseBExecutor:
                 as_of_date=submission_day,
                 target_weights=effective_bundle.target_weights,
                 expected_nav=_expected_nav(self.config),
+                rebalance_id=effective_bundle.rebalance_id,
+                order_ids=[item["order_id"] for item in order_specs if item.get("order_id")],
             )
             fills = _fills_for_order_ids(
                 self.repo_root / "paper_trading" / "blotter" / "fills.jsonl",
@@ -248,15 +251,74 @@ class PhaseBExecutor:
             rebalance_id=rebalance_id,
         )
 
-    def _get_broker_client(self) -> Any:
+    def _get_broker_client(self, bundle: IntentBundle | None = None) -> Any:
         if self._broker_client is not None:
             return self._broker_client
-        from .brokerage.factory import create_broker_client
+        broker_name = str(self.config.get("broker") or "mock").strip().lower()
+        if broker_name == "mock":
+            return self._build_mock_broker_client(bundle)
 
+        from .brokerage.factory import create_broker_client
         client = create_broker_client(self.config)
         if client is None:
             raise RuntimeError("Unable to create configured broker client.")
         return client
+
+    def _build_mock_broker_client(self, bundle: IntentBundle | None) -> MockBrokerClient:
+        notional = _expected_nav(self.config) or 100000.0
+        holdings = dict(bundle.current_holdings) if bundle is not None else {}
+        reference_prices = {}
+        if bundle is not None and isinstance(bundle.metadata, dict):
+            reference_prices = {
+                str(ticker).strip().upper(): float(price)
+                for ticker, price in dict(bundle.metadata.get("reference_prices") or {}).items()
+                if price is not None and float(price) > 0
+            }
+
+        positions = []
+        invested_value = 0.0
+        for ticker, weight in holdings.items():
+            normalized_ticker = str(ticker).strip().upper()
+            normalized_weight = float(weight)
+            if abs(normalized_weight) <= 1e-12:
+                continue
+            price = float(reference_prices.get(normalized_ticker, 100.0))
+            market_value = normalized_weight * notional
+            quantity = market_value / price if price > 0 else 0.0
+            invested_value += market_value
+            positions.append(
+                {
+                    "ticker": normalized_ticker,
+                    "quantity": quantity,
+                    "cost_basis": price,
+                    "market_value": market_value,
+                    "current_weight": normalized_weight,
+                    "unrealized_pnl": 0.0,
+                }
+            )
+
+        cash = notional - invested_value
+        return MockBrokerClient(
+            profile={
+                "account_id": str(self.config.get("account_id") or "PAPER-12345"),
+                "account_type": "paper",
+                "status": "active",
+                "user_name": "Phase B Mock",
+                "email": None,
+            },
+            balances={
+                "account_id": str(self.config.get("account_id") or "PAPER-12345"),
+                "account_type": "paper",
+                "cash": cash,
+                "buying_power": max(notional, cash),
+                "equity": notional,
+                "market_value": invested_value,
+                "total_equity": notional,
+                "maintenance_requirement": 0.0,
+            },
+            positions=positions,
+            fill_after_polls=max(1, int(self.config.get("mock_fill_after_polls", 3) or 3)),
+        )
 
     def _check_kill_switch(self) -> None:
         kill_switch_path = self._resolved_kill_switch_path()

@@ -42,7 +42,7 @@ def load_target_book(
     rebalance_dates = portfolio_module._get_optimal_rebalance_dates(signal.index, day_offset=2)
     is_rebalance_day = as_of_ts in rebalance_dates
 
-    prior_state = _load_portfolio_state(repo_root_path, signal.columns)
+    prior_state = _load_portfolio_state(repo_root_path, signal.columns, as_of_date=as_of_ts)
     historical_weights = _load_weights_history(baseline_dir, signal.columns)
     prior_weights = _resolve_prior_weights(
         prior_state=prior_state,
@@ -405,7 +405,12 @@ def _weights_row_for_date(
     return _safe_series(historical_weights.loc[as_of_date], universe)
 
 
-def _load_portfolio_state(repo_root: Path, universe: pd.Index) -> dict[str, Any]:
+def _load_portfolio_state(
+    repo_root: Path,
+    universe: pd.Index,
+    *,
+    as_of_date: pd.Timestamp | None = None,
+) -> dict[str, Any]:
     candidates = [
         repo_root / "paper_trading" / "state" / "portfolio_state.json",
         repo_root / "paper_trading" / "current" / "state.json",
@@ -416,6 +421,13 @@ def _load_portfolio_state(repo_root: Path, universe: pd.Index) -> dict[str, Any]
         try:
             payload = json.loads(state_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
+            continue
+        snapshot_as_of = _payload_as_of_date(payload)
+        if (
+            as_of_date is not None
+            and snapshot_as_of is not None
+            and snapshot_as_of > as_of_date.normalize()
+        ):
             continue
         if isinstance(payload, dict) and isinstance(payload.get("weights"), dict):
             payload["weights"] = {
@@ -432,6 +444,18 @@ def _load_portfolio_state(repo_root: Path, universe: pd.Index) -> dict[str, Any]
             }
             return payload
     return {}
+
+
+def _payload_as_of_date(payload: dict[str, Any]) -> pd.Timestamp | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_value = payload.get("as_of_date")
+    if raw_value in (None, ""):
+        return None
+    try:
+        return pd.Timestamp(raw_value).normalize()
+    except (TypeError, ValueError):
+        return None
 
 
 def _check_signal_staleness(

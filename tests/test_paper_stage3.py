@@ -38,6 +38,12 @@ def test_run_phase_a_writes_pending_intents_and_order_blotter(tmp_path: Path) ->
     assert intents["status"] == "AWAITING_APPROVAL"
     assert intents["rebalance_id"]
     assert intents["proposed_orders"]
+    assert {(order["symbol"], order["side"]) for order in intents["proposed_orders"]} == {
+        ("AAA", "BUY"),
+        ("BBB", "SELL"),
+    }
+    assert intents["current_holdings"] == {"AAA": 0.55, "BBB": 0.45}
+    assert intents["target_weights"] == {"AAA": 0.6, "BBB": 0.4}
     assert (bundle_dir / "approval.template.json").exists()
 
     orders_path = repo_root / "paper_trading" / "blotter" / "orders.jsonl"

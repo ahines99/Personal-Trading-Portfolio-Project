@@ -61,13 +61,19 @@ class ReconciliationEngine:
         target_weights: dict[str, float] | None = None,
         expected_cash: float | None = None,
         expected_nav: float | None = None,
+        rebalance_id: str | None = None,
+        order_ids: list[str] | set[str] | tuple[str, ...] | None = None,
     ) -> ReconciliationResult:
         del end_of_day
         reconcile_date = self._coerce_date(as_of_date)
         discrepancies: list[str] = []
         fills_written = 0
 
-        orders = self._orders_for_date(reconcile_date)
+        orders = self._orders_for_date(
+            reconcile_date,
+            rebalance_id=rebalance_id,
+            order_ids=order_ids,
+        )
         executed_trades: list[dict[str, Any]] = []
         unfilled_orders: list[dict[str, Any]] = []
         cancellations: list[dict[str, Any]] = []
@@ -164,12 +170,21 @@ class ReconciliationEngine:
             reconciliation_path=str(reconciliation_path),
         )
 
-    def _orders_for_date(self, reconcile_date: date) -> list[Any]:
+    def _orders_for_date(
+        self,
+        reconcile_date: date,
+        *,
+        rebalance_id: str | None = None,
+        order_ids: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> list[Any]:
         latest = self.order_blotter.list_orders(latest_only=True)
+        normalized_order_ids = {str(order_id) for order_id in (order_ids or []) if order_id}
         orders = [
             order
             for order in latest
             if self._coerce_date(order.submission_timestamp or order.timestamp) == reconcile_date
+            and (rebalance_id is None or str(order.rebalance_id) == str(rebalance_id))
+            and (not normalized_order_ids or str(order.order_id) in normalized_order_ids)
         ]
         orders.sort(key=lambda row: row.submission_timestamp or row.timestamp)
         return orders
