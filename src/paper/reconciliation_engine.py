@@ -80,7 +80,8 @@ class ReconciliationEngine:
                 continue
 
             broker_status = self.broker_client.get_order_status(order.broker_order_id)
-            fills = self._extract_fills(order, broker_status)
+            fills, fill_anomalies = self._extract_fills(order, broker_status)
+            discrepancies.extend(fill_anomalies)
 
             if order.status == OrderStatus.FILLED and not fills:
                 discrepancies.append(
@@ -173,7 +174,11 @@ class ReconciliationEngine:
         orders.sort(key=lambda row: row.submission_timestamp or row.timestamp)
         return orders
 
-    def _extract_fills(self, order: Any, broker_status: dict[str, Any]) -> list[FillRecord]:
+    def _extract_fills(
+        self,
+        order: Any,
+        broker_status: dict[str, Any],
+    ) -> tuple[list[FillRecord], list[str]]:
         terminal_poll = None
         payloads = broker_status.get("fills") or broker_status.get("fill") or []
         if not payloads and isinstance(order.preview_result, dict):
@@ -194,14 +199,33 @@ class ReconciliationEngine:
                 expected_price = None
 
         records: list[FillRecord] = []
+        anomalies: list[str] = []
         for index, payload in enumerate(payloads):
-            qty = self._coerce_float(
-                payload.get("qty", payload.get("quantity", payload.get("filled_qty")))
+            fill_label = f"Order {order.order_id} fill payload #{index + 1}"
+            if not isinstance(payload, dict):
+                anomalies.append(
+                    f"{fill_label} is malformed: expected mapping payload, got {type(payload).__name__}."
+                )
+                continue
+
+            qty, qty_error = self._parse_fill_float(
+                payload,
+                field_names=("qty", "quantity", "filled_qty"),
+                fill_label=fill_label,
+                field_label="qty",
             )
-            price = self._coerce_float(
-                payload.get("price", payload.get("avg_fill_price", broker_status.get("avg_fill_price")))
+            price, price_error = self._parse_fill_float(
+                payload,
+                field_names=("price", "avg_fill_price"),
+                fallback=broker_status.get("avg_fill_price"),
+                fill_label=fill_label,
+                field_label="price",
             )
-            if qty <= 0.0 or price <= 0.0:
+            if qty_error:
+                anomalies.append(qty_error)
+            if price_error:
+                anomalies.append(price_error)
+            if qty_error or price_error:
                 continue
 
             broker_fill_id = payload.get("broker_fill_id") or payload.get("fill_id") or payload.get("id")
@@ -229,7 +253,44 @@ class ReconciliationEngine:
                     expected_price=expected_price,
                 )
             )
-        return records
+        return records, anomalies
+
+    def _parse_fill_float(
+        self,
+        payload: dict[str, Any],
+        *,
+        field_names: tuple[str, ...],
+        fill_label: str,
+        field_label: str,
+        fallback: Any = None,
+    ) -> tuple[float | None, str | None]:
+        raw_value: Any = None
+        field_source = None
+        for name in field_names:
+            if name in payload:
+                raw_value = payload.get(name)
+                field_source = name
+                break
+        if field_source is None:
+            raw_value = fallback
+            field_source = "fallback"
+
+        if raw_value in (None, ""):
+            return None, f"{fill_label} is malformed: missing {field_label}."
+
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return (
+                None,
+                f"{fill_label} is malformed: invalid {field_label}={raw_value!r} from {field_source}.",
+            )
+        if value <= 0.0:
+            return (
+                None,
+                f"{fill_label} is malformed: non-positive {field_label}={value} from {field_source}.",
+            )
+        return value, None
 
     def _build_positions_payload(
         self,

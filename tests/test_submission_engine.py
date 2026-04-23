@@ -131,9 +131,9 @@ def test_submission_engine_sells_first_and_records_terminal_states(tmp_path: Pat
         kill_switch_path=tmp_path / "KILL_SWITCH",
     )
     preview_batch = {
-        "intent-sell": {"expected_price": 100.0},
-        "intent-buy-bbb": {"expected_price": 52.0},
-        "intent-buy-ccc": {"expected_price": 10.0},
+        "intent-sell": _preview("AAA", 10, "SELL", expected_price=100.0),
+        "intent-buy-bbb": _preview("BBB", 8, "BUY", expected_price=52.0),
+        "intent-buy-ccc": _preview("CCC", 5, "BUY", expected_price=10.0),
     }
     approval_record = {"status": "APPROVED", "rebalance_id": str(uuid4())}
     order_specs = [
@@ -230,8 +230,8 @@ def test_submission_engine_halts_when_kill_switch_appears_mid_loop(tmp_path: Pat
                 },
             ],
             {
-                "intent-sell": {"expected_price": 100.0},
-                "intent-buy-bbb": {"expected_price": 52.0},
+                "intent-sell": _preview("AAA", 10, "SELL", expected_price=100.0),
+                "intent-buy-bbb": _preview("BBB", 8, "BUY", expected_price=52.0),
             },
             approval_record,
         )
@@ -270,7 +270,7 @@ def test_submission_engine_cancels_once_and_halts_on_poll_failure(tmp_path: Path
                     "parent_intent_hash": "intent-aaa",
                 }
             ],
-            {"intent-aaa": {"expected_price": 100.0}},
+            {"intent-aaa": _preview("AAA", 10, "SELL", expected_price=100.0)},
             approval_record,
         )
 
@@ -303,7 +303,7 @@ def test_reconciliation_engine_writes_fills_and_positions(tmp_path: Path) -> Non
                 "parent_intent_hash": "intent-aaa",
             }
         ],
-            {"intent-aaa": {"expected_price": 100.0}},
+        {"intent-aaa": _preview("AAA", 10, "SELL", expected_price=100.0)},
         approval_record,
     )
 
@@ -338,3 +338,92 @@ def test_reconciliation_engine_writes_fills_and_positions(tmp_path: Path) -> Non
     assert fills_path.exists()
     payload = Path(result.positions_path).read_text(encoding="utf-8")
     assert "\"AAA\"" in payload
+
+
+def test_submission_engine_blocks_batch_when_preview_missing_for_any_order(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    blotter = OrderBlotter(tmp_path / "orders.jsonl")
+    engine = SubmissionEngine(
+        broker,
+        order_blotter=blotter,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+    )
+    approval_record = {"status": "APPROVED", "rebalance_id": str(uuid4())}
+
+    with pytest.raises(ValueError, match="missing preview coverage"):
+        engine.submit_and_poll(
+            [
+                {
+                    "symbol": "AAA",
+                    "qty": 10,
+                    "side": "SELL",
+                    "order_type": "market",
+                    "parent_intent_hash": "intent-aaa",
+                },
+                {
+                    "symbol": "BBB",
+                    "qty": 8,
+                    "side": "BUY",
+                    "order_type": "market",
+                    "parent_intent_hash": "intent-bbb",
+                },
+            ],
+            {
+                "intent-aaa": _preview("AAA", 10, "SELL", expected_price=100.0),
+            },
+            approval_record,
+        )
+
+    assert broker.placed_orders == []
+    assert blotter.list_orders(latest_only=True) == []
+
+
+def test_submission_engine_blocks_batch_when_preview_mismatches_order_request(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    blotter = OrderBlotter(tmp_path / "orders.jsonl")
+    engine = SubmissionEngine(
+        broker,
+        order_blotter=blotter,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+    )
+    approval_record = {"status": "APPROVED", "rebalance_id": str(uuid4())}
+
+    with pytest.raises(ValueError, match="preview does not match order request"):
+        engine.submit_and_poll(
+            [
+                {
+                    "symbol": "AAA",
+                    "qty": 10,
+                    "side": "SELL",
+                    "order_type": "market",
+                    "parent_intent_hash": "intent-aaa",
+                }
+            ],
+            {
+                "intent-aaa": _preview("AAA", 9, "SELL", expected_price=100.0),
+            },
+            approval_record,
+        )
+
+    assert broker.placed_orders == []
+    assert blotter.list_orders(latest_only=True) == []
+
+
+def _preview(
+    symbol: str,
+    qty: float,
+    side: str,
+    *,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "symbol": symbol,
+        "quantity": qty,
+        "side": side,
+        "type": order_type,
+        "limit_price": limit_price,
+    }
+    payload.update(extra)
+    return payload

@@ -24,6 +24,53 @@ TRADIER_BASE_URLS = {
 class TradierBrokerError(RuntimeError):
     """Raised for broker connectivity or response-shape errors."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        retryable: bool = False,
+        response_payload: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.retryable = retryable
+        self.response_payload = response_payload
+
+
+class TradierAuthenticationError(TradierBrokerError):
+    """Raised for 401/403 responses."""
+
+
+class TradierRateLimitError(TradierBrokerError):
+    """Raised for Tradier 429 responses."""
+
+
+class TradierTransientError(TradierBrokerError):
+    """Raised for retryable 5xx/transport failures."""
+
+
+class TradierTransportError(TradierTransientError):
+    """Raised for retryable connection-level request failures."""
+
+
+class TradierNotFoundError(TradierBrokerError):
+    """Raised for 404 responses."""
+
+
+class TradierValidationError(TradierBrokerError):
+    """Raised for non-retryable request validation failures."""
+
+
+class TradierResponseShapeError(TradierBrokerError):
+    """Raised when Tradier returns an unexpected payload shape."""
+
+
+class TradierDuplicateOrderError(TradierBrokerError):
+    """Raised when multiple live orders share the same client tag."""
+
 
 class TradierBrokerClient(BrokerClient):
     def __init__(
@@ -210,50 +257,48 @@ class TradierBrokerClient(BrokerClient):
             limit_price=limit_price,
         )
         preview = _validate_preview_result(preview_result, request)
-        payload = self._post(
-            f"/accounts/{self.account_id}/orders",
-            data=self._build_order_form(
-                request,
-                preview=False,
-                tag=str(preview["tag"]),
-            ),
-            retryable=False,
-        )
-        order = _extract_order_node(payload)
-        broker_order_id = _coerce_text(order.get("id"))
-        latest_status: dict[str, Any] | None = None
-        if broker_order_id:
-            try:
-                latest_status = self.get_order_status(broker_order_id)
-            except TradierBrokerError:
-                latest_status = None
-
-        result = {
-            "broker_order_id": broker_order_id,
-            "accepted": _coerce_text(order.get("status")) == "ok",
-            "placement_status": _coerce_text(order.get("status"), default="unknown"),
-            "partner_id": _coerce_text(order.get("partner_id")),
-            "preview_id": preview["preview_id"],
-            "tag": preview["tag"],
-            "symbol": request["symbol"],
-            "quantity": request["qty"],
-            "side": request["side"],
-            "type": request["order_type"],
-            "duration": request["duration"],
-            "limit_price": request["limit_price"],
-            "raw": deepcopy_safe(payload),
-        }
-        if latest_status is not None:
-            result.update(
-                {
-                    "status": latest_status["status"],
-                    "is_terminal": latest_status["is_terminal"],
-                    "latest_status": latest_status,
-                }
+        preview_tag = str(preview["tag"])
+        existing_order = self._find_order_by_tag(preview_tag)
+        if existing_order is not None:
+            return self._build_submission_result(
+                order_payload=existing_order,
+                request=request,
+                preview=preview,
+                raw_payload={"order": deepcopy_safe(existing_order)},
+                placement_status="recovered_existing",
+                recovered_by_tag=True,
             )
-        else:
-            result.update({"status": "pending", "is_terminal": False})
-        return result
+
+        try:
+            payload = self._post(
+                f"/accounts/{self.account_id}/orders",
+                data=self._build_order_form(
+                    request,
+                    preview=False,
+                    tag=preview_tag,
+                ),
+                retryable=False,
+            )
+        except (TradierRateLimitError, TradierTransientError) as exc:
+            recovered = self._recover_order_by_tag(
+                preview_tag,
+                request=request,
+                preview=preview,
+                error=exc,
+            )
+            if recovered is not None:
+                return recovered
+            raise
+
+        order = _extract_order_node(payload)
+        return self._build_submission_result(
+            order_payload=order,
+            request=request,
+            preview=preview,
+            raw_payload=payload,
+            placement_status=_coerce_text(order.get("status"), default="unknown"),
+            recovered_by_tag=False,
+        )
 
     def cancel_order(self, broker_order_id: str) -> dict[str, Any]:
         normalized_order_id = _require_order_id(broker_order_id)
@@ -521,12 +566,12 @@ class TradierBrokerClient(BrokerClient):
         url = f"{self.base_url}{path}"
         method_name = str(method).upper()
         request_fn = getattr(self.session, method_name.lower())
-        last_error: Exception | None = None
         headers = None
         if method_name in {"POST", "PUT"}:
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        attempt_budget = max(1, self.max_retries + 1)
 
-        for attempt in range(self.max_retries):
+        for attempt in range(attempt_budget):
             try:
                 request_kwargs: dict[str, Any] = {
                     "timeout": self.timeout,
@@ -538,34 +583,49 @@ class TradierBrokerClient(BrokerClient):
                 if headers is not None:
                     request_kwargs["headers"] = headers
                 response = request_fn(url, **request_kwargs)
-                if response.status_code == 429 or response.status_code >= 500:
-                    if (not retryable) or attempt == self.max_retries - 1:
-                        response.raise_for_status()
-                    time.sleep(min(2**attempt, 8))
-                    continue
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise TradierBrokerError(
-                        f"Unexpected Tradier payload type for {path}: {type(payload)!r}"
-                    )
-                return _normalize_tradier_payload(payload)
-            except requests.HTTPError as exc:
-                detail = _error_detail(exc.response)
-                raise TradierBrokerError(
-                    f"Tradier request failed for {path} [{self.broker}] via {method_name}: "
-                    f"{detail}"
-                ) from exc
             except requests.RequestException as exc:
-                last_error = exc
-                if (not retryable) or attempt == self.max_retries - 1:
-                    break
-                time.sleep(min(2**attempt, 8))
+                error = _classify_transport_error(
+                    exc,
+                    path=path,
+                    broker=self.broker,
+                    method_name=method_name,
+                )
+                if retryable and error.retryable and attempt < attempt_budget - 1:
+                    time.sleep(_retry_delay_seconds(attempt=attempt, response=None))
+                    continue
+                raise error from exc
 
-        raise TradierBrokerError(
-            f"Tradier request failed for {path} [{self.broker}] via {method_name}: "
-            f"{last_error}"
-        ) from last_error
+            if response.status_code >= 400:
+                error = _classify_http_error(
+                    response,
+                    path=path,
+                    broker=self.broker,
+                    method_name=method_name,
+                )
+                if retryable and error.retryable and attempt < attempt_budget - 1:
+                    time.sleep(_retry_delay_seconds(attempt=attempt, response=response))
+                    continue
+                raise error
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise TradierResponseShapeError(
+                    f"Tradier request returned invalid JSON for {path} [{self.broker}] "
+                    f"via {method_name}",
+                    error_code="invalid_json",
+                    response_payload=response.text,
+                ) from exc
+            if not isinstance(payload, dict):
+                raise TradierResponseShapeError(
+                    f"Unexpected Tradier payload type for {path}: {type(payload)!r}"
+                )
+            return _normalize_tradier_payload(payload)
+        raise TradierTransientError(
+            f"Tradier request exhausted retries for {path} [{self.broker}] via {method_name}",
+            error_code="retries_exhausted",
+            retryable=False,
+        )
 
     def _build_order_form(
         self,
@@ -605,6 +665,110 @@ class TradierBrokerClient(BrokerClient):
             form["tag"] = tag
         return form
 
+    def _list_orders(self) -> list[dict[str, Any]]:
+        payload = self._get(
+            f"/accounts/{self.account_id}/orders",
+            params={"includeTags": "true"},
+        )
+        return _extract_order_nodes(payload)
+
+    def _find_order_by_tag(self, tag: str) -> dict[str, Any] | None:
+        normalized_tag = str(tag).strip()
+        if not normalized_tag:
+            return None
+
+        matches = [
+            order
+            for order in self._list_orders()
+            if _coerce_text(order.get("tag")) == normalized_tag
+        ]
+        if not matches:
+            return None
+        unique_ids = {
+            _coerce_text(match.get("id"))
+            for match in matches
+            if _coerce_text(match.get("id"))
+        }
+        if len(unique_ids) > 1:
+            raise TradierDuplicateOrderError(
+                f"Multiple Tradier orders share client tag {normalized_tag!r}; "
+                f"refusing duplicate-unsafe submission recovery.",
+                error_code="duplicate_tag_orders",
+                response_payload=deepcopy_safe(matches),
+            )
+        return matches[0]
+
+    def _recover_order_by_tag(
+        self,
+        tag: str,
+        *,
+        request: dict[str, Any],
+        preview: dict[str, Any],
+        error: TradierBrokerError,
+    ) -> dict[str, Any] | None:
+        try:
+            existing_order = self._find_order_by_tag(tag)
+        except TradierBrokerError:
+            raise error
+        if existing_order is None:
+            return None
+        return self._build_submission_result(
+            order_payload=existing_order,
+            request=request,
+            preview=preview,
+            raw_payload={
+                "order": deepcopy_safe(existing_order),
+                "recovered_after_error": str(error),
+            },
+            placement_status="recovered_existing",
+            recovered_by_tag=True,
+        )
+
+    def _build_submission_result(
+        self,
+        *,
+        order_payload: dict[str, Any],
+        request: dict[str, Any],
+        preview: dict[str, Any],
+        raw_payload: dict[str, Any],
+        placement_status: str,
+        recovered_by_tag: bool,
+    ) -> dict[str, Any]:
+        broker_order_id = _coerce_text(order_payload.get("id"))
+        latest_status: dict[str, Any] | None = None
+        if broker_order_id:
+            try:
+                latest_status = self.get_order_status(broker_order_id)
+            except TradierBrokerError:
+                latest_status = None
+        normalized_order = latest_status or _normalize_order_status(order_payload)
+        accepted = normalized_order["status"] not in {"rejected", "error"}
+
+        result = {
+            "broker_order_id": broker_order_id,
+            "accepted": accepted,
+            "placement_status": placement_status,
+            "partner_id": _coerce_text(order_payload.get("partner_id")),
+            "preview_id": preview["preview_id"],
+            "tag": preview["tag"],
+            "symbol": request["symbol"],
+            "quantity": request["qty"],
+            "side": request["side"],
+            "type": request["order_type"],
+            "duration": request["duration"],
+            "limit_price": request["limit_price"],
+            "recovered_by_tag": recovered_by_tag,
+            "raw": deepcopy_safe(raw_payload),
+        }
+        result.update(
+            {
+                "status": normalized_order["status"],
+                "is_terminal": normalized_order["is_terminal"],
+                "latest_status": normalized_order,
+            }
+        )
+        return result
+
 
 def _normalize_tradier_payload(value: Any) -> Any:
     if isinstance(value, dict):
@@ -620,14 +784,32 @@ def _normalize_tradier_payload(value: Any) -> Any:
 
 
 def _extract_order_node(payload: dict[str, Any]) -> dict[str, Any]:
-    order = _as_dict(payload.get("order"))
-    if order:
-        return order
-    orders = _as_dict(payload.get("orders"))
-    nested = _as_dict(orders.get("order"))
-    if nested:
-        return nested
-    raise TradierBrokerError(f"Tradier payload did not include an order node: {payload!r}")
+    orders = _extract_order_nodes(payload)
+    if len(orders) == 1:
+        return orders[0]
+    if not orders:
+        raise TradierResponseShapeError(
+            f"Tradier payload did not include an order node: {payload!r}",
+            error_code="missing_order",
+            response_payload=deepcopy_safe(payload),
+        )
+    raise TradierResponseShapeError(
+        f"Tradier payload unexpectedly included multiple orders: {payload!r}",
+        error_code="multiple_orders",
+        response_payload=deepcopy_safe(payload),
+    )
+
+
+def _extract_order_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[Any] = []
+    if "order" in payload:
+        candidates.extend(_ensure_list(payload.get("order")))
+    orders = payload.get("orders")
+    if isinstance(orders, dict):
+        candidates.extend(_ensure_list(orders.get("order")))
+    elif orders is not None:
+        candidates.extend(_ensure_list(orders))
+    return [node for node in (_as_dict(item) for item in candidates) if node]
 
 
 def _normalize_preview_response(
@@ -889,6 +1071,118 @@ def _error_detail(response: requests.Response | None) -> str:
     except ValueError:
         payload = response.text.strip()
     return f"{response.status_code} {payload}"
+
+
+def _safe_json_payload(response: requests.Response) -> Any | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return _normalize_tradier_payload(payload)
+
+
+def _classify_http_error(
+    response: requests.Response,
+    *,
+    path: str,
+    broker: str,
+    method_name: str,
+) -> TradierBrokerError:
+    payload = _safe_json_payload(response)
+    detail = _error_detail(response)
+    message = (
+        f"Tradier request failed for {path} [{broker}] via {method_name}: {detail}"
+    )
+    status_code = int(response.status_code)
+
+    if status_code == 429:
+        return TradierRateLimitError(
+            message,
+            status_code=status_code,
+            error_code="rate_limit",
+            retryable=True,
+            response_payload=payload,
+        )
+    if status_code in {401, 403}:
+        return TradierAuthenticationError(
+            message,
+            status_code=status_code,
+            error_code="authentication",
+            retryable=False,
+            response_payload=payload,
+        )
+    if status_code == 404:
+        return TradierNotFoundError(
+            message,
+            status_code=status_code,
+            error_code="not_found",
+            retryable=False,
+            response_payload=payload,
+        )
+    if status_code in {400, 409, 422}:
+        return TradierValidationError(
+            message,
+            status_code=status_code,
+            error_code="validation",
+            retryable=False,
+            response_payload=payload,
+        )
+    if status_code >= 500:
+        return TradierTransientError(
+            message,
+            status_code=status_code,
+            error_code="server_error",
+            retryable=True,
+            response_payload=payload,
+        )
+    return TradierBrokerError(
+        message,
+        status_code=status_code,
+        error_code="http_error",
+        retryable=False,
+        response_payload=payload,
+    )
+
+
+def _classify_transport_error(
+    exc: requests.RequestException,
+    *,
+    path: str,
+    broker: str,
+    method_name: str,
+) -> TradierBrokerError:
+    retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError))
+    error_cls = TradierTransportError if retryable else TradierBrokerError
+    return error_cls(
+        f"Tradier transport error for {path} [{broker}] via {method_name}: {exc}",
+        error_code="transport",
+        retryable=retryable,
+    )
+
+
+def _retry_delay_seconds(
+    *,
+    attempt: int,
+    response: requests.Response | None,
+) -> float:
+    retry_after = _parse_retry_after_seconds(response)
+    if retry_after is not None:
+        return retry_after
+    return min(2**attempt, 8)
+
+
+def _parse_retry_after_seconds(response: requests.Response | None) -> float | None:
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, seconds)
 
 
 def _utc_now_iso() -> str:

@@ -16,6 +16,7 @@ _SELL_ORDER = {"SELL", "SELL_SHORT"}
 _APPROVED_STATUS = "APPROVED"
 _TERMINAL_BROKER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "error"}
 _DEFAULT_KILL_SWITCH_PATH = Path("paper_trading/state/KILL_SWITCH")
+_PREVIEW_FAILURE_STATUSES = {"error", "errors", "failed", "failure", "rejected", "invalid"}
 
 
 @dataclass(frozen=True)
@@ -68,10 +69,16 @@ class SubmissionEngine:
             [self._normalize_spec(spec) for spec in order_specs],
             key=self._sort_key,
         )
+        preview_results = [
+            self._require_valid_preview(
+                self._resolve_preview(preview_batch, spec, index),
+                spec=spec,
+            )
+            for index, spec in enumerate(ordered_specs)
+        ]
 
-        for index, spec in enumerate(ordered_specs):
+        for spec, preview_result in zip(ordered_specs, preview_results):
             self._ensure_kill_switch_clear(stage="before_prepare")
-            preview_result = self._resolve_preview(preview_batch, spec, index)
             order_row = self._create_blotter_order(
                 spec=spec,
                 approval_record=approval_record,
@@ -303,6 +310,162 @@ class SubmissionEngine:
                 if key in preview_batch and isinstance(preview_batch[key], dict):
                     return dict(preview_batch[key])
         return None
+
+    def _require_valid_preview(
+        self,
+        preview_result: dict[str, Any] | None,
+        *,
+        spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(preview_result, dict):
+            raise ValueError(
+                "Submission blocked: missing preview coverage for "
+                f"{spec['symbol']} {spec['side'].value} {spec['qty']}."
+            )
+
+        preview_errors = self._collect_preview_errors(preview_result)
+        if preview_errors:
+            raise ValueError(
+                "Submission blocked: preview contains errors for "
+                f"{spec['symbol']}: {'; '.join(preview_errors)}"
+            )
+
+        if self._preview_indicates_failure(preview_result):
+            raise ValueError(
+                "Submission blocked: preview does not indicate success for "
+                f"{spec['symbol']}."
+            )
+
+        preview_request = self._extract_preview_request(preview_result)
+        if preview_request is None:
+            raise ValueError(
+                "Submission blocked: preview coverage is incomplete for "
+                f"{spec['symbol']} {spec['side'].value} {spec['qty']}."
+            )
+
+        expected_request = normalize_equity_order_request(
+            spec["symbol"],
+            spec["qty"],
+            spec["side"].value,
+            spec["order_type"],
+            limit_price=spec.get("limit_price"),
+        )
+        for key in ("symbol", "qty", "side", "order_type", "limit_price"):
+            if preview_request[key] != expected_request[key]:
+                raise ValueError(
+                    "Submission blocked: preview does not match order request for "
+                    f"{spec['symbol']} {key}: "
+                    f"{preview_request[key]!r} != {expected_request[key]!r}"
+                )
+        return preview_result
+
+    def _extract_preview_request(
+        self,
+        preview_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        symbol = self._preview_field(preview_result, "symbol")
+        qty = self._preview_field(preview_result, "quantity", "qty")
+        side = self._preview_field(preview_result, "side")
+        order_type = self._preview_field(preview_result, "type", "order_type")
+        limit_price = self._preview_field(preview_result, "limit_price")
+        if symbol in (None, "") or qty in (None, "") or side in (None, "") or order_type in (None, ""):
+            return None
+        return normalize_equity_order_request(
+            symbol,
+            qty,
+            side,
+            order_type,
+            limit_price=limit_price,
+        )
+
+    def _preview_field(
+        self,
+        preview_result: dict[str, Any],
+        *keys: str,
+    ) -> Any:
+        for payload in self._preview_payload_sources(preview_result):
+            for key in keys:
+                if key in payload:
+                    value = payload.get(key)
+                    if value is not None:
+                        return value
+        return None
+
+    def _preview_payload_sources(
+        self,
+        preview_result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        sources = [preview_result]
+        order_payload = preview_result.get("order")
+        if isinstance(order_payload, dict):
+            sources.append(order_payload)
+        raw_payload = preview_result.get("raw_payload")
+        if isinstance(raw_payload, dict):
+            sources.append(raw_payload)
+        return sources
+
+    def _collect_preview_errors(
+        self,
+        preview_result: dict[str, Any],
+    ) -> list[str]:
+        errors: list[str] = []
+        for payload in self._preview_payload_sources(preview_result):
+            for key in ("errors", "error", "fault"):
+                errors.extend(self._flatten_preview_messages(payload.get(key)))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for error in errors:
+            if error in seen:
+                continue
+            seen.add(error)
+            deduped.append(error)
+        return deduped
+
+    def _flatten_preview_messages(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, dict):
+            messages: list[str] = []
+            for item in value.values():
+                messages.extend(self._flatten_preview_messages(item))
+            return messages
+        if isinstance(value, (list, tuple, set)):
+            messages: list[str] = []
+            for item in value:
+                messages.extend(self._flatten_preview_messages(item))
+            return messages
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _preview_indicates_failure(
+        self,
+        preview_result: dict[str, Any],
+    ) -> bool:
+        result_value = self._preview_field(preview_result, "result")
+        if result_value is not None and not self._coerce_preview_success(result_value):
+            return True
+
+        for payload in self._preview_payload_sources(preview_result):
+            for key in ("broker_status", "status", "outcome"):
+                status = payload.get(key)
+                if status is None:
+                    continue
+                if str(status).strip().lower() in _PREVIEW_FAILURE_STATUSES:
+                    return True
+        return False
+
+    def _coerce_preview_success(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value) != 0.0
+        text = str(value).strip().lower()
+        if not text:
+            return False
+        return text not in _PREVIEW_FAILURE_STATUSES and text not in {"false", "0", "no", "off"}
 
     def _extract_broker_order_id(self, payload: dict[str, Any]) -> str:
         for key in ("broker_order_id", "order_id", "id"):
