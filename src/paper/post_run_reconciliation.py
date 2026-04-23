@@ -86,6 +86,16 @@ def generate_reconciliation_report(
         anomalies=anomalies,
         thresholds=thresholds,
     )
+    summary_path = Path(
+        context.get("summary_path") or report_dir.parent / "reconciliation_summary.jsonl"
+    )
+    existing_summary_rows = _load_summary_rows(summary_path)
+    tracking_summary = _build_tracking_summary(
+        as_of_date=report_date,
+        tracking_payload=context.get("tracking_vs_backtest"),
+        existing_rows=existing_summary_rows,
+        settings=_tracking_settings(context),
+    )
 
     report = ReconciliationReport(
         as_of_date=report_date,
@@ -100,21 +110,27 @@ def generate_reconciliation_report(
         weight_drift_l1=weight_drift_l1,
         cash_drift=cash_drift,
         nav_drift=nav_drift,
-        pnl_reconciled_vs_backtest=context.get("pnl_reconciled_vs_backtest"),
+        pnl_reconciled_vs_backtest=tracking_summary.get("pnl_reconciled_vs_backtest"),
         anomalies=anomalies,
     )
 
     report_path = report_dir / "reconciliation.md"
     atomic_write_text(
         report_path,
-        _render_markdown(report, status=status, thresholds=thresholds),
+        _render_markdown(
+            report,
+            status=status,
+            thresholds=thresholds,
+            tracking_summary=tracking_summary,
+        ),
     )
-    _write_summary(
+    summary_row = _build_summary_row(
         report,
         status=status,
         thresholds=thresholds,
-        summary_path=context.get("summary_path") or report_dir.parent / "reconciliation_summary.jsonl",
+        tracking_summary=tracking_summary,
     )
+    _write_summary_row(summary_row, summary_path=summary_path)
     return str(report_path)
 
 
@@ -202,6 +218,7 @@ def _render_markdown(
     *,
     status: str,
     thresholds: dict[str, float],
+    tracking_summary: dict[str, Any],
 ) -> str:
     lines = [
         f"# Reconciliation Report - {report.as_of_date.isoformat()}",
@@ -221,6 +238,20 @@ def _render_markdown(
         f"- NAV drift: {report.nav_drift:+.2f}",
         f"- NAV drift threshold: {thresholds['nav_drift_abs']:.2f}",
         f"- Slippage mean bps: {report.slippage_summary.mean_bps:.2f}",
+        "",
+        "## Tracking vs Backtest",
+        "",
+        f"- Tracking status: {tracking_summary['tracking_status']}",
+        f"- Return date: {tracking_summary['return_date'] or 'N/A'}",
+        f"- Return date source: {tracking_summary['return_date_source'] or 'N/A'}",
+        f"- Backtest-predicted return: {tracking_summary['backtest_predicted_return']:+.6f}",
+        f"- Paper realized return: {tracking_summary['paper_realized_return']:+.6f}",
+        f"- Excess return vs backtest: {tracking_summary['return_excess_vs_backtest']:+.6f}",
+        f"- Rolling tracking error ({tracking_summary['tracking_error_window_days']}d ann.): "
+        f"{tracking_summary['tracking_error_rolling_ann_pct']:.3f}%",
+        f"- Tracking error threshold: {tracking_summary['tracking_error_alert_threshold_pct']:.3f}%",
+        f"- Monthly win rate vs backtest: {tracking_summary['monthly_win_rate_vs_backtest_pct']:.2f}%",
+        f"- Monthly win-rate threshold: {tracking_summary['monthly_win_rate_min_threshold_pct']:.2f}%",
         "",
         "## Intended vs Executed",
         "",
@@ -245,6 +276,8 @@ def _render_markdown(
             lines.append(f"- {anomaly}")
     else:
         lines.append("- None")
+    if tracking_summary.get("tracking_reason"):
+        lines.append(f"- tracking_vs_backtest: {tracking_summary['tracking_reason']}")
 
     lines.extend(
         [
@@ -258,14 +291,13 @@ def _render_markdown(
     return "\n".join(lines)
 
 
-def _write_summary(
+def _build_summary_row(
     report: ReconciliationReport,
     *,
     status: str,
     thresholds: dict[str, float],
-    summary_path: str | Path,
-) -> None:
-    path = Path(summary_path)
+    tracking_summary: dict[str, Any],
+) -> dict[str, Any]:
     summary_row = report.summary_row()
     summary_row["status"] = status
     summary_row.update(
@@ -276,22 +308,172 @@ def _write_summary(
             "nav_drift_abs_threshold": thresholds["nav_drift_abs"],
         }
     )
+    summary_row.update(tracking_summary)
+    return summary_row
+
+
+def _write_summary_row(summary_row: dict[str, Any], *, summary_path: str | Path) -> None:
+    path = Path(summary_path)
 
     def merge_summary(existing_text: str) -> str:
-        existing = [
-            json.loads(line)
-            for line in existing_text.splitlines()
-            if line.strip()
-        ]
+        existing = [json.loads(line) for line in existing_text.splitlines() if line.strip()]
         filtered = [
-            row
-            for row in existing
-            if str(row.get("as_of_date")) != report.as_of_date.isoformat()
+            row for row in existing if str(row.get("as_of_date")) != str(summary_row.get("as_of_date"))
         ]
         filtered.append(summary_row)
+        filtered.sort(key=lambda row: str(row.get("as_of_date") or ""))
         return "".join(json.dumps(row, sort_keys=True) + "\n" for row in filtered)
 
     atomic_update_text(path, merge_summary)
+
+
+def _load_summary_rows(path: str | Path) -> list[dict[str, Any]]:
+    target = Path(path)
+    if not target.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in target.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _tracking_settings(context: dict[str, Any]) -> dict[str, float | int]:
+    return {
+        "tracking_error_window_days": int(context.get("tracking_error_window_days", 21)),
+        "tracking_error_annualization_days": int(context.get("tracking_error_annualization_days", 252)),
+        "tracking_error_alert_threshold": _float_setting(context, "tracking_error_alert_threshold", 0.0075),
+        "monthly_win_rate_min_threshold": _float_setting(context, "monthly_win_rate_min_threshold", 0.55),
+    }
+
+
+def _build_tracking_summary(
+    *,
+    as_of_date: date,
+    tracking_payload: Any,
+    existing_rows: list[dict[str, Any]],
+    settings: dict[str, float | int],
+) -> dict[str, Any]:
+    window_days = int(settings["tracking_error_window_days"])
+    annualization_days = int(settings["tracking_error_annualization_days"])
+    tracking_threshold = float(settings["tracking_error_alert_threshold"])
+    monthly_win_rate_threshold = float(settings["monthly_win_rate_min_threshold"])
+    summary: dict[str, Any] = {
+        "tracking_status": "UNAVAILABLE",
+        "tracking_reason": None,
+        "return_date": None,
+        "return_date_source": None,
+        "backtest_predicted_return": 0.0,
+        "paper_realized_return": 0.0,
+        "return_excess_vs_backtest": 0.0,
+        "backtest_predicted_pnl": 0.0,
+        "paper_realized_pnl": 0.0,
+        "pnl_reconciled_vs_backtest": None,
+        "tracking_capital_base": None,
+        "tracking_error_window_days": window_days,
+        "tracking_error_annualization_days": annualization_days,
+        "tracking_error_observations": 0,
+        "tracking_error_rolling_ann": 0.0,
+        "tracking_error_rolling_ann_pct": 0.0,
+        "tracking_error_alert_threshold": tracking_threshold,
+        "tracking_error_alert_threshold_pct": tracking_threshold * 100.0,
+        "tracking_error_gate_status": "UNAVAILABLE",
+        "monthly_win_rate_observations": 0,
+        "monthly_positive_excess_days": 0,
+        "monthly_win_rate_vs_backtest": 0.0,
+        "monthly_win_rate_vs_backtest_pct": 0.0,
+        "monthly_win_rate_min_threshold": monthly_win_rate_threshold,
+        "monthly_win_rate_min_threshold_pct": monthly_win_rate_threshold * 100.0,
+        "monthly_win_rate_gate_status": "UNAVAILABLE",
+    }
+    payload = dict(tracking_payload or {})
+    if not payload.get("available"):
+        summary["tracking_reason"] = str(payload.get("reason") or "tracking_vs_backtest unavailable")
+        return summary
+
+    summary.update(
+        {
+            "tracking_status": str(payload.get("status") or "OK"),
+            "tracking_reason": payload.get("reason"),
+            "return_date": payload.get("return_date"),
+            "return_date_source": payload.get("return_date_source"),
+            "backtest_predicted_return": float(payload.get("backtest_predicted_return") or 0.0),
+            "paper_realized_return": float(payload.get("paper_realized_return") or 0.0),
+            "return_excess_vs_backtest": float(payload.get("return_excess_vs_backtest") or 0.0),
+            "backtest_predicted_pnl": _optional_float(payload.get("backtest_predicted_pnl")),
+            "paper_realized_pnl": _optional_float(payload.get("paper_realized_pnl")),
+            "pnl_reconciled_vs_backtest": _optional_float(payload.get("pnl_reconciled_vs_backtest")),
+            "tracking_capital_base": _optional_float(payload.get("tracking_capital_base")),
+        }
+    )
+
+    current_date = as_of_date.isoformat()
+    dated_rows = _rows_with_excess_returns(existing_rows)
+    dated_rows = [
+        row for row in dated_rows if str(row.get("as_of_date")) != current_date
+    ]
+    dated_rows.append(
+        {
+            "as_of_date": current_date,
+            "return_excess_vs_backtest": summary["return_excess_vs_backtest"],
+        }
+    )
+    dated_rows.sort(key=lambda row: str(row["as_of_date"]))
+
+    rolling_rows = dated_rows[-window_days:]
+    rolling_excess = [float(row["return_excess_vs_backtest"]) for row in rolling_rows]
+    summary["tracking_error_observations"] = len(rolling_excess)
+    tracking_error_ann = _annualized_tracking_error(
+        rolling_excess,
+        annualization_days=annualization_days,
+    )
+    summary["tracking_error_rolling_ann"] = tracking_error_ann
+    summary["tracking_error_rolling_ann_pct"] = tracking_error_ann * 100.0
+    summary["tracking_error_gate_status"] = (
+        "ALERT" if tracking_error_ann > tracking_threshold else "OK"
+    )
+
+    month_prefix = current_date[:7]
+    month_rows = [row for row in dated_rows if str(row["as_of_date"]).startswith(month_prefix)]
+    monthly_excess = [float(row["return_excess_vs_backtest"]) for row in month_rows]
+    positive_days = sum(1 for value in monthly_excess if value > 0.0)
+    win_rate = (positive_days / len(monthly_excess)) if monthly_excess else 0.0
+    summary["monthly_win_rate_observations"] = len(monthly_excess)
+    summary["monthly_positive_excess_days"] = positive_days
+    summary["monthly_win_rate_vs_backtest"] = win_rate
+    summary["monthly_win_rate_vs_backtest_pct"] = win_rate * 100.0
+    summary["monthly_win_rate_gate_status"] = (
+        "ALERT" if monthly_excess and win_rate < monthly_win_rate_threshold else "OK"
+    )
+    return summary
+
+
+def _rows_with_excess_returns(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        as_of_date = str(row.get("as_of_date") or "").strip()
+        excess = _optional_float(row.get("return_excess_vs_backtest"))
+        if not as_of_date or excess is None:
+            continue
+        filtered.append(
+            {
+                "as_of_date": as_of_date,
+                "return_excess_vs_backtest": excess,
+            }
+        )
+    return filtered
+
+
+def _annualized_tracking_error(
+    values: list[float],
+    *,
+    annualization_days: int,
+) -> float:
+    if not values:
+        return 0.0
+    mean_value = sum(values) / len(values)
+    variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+    return (variance**0.5) * (float(annualization_days) ** 0.5)
 
 
 def _normalize_weights(payload: Any) -> dict[str, float]:

@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from .daily_gate import verify_prior_day_reconciliation
+from .loaders import resolve_baseline_path
 from .models import ApprovalRecord, ApprovalStatus, IntentBundle, IntentBundleStatus
 from .order_blotter import OrderBlotter
 from .post_run_reconciliation import (
@@ -131,6 +132,7 @@ class PhaseBExecutor:
             report_context = self._build_report_context(
                 bundle=effective_bundle,
                 broker=broker,
+                submission_day=submission_day,
                 order_specs=order_specs,
                 fills=fills,
             )
@@ -157,6 +159,7 @@ class PhaseBExecutor:
                     "cash_drift": drift_snapshot["cash_drift"],
                     "nav_drift": drift_snapshot["nav_drift"],
                     "weight_drift_l1": drift_snapshot["weight_drift_l1"],
+                    "tracking_vs_backtest": report_context.get("tracking_vs_backtest"),
                 },
             )
 
@@ -178,6 +181,7 @@ class PhaseBExecutor:
                 "reconciliation_report": report_path,
                 "reconciliation_report_json": str(bundle_report_path),
                 "reconciliation_json": reconciliation_result.reconciliation_path,
+                "tracking_vs_backtest": report_context.get("tracking_vs_backtest"),
             }
             _atomic_write_json(bundle.bundle_dir / "phase_b_summary.json", summary)
             return summary
@@ -318,25 +322,42 @@ class PhaseBExecutor:
         *,
         bundle: IntentBundle,
         broker: Any | None,
+        submission_day: date,
         order_specs: list[dict[str, Any]],
         fills: list[dict[str, Any]],
         anomalies: list[str] | None = None,
     ) -> dict[str, Any]:
         broker_positions = _safe_broker_call(broker, "get_positions")
         broker_balances = _safe_broker_call(broker, "get_balances")
+        actual_weights = _coerce_actual_weights(
+            broker_positions=broker_positions,
+            broker_balances=broker_balances,
+            fallback=bundle.current_holdings,
+        )
+        tracking_metrics = _compute_tracking_vs_backtest(
+            repo_root=self.repo_root,
+            config=self.config,
+            bundle=bundle,
+            submission_day=submission_day,
+            target_weights=bundle.target_weights,
+            actual_weights=actual_weights,
+            tracking_notional=_expected_nav(self.config),
+        )
         context: dict[str, Any] = {
             "repo_root": self.repo_root,
             "target_weights": bundle.target_weights,
+            "actual_weights": actual_weights,
             "expected_nav": _expected_nav(self.config),
             "intended_trades": [dict(item) for item in order_specs],
             "fills": fills,
             "anomalies": list(anomalies or []),
+            "tracking_vs_backtest": tracking_metrics,
+            "pnl_reconciled_vs_backtest": tracking_metrics.get("pnl_reconciled_vs_backtest"),
+            **_tracking_threshold_context(self.config),
             **_reconciliation_threshold_context(self.config),
         }
         if broker_positions is not None:
             context["broker_positions"] = broker_positions
-        else:
-            context["actual_weights"] = bundle.current_holdings
         if broker_balances is not None:
             context["broker_balances"] = broker_balances
         return context
@@ -357,6 +378,7 @@ class PhaseBExecutor:
         report_context = self._build_report_context(
             bundle=effective_bundle,
             broker=broker,
+            submission_day=submission_day,
             order_specs=order_specs,
             fills=fills,
             anomalies=[anomaly],
@@ -404,6 +426,7 @@ class PhaseBExecutor:
                 "nav_drift": drift_snapshot.get("nav_drift", 0.0),
                 "weight_drift_l1": drift_snapshot.get("weight_drift_l1", 0.0),
                 "anomalies": list(drift_snapshot.get("anomalies", [])),
+                "tracking_vs_backtest": report_context.get("tracking_vs_backtest"),
             },
         )
         _atomic_write_json(
@@ -422,6 +445,7 @@ class PhaseBExecutor:
                 "cash_drift": drift_snapshot.get("cash_drift", 0.0),
                 "nav_drift": drift_snapshot.get("nav_drift", 0.0),
                 "drift_thresholds": drift_snapshot.get("thresholds", _reconciliation_threshold_context(self.config)),
+                "tracking_vs_backtest": report_context.get("tracking_vs_backtest"),
             },
         )
 
@@ -468,6 +492,40 @@ def _positions_to_weight_map(positions: list[dict[str, Any]]) -> dict[str, float
     return {ticker: weight for ticker, weight in rows.items() if abs(weight) > 1e-12}
 
 
+def _coerce_actual_weights(
+    *,
+    broker_positions: Any,
+    broker_balances: Any,
+    fallback: dict[str, float],
+) -> dict[str, float]:
+    if not broker_positions:
+        return {
+            str(ticker).strip().upper(): float(weight)
+            for ticker, weight in (fallback or {}).items()
+            if abs(float(weight)) > 1e-12
+        }
+
+    nav = _broker_nav(broker_balances, broker_positions)
+    iterable = broker_positions.values() if isinstance(broker_positions, dict) else broker_positions
+    rows: dict[str, float] = {}
+    for item in iterable:
+        if isinstance(item, dict):
+            ticker = str(item.get("ticker") or "").strip().upper()
+            market_value = _optional_float(item.get("market_value"))
+            current_weight = _optional_float(item.get("current_weight"))
+        else:
+            ticker = str(getattr(item, "ticker", "")).strip().upper()
+            market_value = _optional_float(getattr(item, "market_value", None))
+            current_weight = _optional_float(getattr(item, "current_weight", None))
+        if not ticker:
+            continue
+        if current_weight is not None:
+            rows[ticker] = current_weight
+        elif market_value is not None and nav is not None and abs(nav) > 1e-9:
+            rows[ticker] = market_value / nav
+    return {ticker: weight for ticker, weight in rows.items() if abs(weight) > 1e-12}
+
+
 def _weight_drift_l1(left: dict[str, float], right: dict[str, float]) -> float:
     return sum(abs(float(left.get(ticker, 0.0)) - float(right.get(ticker, 0.0))) for ticker in set(left) | set(right))
 
@@ -477,6 +535,153 @@ def _expected_nav(config: dict[str, Any]) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _compute_tracking_vs_backtest(
+    *,
+    repo_root: Path,
+    config: dict[str, Any],
+    bundle: IntentBundle,
+    submission_day: date,
+    target_weights: dict[str, float],
+    actual_weights: dict[str, float],
+    tracking_notional: float | None,
+) -> dict[str, Any]:
+    try:
+        baseline_dir = resolve_baseline_path(
+            config=config,
+            baseline_path=config.get("baseline_path"),
+            repo_root=repo_root,
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": f"baseline_resolve_failed: {exc}",
+        }
+
+    returns_path = baseline_dir / "returns_panel.parquet"
+    if not returns_path.exists():
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": f"missing returns_panel artifact: {returns_path}",
+            "baseline_path": str(baseline_dir),
+        }
+
+    returns_panel = pd.read_parquet(returns_path)
+    if returns_panel.empty:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": f"returns_panel is empty: {returns_path}",
+            "baseline_path": str(baseline_dir),
+            "returns_path": str(returns_path),
+        }
+
+    returns_panel.index = pd.to_datetime(returns_panel.index).normalize()
+    returns_panel = returns_panel.sort_index()
+    return_date, return_date_source = _select_tracking_return_date(
+        returns_panel.index,
+        submission_day=submission_day,
+        bundle=bundle,
+    )
+    if return_date is None:
+        bundle_date = bundle.as_of_date.isoformat() if bundle.as_of_date is not None else None
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": (
+                "no return row found for submission_day="
+                f"{submission_day.isoformat()} or bundle_as_of_date={bundle_date}"
+            ),
+            "baseline_path": str(baseline_dir),
+            "returns_path": str(returns_path),
+        }
+
+    returns_row = returns_panel.loc[return_date]
+    if isinstance(returns_row, pd.DataFrame):
+        returns_row = returns_row.iloc[-1]
+    returns_row = pd.to_numeric(returns_row, errors="coerce").fillna(0.0)
+    aligned_index = pd.Index(sorted(set(returns_row.index) | set(target_weights) | set(actual_weights)))
+    aligned_returns = returns_row.reindex(aligned_index).fillna(0.0).astype("float64")
+    target_series = pd.Series(target_weights, dtype="float64").reindex(aligned_index).fillna(0.0)
+    actual_series = pd.Series(actual_weights, dtype="float64").reindex(aligned_index).fillna(0.0)
+
+    backtest_predicted_return = float((target_series * aligned_returns).sum())
+    paper_realized_return = float((actual_series * aligned_returns).sum())
+    return_excess = paper_realized_return - backtest_predicted_return
+    capital_base = float(tracking_notional) if tracking_notional not in (None, "") else 1.0
+
+    return {
+        "available": True,
+        "status": "OK",
+        "baseline_path": str(baseline_dir),
+        "returns_path": str(returns_path),
+        "return_date": pd.Timestamp(return_date).date().isoformat(),
+        "return_date_source": return_date_source,
+        "paper_realized_return": paper_realized_return,
+        "backtest_predicted_return": backtest_predicted_return,
+        "return_excess_vs_backtest": return_excess,
+        "paper_realized_pnl": paper_realized_return * capital_base,
+        "backtest_predicted_pnl": backtest_predicted_return * capital_base,
+        "pnl_reconciled_vs_backtest": return_excess * capital_base,
+        "tracking_capital_base": capital_base,
+        "tracked_symbol_count": int((aligned_returns.abs() > 0).sum()),
+    }
+
+
+def _select_tracking_return_date(
+    index: pd.Index,
+    *,
+    submission_day: date,
+    bundle: IntentBundle,
+) -> tuple[pd.Timestamp | None, str | None]:
+    normalized_index = pd.DatetimeIndex(pd.to_datetime(index)).normalize().sort_values()
+    submission_ts = pd.Timestamp(submission_day).normalize()
+    if submission_ts in normalized_index:
+        return submission_ts, "submission_day"
+
+    bundle_ts = pd.Timestamp(bundle.as_of_date).normalize() if bundle.as_of_date is not None else None
+    if bundle_ts is not None and bundle_ts in normalized_index:
+        return bundle_ts, "bundle_as_of_date"
+
+    prior_submission = normalized_index[normalized_index <= submission_ts]
+    if len(prior_submission) > 0:
+        return pd.Timestamp(prior_submission[-1]).normalize(), "latest_on_or_before_submission_day"
+
+    if bundle_ts is not None:
+        prior_bundle = normalized_index[normalized_index <= bundle_ts]
+        if len(prior_bundle) > 0:
+            return pd.Timestamp(prior_bundle[-1]).normalize(), "latest_on_or_before_bundle_as_of_date"
+    return None, None
+
+
+def _broker_nav(balances: Any, positions: Any) -> float | None:
+    if isinstance(balances, dict):
+        for key in ("nav", "equity", "total_equity"):
+            value = _optional_float(balances.get(key))
+            if value is not None and abs(value) > 1e-9:
+                return value
+        cash = _optional_float(balances.get("cash", balances.get("total_cash")))
+    else:
+        cash = None
+
+    total_market_value = 0.0
+    found_market_value = False
+    iterable = positions.values() if isinstance(positions, dict) else (positions or [])
+    for item in iterable:
+        if isinstance(item, dict):
+            market_value = _optional_float(item.get("market_value"))
+        else:
+            market_value = _optional_float(getattr(item, "market_value", None))
+        if market_value is None:
+            continue
+        total_market_value += market_value
+        found_market_value = True
+    if cash is not None and found_market_value:
+        return cash + total_market_value
+    return None
 
 
 def _reconciliation_threshold_context(config: dict[str, Any]) -> dict[str, float]:
@@ -492,6 +697,15 @@ def _reconciliation_threshold_context(config: dict[str, Any]) -> dict[str, float
         "weight_drift_minor_threshold": weight_minor_pct / 100.0,
         "cash_drift_abs_threshold": float(config.get("reconciliation_cash_drift_usd", 1.0)),
         "nav_drift_abs_threshold": float(config.get("reconciliation_nav_drift_usd", 1.0)),
+    }
+
+
+def _tracking_threshold_context(config: dict[str, Any]) -> dict[str, float | int]:
+    return {
+        "tracking_error_window_days": int(config.get("tracking_error_window_days", 21)),
+        "tracking_error_annualization_days": int(config.get("tracking_error_annualization_days", 252)),
+        "tracking_error_alert_threshold": float(config.get("tracking_error_alert_pct", 0.75)) / 100.0,
+        "monthly_win_rate_min_threshold": float(config.get("tracking_monthly_win_rate_min_pct", 55.0)) / 100.0,
     }
 
 
@@ -547,6 +761,15 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         path,
         json.dumps(payload, indent=2, sort_keys=True),
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = ["PhaseBExecutor"]

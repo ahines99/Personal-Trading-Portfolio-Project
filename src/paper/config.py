@@ -94,6 +94,10 @@ class PaperTradingConfig(BaseModel):
     submission_poll_seconds: int = 60
     submission_poll_interval_seconds: int = 5
     approval_deadline_time_et: str = "08:00"
+    tracking_error_window_days: int = 21
+    tracking_error_annualization_days: int = 252
+    tracking_error_alert_pct: float = 0.75
+    tracking_monthly_win_rate_min_pct: float = 55.0
     hard_halt_drawdown_pct: float | None = None
     hard_halt_daily_loss_pct: float | None = None
     confirm_live_trading: bool = Field(default=False, exclude=True, repr=False)
@@ -177,6 +181,8 @@ class PaperTradingConfig(BaseModel):
         "canary_max_order_count",
         "submission_poll_seconds",
         "submission_poll_interval_seconds",
+        "tracking_error_window_days",
+        "tracking_error_annualization_days",
     )
     @classmethod
     def validate_positive_ints(cls, value: int) -> int:
@@ -224,6 +230,8 @@ class PaperTradingConfig(BaseModel):
         return f"{hour:02d}:{minute:02d}"
 
     @field_validator(
+        "tracking_error_alert_pct",
+        "tracking_monthly_win_rate_min_pct",
         "overnight_drift_halt_pct",
         "turnover_cap_pct",
         "estimated_cost_cap_pct",
@@ -236,7 +244,7 @@ class PaperTradingConfig(BaseModel):
         if value is None:
             return None
         if value <= 0:
-            raise ValueError("hard halt percentages must be positive when set")
+            raise ValueError("percentage config values must be positive when set")
         return value
 
     @model_validator(mode="after")
